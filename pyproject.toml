@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "btgui"
+version = "0.1.0"
+description = "Interactive molecular and crystal structure viewer"
+requires-python = ">=3.10"
+dependencies = ["numpy>=1.24", "PySide6>=6.5", "pyvista>=0.44", "pyvistaqt>=0.11"]
+
+[project.scripts]
+btgui = "btgui.app:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+btgui = ["settings.json", "data/*.json"]
