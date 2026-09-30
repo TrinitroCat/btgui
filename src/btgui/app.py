@@ -5,7 +5,7 @@ import sys
 from PySide6.QtWidgets import QApplication
 
 from btgui.frontend.main_window import MainWindow
-from btgui.integrations.buctoolkit import make_buctoolkit_handlers
+from btgui.integrations.structure_io import make_structure_handlers
 
 
 def main():
@@ -18,7 +18,7 @@ def main():
         The QApplication exit code.
     """
     application = QApplication(sys.argv)
-    open_handler, save_handler = make_buctoolkit_handlers()
+    open_handler, save_handler = make_structure_handlers()
     window = MainWindow(open_handler=open_handler, save_handler=save_handler)
     window.show()
     return application.exec()

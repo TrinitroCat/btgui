@@ -4,5 +4,6 @@
   "atom_lighting": true,
   "atom_edges": false,
   "atom_edge_color": "#202020",
-  "atom_edge_width": 1.0
+  "atom_edge_width": 1.0,
+  "buctoolkit_paths": []
 }

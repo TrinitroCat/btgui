@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Added built-in serial POSCAR, CIF, XYZ, EXTXYZ, and complete OUTCAR I/O using
+  the GUI's raw lists, removing BUCToolkit, PyTorch, and joblib from normal file
+  operations while retaining optional BUCToolkit conversion through `to_bt()`.
 - Added view-relative selected-atom rotation with separate center and edge gestures.
 - Added actor-only drag previews, release-time coordinate and bond updates, and undo/redo history.
 - Added persistent rendering and history settings in `btgui/settings.json`.

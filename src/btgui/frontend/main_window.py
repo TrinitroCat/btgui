@@ -2,6 +2,7 @@
 
 from collections import deque
 import json
+import os
 from pathlib import Path
 
 import numpy as np
@@ -53,6 +54,7 @@ DEFAULT_SETTINGS = {
     "atom_edges": False,
     "atom_edge_color": "#202020",
     "atom_edge_width": 1.0,
+    "buctoolkit_paths": [],
 }
 
 
@@ -310,6 +312,7 @@ class SettingsDialog(QDialog):
         super().__init__(parent)
         self.setWindowTitle("Settings")
         self.resize(420, 260)
+        self.buctoolkit_paths = list(settings.get("buctoolkit_paths", []))
         self.history_limit_spin = QSpinBox(self)
         self.history_limit_spin.setRange(1, 1000)
         self.history_limit_spin.setValue(settings["history_limit"])
@@ -381,6 +384,7 @@ class SettingsDialog(QDialog):
             "atom_edges": self.edges_check.isChecked(),
             "atom_edge_color": self.edge_color_button.property("color") or "#202020",
             "atom_edge_width": self.edge_width_spin.value(),
+            "buctoolkit_paths": self.buctoolkit_paths,
         }
 
 
@@ -819,6 +823,7 @@ class MainWindow(QMainWindow):
             on_view_reset=self._reset_view,
             on_data_changed=self._on_cli_data_changed,
             on_shortcut=self._create_shortcut,
+            buctoolkit_paths=self.settings["buctoolkit_paths"],
         )
         self.viewer.set_error_handler(self._log)
         self.setAcceptDrops(True)
@@ -880,6 +885,24 @@ class MainWindow(QMainWindow):
             edge_width = float(loaded.get("atom_edge_width", settings["atom_edge_width"]))
             if not 0.1 <= edge_width <= 10.0:
                 raise ValueError("atom_edge_width must be between 0.1 and 10.0")
+            buctoolkit_paths = loaded.get("buctoolkit_paths", settings["buctoolkit_paths"])
+            if isinstance(buctoolkit_paths, str):
+                buctoolkit_paths = buctoolkit_paths.split(os.pathsep)
+            if not isinstance(buctoolkit_paths, list) or any(
+                not isinstance(path, str) for path in buctoolkit_paths
+            ):
+                raise TypeError("buctoolkit_paths must be a string or a list of strings")
+            settings_directory = self.settings_path.parent
+            normalized_paths = []
+            for path in buctoolkit_paths:
+                path = path.strip()
+                if not path:
+                    continue
+                candidate = Path(path).expanduser()
+                if not candidate.is_absolute():
+                    candidate = settings_directory / candidate
+                normalized_paths.append(str(candidate))
+            buctoolkit_paths = normalized_paths
             settings.update(
                 history_limit=history_limit,
                 default_atom_material=material,
@@ -887,6 +910,7 @@ class MainWindow(QMainWindow):
                 atom_edges=edges,
                 atom_edge_color=edge_color,
                 atom_edge_width=edge_width,
+                buctoolkit_paths=buctoolkit_paths,
             )
         except (json.JSONDecodeError, OSError, TypeError, ValueError) as error:
             self.settings_warning = f"Settings warning: {error}; using defaults."
@@ -1905,7 +1929,7 @@ class MainWindow(QMainWindow):
     def _export_dialog(self):
         """Open the batch frame-selection and text-format export dialog."""
         if self.save_handler is None or not hasattr(self.save_handler, "export_batch"):
-            self._log("Batch export is unavailable; BUCToolkit is not loaded.")
+            self._log("Batch export is unavailable for the configured save handler.")
             return
         if len(self.coordinates) == 0:
             self._log("Open structure data before exporting.")
@@ -1940,7 +1964,14 @@ class MainWindow(QMainWindow):
             return
         try:
             indices = parse_frame_selection(selection.text(), len(self.coordinates))
-            self.save_handler.export_batch(output_path["value"], indices, format_combo.currentData())
+            self.save_handler.export_batch(
+                output_path["value"],
+                indices,
+                format_combo.currentData(),
+                self.elements,
+                self.coordinates,
+                self.lattices,
+            )
             self._log(f"Exported {len(indices)} frame(s) to {output_path['value']}")
         except (ImportError, OSError, RuntimeError, TypeError, ValueError) as error:
             self._log(f"Export error: {error}")

@@ -15,6 +15,7 @@ from typing import Callable
 import numpy as np
 
 from btgui.backend.core import parse_frame_selection, validate_data
+from btgui.integrations.buctoolkit import load_buctoolkit
 
 
 class _CapturedConsole(code.InteractiveConsole):
@@ -106,6 +107,7 @@ class CLI:
         on_view_reset: Callable,
         on_data_changed: Callable,
         on_shortcut: Callable,
+        buctoolkit_paths=None,
     ) -> None:
         self._log = log
         self._on_open = on_open
@@ -125,7 +127,7 @@ class CLI:
         self.coo = self._work["coo"]
         self.cell = self._work["cell"]
         self.elements = self._work["elements"]
-        self._buctoolkit = self._find_buctoolkit()
+        self._buctoolkit = self._find_buctoolkit(buctoolkit_paths)
         self._namespace = {
             "__builtins__": __builtins__,
             "np": np,
@@ -138,7 +140,7 @@ class CLI:
         self._continuation = False
 
     @staticmethod
-    def _find_buctoolkit():
+    def _find_buctoolkit(search_paths=None):
         """Locate and preload optional BUCToolkit at console construction.
 
         Args:
@@ -147,12 +149,7 @@ class CLI:
         Returns:
             The imported BUCToolkit package, or ``None`` when unavailable.
         """
-        if importlib.util.find_spec("BUCToolkit") is None:
-            return None
-        try:
-            return importlib.import_module("BUCToolkit")
-        except (ImportError, ModuleNotFoundError):
-            return None
+        return load_buctoolkit(search_paths)
 
     @staticmethod
     def _clone_lists(values: dict[str, list]) -> dict[str, list]:
@@ -547,7 +544,10 @@ class CLI:
         else:
             raise ValueError("to_bt index must be None, range text, or List[int]")
 
-        module = importlib.import_module("BUCToolkit.BatchStructures.BatchStructuresBase")
+        module_name = (
+            f"{self._buctoolkit.__name__}.BatchStructures.BatchStructuresBase"
+        )
+        module = importlib.import_module(module_name)
         batch = module.BatchStructures()
         selected_elements = [self._targets["elements"][frame] for frame in selected]
         batch.append_from_lists(

@@ -12,7 +12,9 @@ coordinates[i]  # shape (N, 3), Cartesian coordinates in angstroms
 lattices[i]     # shape (3, 3), lattice vectors as rows
 ```
 
-The lists are retained directly and coordinate editing changes `coordinates[i]` in place. Use `MainWindow.set_data(elements, coordinates, lattices)` when embedding the viewer. BUCToolkit is optional and discovered dynamically at runtime; there is no build-time dependency. An application can supply `open_handler(path)` and `save_handler(path, elements, coordinates, lattices)` callbacks to connect its preferred I/O implementation.
+The lists are retained directly and coordinate editing changes `coordinates[i]` in place. Use `MainWindow.set_data(elements, coordinates, lattices)` when embedding the viewer. The standalone GUI includes serial NumPy/Python readers and writers, so normal structure I/O has no BUCToolkit, PyTorch, or joblib dependency. An application can still supply `open_handler(path)` and `save_handler(path, elements, coordinates, lattices)` callbacks to connect another I/O implementation.
+
+BUCToolkit remains an optional runtime backend only for the CLI `to_bt()` conversion. Add one or more site-package directories (or a directory containing the `BUCToolkit` package) to `buctoolkit_paths` in `src/btgui/settings.json`; these paths are tried first. `BTGUI_BUCTOOLKIT_PATH` or `BTGUI_BUCTOOLKIT_PATHS` may be used for machine-specific startup configuration, followed by the current Python environment. If no installation can be loaded, structure viewing and file I/O remain available and `to_bt()` reports that the optional backend is absent.
 
 For BUCToolkit integration, pass its lists explicitly after expanding element counts:
 
@@ -30,7 +32,7 @@ pip install -e .
 btgui
 ```
 
-The standalone entry point supplies a BUCToolkit I/O bridge. File Open supports multi-selection and groups files by reader and parent directory before appending them to one retained `BatchStructures` object. The command `open PATH` accepts one path or a path list and reads POSCAR, CIF, XYZ, EXTXYZ, or complete OUTCAR trajectories; `save PATH` writes POSCAR, CIF, or XYZ through the retained batch. File > Export batch writes a selected inclusive one-based frame list such as `1-2, 4, 6,8,10-30` in POSCAR, CIF, or XYZ format. The bridge preloads BUCToolkit at application startup when it is available. Other hosts can supply their own I/O callbacks without adding BUCToolkit imports to the GUI.
+The standalone entry point uses built-in serial readers and writers. File Open supports multi-selection and appends POSCAR, CIF, XYZ, EXTXYZ, or complete OUTCAR trajectories directly to the three GUI lists. The command `open PATH` accepts one path or a path list; `save PATH` writes the current frame as POSCAR, CIF, or XYZ. File > Export batch writes a selected inclusive one-based frame list such as `1-2, 4, 6,8,10-30` in POSCAR, CIF, or XYZ format. The built-in path contains no multiprocessing branch and always exports the current authoritative GUI data. Portions adapted from BUCToolkit are distributed under its MIT license in `LICENSES/BUCToolkit-MIT.txt`.
 
 ## Mouse controls
 
