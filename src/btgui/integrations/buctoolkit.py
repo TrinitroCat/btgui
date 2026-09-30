@@ -2,6 +2,8 @@
 
 from pathlib import Path
 
+import numpy as np
+
 
 def make_buctoolkit_handlers():
     """Create I/O callbacks that retain the loaded BatchStructures instance.
@@ -54,6 +56,7 @@ def make_buctoolkit_handlers():
                     and (
                         item.suffix.lower() in {".cif", ".extxyz", ".xyz", ".vasp", ".poscar"}
                         or item.name.upper() in {"POSCAR", "OUTCAR"}
+                        or "OUTCAR" in item.name.upper()
                     )
                 )
                 for directory_file in directory_files:
@@ -64,7 +67,13 @@ def make_buctoolkit_handlers():
             raise ValueError("the selected paths contain no supported structure files")
 
         for (reader_kind, directory), file_names in file_groups.items():
-            loaded_structures = _read_group(reader_kind, directory, file_names)
+            try:
+                loaded_structures = _read_group(reader_kind, directory, file_names)
+            except (OSError, RuntimeError, TypeError, ValueError) as error:
+                raise ValueError(
+                    "Unknown file format! Please check your input file. "
+                    "Support cif, xyz, vasp files."
+                ) from error
             loaded_structures.direct2cartesian()
             loaded_structures.generate_atom_list()
             if current_structures is None:
@@ -107,14 +116,14 @@ def make_buctoolkit_handlers():
             reader_kind = "poscar"
         elif suffix == ".cif":
             reader_kind = "cif"
-        elif file_path.name.upper() == "OUTCAR" or suffix == ".outcar":
+        elif "OUTCAR" in file_path.name.upper() or suffix == ".outcar":
             reader_kind = "outcar"
         elif suffix == ".extxyz":
             reader_kind = "extxyz"
         elif suffix == ".xyz":
             reader_kind = "xyz"
         else:
-            raise ValueError(f"unsupported BUCToolkit structure format: {suffix or file_path.name}")
+            reader_kind = "poscar"
         return reader_kind, str(file_path.parent)
 
     def _read_group(reader_kind, directory, file_names):
@@ -167,6 +176,19 @@ def make_buctoolkit_handlers():
         ]
         if len(matching_indices) != 1:
             raise ValueError("the current frame is not owned by the loaded BUCToolkit structure")
+        frame_index = matching_indices[0]
+        frame_elements = np.asarray(elements[0], dtype=str).reshape(-1)
+        frame_coordinates = np.asarray(coordinates[0], dtype=float)
+        frame_lattice = np.asarray(lattices[0], dtype=float)
+        element_order = list(dict.fromkeys(frame_elements.tolist()))
+        element_counts = [
+            int(np.count_nonzero(frame_elements == symbol)) for symbol in element_order
+        ]
+        current_structures.Atom_list[frame_index] = frame_elements.copy()
+        current_structures.Coords[frame_index] = frame_coordinates.copy()
+        current_structures.Cells[frame_index] = frame_lattice.copy()
+        current_structures.Elements[frame_index] = element_order
+        current_structures.Numbers[frame_index] = element_counts
         file_path = Path(path).expanduser().resolve()
         formats = {".vasp": "POSCAR", ".poscar": "POSCAR", ".cif": "cif", ".xyz": "xyz"}
         if file_path.suffix.lower() not in formats:

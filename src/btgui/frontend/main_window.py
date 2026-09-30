@@ -3,11 +3,12 @@
 from collections import deque
 import json
 from pathlib import Path
-import shlex
 
 import numpy as np
+
+from ..backend.lattice_transform import transform_structure
 from PySide6.QtCore import QSignalBlocker, QTimer, Qt
-from PySide6.QtGui import QAction, QColor
+from PySide6.QtGui import QAction, QColor, QDoubleValidator, QIntValidator
 from PySide6.QtWidgets import (
     QComboBox,
     QCheckBox,
@@ -29,13 +30,19 @@ from PySide6.QtWidgets import (
     QStyle,
     QToolBar,
     QToolButton,
+    QWidgetAction,
     QVBoxLayout,
     QWidget,
     QColorDialog,
+    QGridLayout,
+    QHBoxLayout,
+    QMessageBox,
 )
 
 from btgui.backend.core import parse_frame_range, parse_frame_selection, validate_data
-from btgui.data.appearance import default_color
+from btgui.data.appearance import ELEMENT_SYMBOLS, default_color
+from btgui.frontend.cli import CLI
+from btgui.frontend.changes import StructureChange
 from btgui.frontend.viewer import StructureViewer
 
 
@@ -107,6 +114,10 @@ class AppearanceDialog(QDialog):
         self.lighting_check.setChecked(viewer.atom_lighting)
         self.edges_check = QCheckBox("Atom boundaries", self)
         self.edges_check.setChecked(viewer.atom_edges)
+        self.axes_check = QCheckBox("Axes", self)
+        self.axes_check.setChecked(viewer.axes_visible)
+        self.grid_check = QCheckBox("Grid", self)
+        self.grid_check.setChecked(viewer.grid_visible)
         self.edge_width_spin = QDoubleSpinBox(self)
         self.edge_width_spin.setRange(0.1, 10.0)
         self.edge_width_spin.setSingleStep(0.1)
@@ -150,6 +161,8 @@ class AppearanceDialog(QDialog):
         form.addRow("PBR metallic", self.metallic_spin)
         form.addRow(self.lighting_check)
         form.addRow(self.edges_check)
+        form.addRow(self.axes_check)
+        form.addRow(self.grid_check)
         form.addRow("Boundary width", self.edge_width_spin)
         form.addRow("Boundary color", self.edge_color_button)
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel, self)
@@ -166,10 +179,10 @@ class AppearanceDialog(QDialog):
     def _load_material_preset(self):
         """Refresh PBR coefficient controls when the material preset changes."""
         presets = {
-            "default": (0.15, 0.78, 0.25, 0.42, 0.0),
+            "default": (0.24, 0.86, 0.32, 0.34, 0.0),
             "matte": (0.28, 0.72, 0.0, 0.9, 0.0),
-            "glossy": (0.10, 0.72, 0.75, 0.18, 0.0),
-            "metallic": (0.12, 0.55, 0.85, 0.24, 0.65),
+            "glossy": (0.18, 0.86, 0.78, 0.16, 0.0),
+            "metallic": (0.20, 0.76, 0.88, 0.22, 0.40),
         }
         values = presets.get(self.material_combo.currentData())
         if values is None:
@@ -265,6 +278,8 @@ class AppearanceDialog(QDialog):
             self.specular_spin.value(),
             self.roughness_spin.value(),
             self.metallic_spin.value(),
+            self.axes_check.isChecked(),
+            self.grid_check.isChecked(),
         )
         self.viewer.set_bond_width(self.bond_width_spin.value())
         self.viewer.set_bond_alpha(self.bond_alpha_spin.value())
@@ -369,6 +384,249 @@ class SettingsDialog(QDialog):
         }
 
 
+class AddAtomDialog(QDialog):
+    """Collect one element and either Cartesian coordinates or a reference mode."""
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Add Atom")
+        self._reference_requested = False
+        layout = QVBoxLayout(self)
+        quick_layout = QHBoxLayout()
+        quick_layout.addWidget(QLabel("Element:"))
+        self.element_edit = QLineEdit(self)
+        self.element_edit.setPlaceholderText("C, H, O, N, P, S, ...")
+        quick_layout.addWidget(self.element_edit)
+        for symbol in ("C", "H", "O", "N", "P", "S"):
+            button = QPushButton(symbol, self)
+            button.setFixedWidth(34)
+            button.clicked.connect(lambda _checked=False, value=symbol: self.element_edit.setText(value))
+            quick_layout.addWidget(button)
+        layout.addLayout(quick_layout)
+
+        coordinate_layout = QFormLayout()
+        self.coordinate_edits = []
+        validator = QDoubleValidator(-1.0e9, 1.0e9, 8, self)
+        for axis in ("x", "y", "z"):
+            edit = QLineEdit("0", self)
+            edit.setValidator(validator)
+            coordinate_layout.addRow(f"{axis}:", edit)
+            self.coordinate_edits.append(edit)
+        layout.addLayout(coordinate_layout)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel,
+            parent=self,
+        )
+        reference_button = QPushButton("Reference to existing atom", self)
+        reference_button.clicked.connect(self._accept_reference)
+        layout.addWidget(reference_button)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def _validated_symbol(self) -> str:
+        """Normalize and validate the manually entered element symbol.
+
+        Args:
+            None.
+
+        Returns:
+            Canonical element symbol.
+
+        Raises:
+            ValueError: If the symbol is not in the periodic table.
+        """
+        text = self.element_edit.text().strip()
+        symbol = text[:1].upper() + text[1:].lower() if text else ""
+        if symbol not in ELEMENT_SYMBOLS:
+            raise ValueError("element must be a valid periodic-table symbol")
+        return symbol
+
+    def _accept_reference(self) -> None:
+        """Validate the element and close in reference-placement mode.
+
+        Args:
+            None.
+
+        Returns:
+            None. The caller enters viewer reference mode after acceptance.
+        """
+        try:
+            self._validated_symbol()
+        except ValueError as error:
+            QMessageBox.warning(self, "Invalid element", str(error))
+            return
+        self._reference_requested = True
+        super().accept()
+
+    def accept(self) -> None:
+        """Validate the direct-coordinate form before accepting the dialog.
+
+        Args:
+            None.
+
+        Returns:
+            None. Invalid element or coordinate text keeps the dialog open.
+        """
+        try:
+            self._validated_symbol()
+            for edit in self.coordinate_edits:
+                float(edit.text().strip())
+        except (TypeError, ValueError) as error:
+            QMessageBox.warning(self, "Invalid atom", str(error))
+            return
+        super().accept()
+
+    def values(self) -> tuple[str, np.ndarray, bool]:
+        """Return the validated element, coordinates, and placement mode.
+
+        Args:
+            None.
+
+        Returns:
+            ``(symbol, xyz, reference_requested)``.
+        """
+        symbol = self._validated_symbol()
+        xyz = np.asarray([float(edit.text()) for edit in self.coordinate_edits], dtype=float)
+        return symbol, xyz, self._reference_requested
+
+
+class SupercellDialog(QDialog):
+    """Collect integer replication factors and a lattice transformation."""
+
+    _MAX_MULTIPLIER = 999
+    _MAX_MATRIX_VALUE = 999
+
+    def __init__(
+        self,
+        multipliers: np.ndarray | None = None,
+        matrix: np.ndarray | None = None,
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Supercell")
+        self._multipliers: list[QLineEdit] = []
+        self._matrix_entries: list[list[QLineEdit]] = []
+        self._accepted_values: tuple[np.ndarray, np.ndarray] | None = None
+        self.resize_requested = False
+        initial_multipliers = np.ones(3, dtype=np.int64) if multipliers is None else np.asarray(multipliers, dtype=np.int64)
+        initial_matrix = np.eye(3, dtype=np.int64) if matrix is None else np.asarray(matrix, dtype=np.int64)
+
+        layout = QVBoxLayout(self)
+        multiplier_grid = QGridLayout()
+        for column, axis_name in enumerate(("a", "b", "c")):
+            axis_label = QLabel(axis_name)
+            axis_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            multiplier_grid.addWidget(axis_label, 0, column)
+            increase_button = QPushButton("▲")
+            value_edit = QLineEdit(str(int(initial_multipliers[column])))
+            value_edit.setValidator(QIntValidator(1, self._MAX_MULTIPLIER, value_edit))
+            value_edit.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            decrease_button = QPushButton("▼")
+            for widget in (increase_button, value_edit, decrease_button):
+                widget.setFixedWidth(52)
+            increase_button.clicked.connect(
+                lambda _checked=False, index=column: self._change_multiplier(index, 1)
+            )
+            decrease_button.clicked.connect(
+                lambda _checked=False, index=column: self._change_multiplier(index, -1)
+            )
+            multiplier_grid.addWidget(increase_button, 1, column)
+            multiplier_grid.addWidget(value_edit, 2, column)
+            multiplier_grid.addWidget(decrease_button, 3, column)
+            self._multipliers.append(value_edit)
+        layout.addLayout(multiplier_grid)
+
+        separator = QFrame()
+        separator.setFrameShape(QFrame.Shape.HLine)
+        separator.setFrameShadow(QFrame.Shadow.Sunken)
+        layout.addWidget(separator)
+        layout.addWidget(QLabel("Lattice transform:"))
+
+        matrix_grid = QGridLayout()
+        for row in range(3):
+            matrix_row: list[QLineEdit] = []
+            for column in range(3):
+                entry = QLineEdit(str(int(initial_matrix[row, column])))
+                entry.setValidator(
+                    QIntValidator(-self._MAX_MATRIX_VALUE, self._MAX_MATRIX_VALUE, entry)
+                )
+                entry.setAlignment(Qt.AlignmentFlag.AlignCenter)
+                entry.setFixedWidth(64)
+                matrix_grid.addWidget(entry, row, column)
+                matrix_row.append(entry)
+            self._matrix_entries.append(matrix_row)
+        layout.addLayout(matrix_grid)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        resize_button = buttons.addButton("Resize", QDialogButtonBox.ButtonRole.ActionRole)
+        resize_button.setToolTip("Use the current structure as a new 1 x 1 x 1 base")
+        resize_button.clicked.connect(self._request_resize)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def _request_resize(self) -> None:
+        """Accept the dialog as a request to rebase the current supercell."""
+        self.resize_requested = True
+        QDialog.accept(self)
+
+    def _change_multiplier(self, index: int, delta: int) -> None:
+        """Change one replication factor while preserving its lower bound."""
+        text = self._multipliers[index].text().strip()
+        current = int(text) if text.isdigit() and int(text) >= 1 else 1
+        value = min(self._MAX_MULTIPLIER, max(1, current + delta))
+        self._multipliers[index].setText(str(value))
+
+    def _validated_values(self) -> tuple[np.ndarray, np.ndarray]:
+        """Return validated replication factors and the integer matrix."""
+        multiplier_values: list[int] = []
+        for axis_name, entry in zip(("a", "b", "c"), self._multipliers):
+            try:
+                value = int(entry.text().strip())
+            except ValueError as error:
+                raise ValueError(f"The {axis_name}-axis multiplier must be an integer.") from error
+            if value < 1:
+                raise ValueError(
+                    f"The {axis_name}-axis multiplier must be at least 1; zero is not valid."
+                )
+            multiplier_values.append(value)
+
+        matrix = np.empty((3, 3), dtype=np.int64)
+        for row in range(3):
+            for column in range(3):
+                try:
+                    matrix[row, column] = int(
+                        self._matrix_entries[row][column].text().strip()
+                    )
+                except ValueError as error:
+                    raise ValueError(
+                        f"Transform entry ({row + 1}, {column + 1}) must be an integer."
+                    ) from error
+        if int(round(float(np.linalg.det(matrix)))) == 0:
+            raise ValueError("The lattice transformation matrix must be non-singular.")
+        return np.asarray(multiplier_values, dtype=np.int64), matrix
+
+    def accept(self) -> None:
+        """Validate the dialog before accepting it."""
+        try:
+            self._accepted_values = self._validated_values()
+        except ValueError as error:
+            QMessageBox.warning(self, "Invalid supercell", str(error))
+            return
+        super().accept()
+
+    def values(self) -> tuple[np.ndarray, np.ndarray]:
+        """Return the accepted replication factors and transformation matrix."""
+        if self._accepted_values is None:
+            return self._validated_values()
+        multipliers, matrix = self._accepted_values
+        return multipliers.copy(), matrix.copy()
+
+
 class MainWindow(QMainWindow):
     """Present the viewer, extensible toolbar, and bottom command console.
 
@@ -396,6 +654,8 @@ class MainWindow(QMainWindow):
         self.settings = self._load_settings()
         self.undo_stack = deque(maxlen=self.settings["history_limit"])
         self.redo_stack = deque()
+        self.supercell_bases = {}
+        self.supercell_transforms = {}
         self.timer = QTimer(self)
         self.timer.timeout.connect(self._advance_frame)
 
@@ -411,7 +671,11 @@ class MainWindow(QMainWindow):
         self.viewer.atom_edge_color = self.settings["atom_edge_color"]
         self.viewer.atom_edge_width = self.settings["atom_edge_width"]
         self.viewer.coordinatesEdited.connect(self._record_coordinate_edit)
+        self.viewer.deleteRequested.connect(self._delete_selected_atoms)
+        self.viewer.atomsAdded.connect(self._commit_reference_atoms)
+        self.viewer.filesDropped.connect(self._open_dropped_files)
         self.viewer.measurementModeChanged.connect(self._sync_measurement_actions)
+        self.viewer.selectionChanged.connect(self._sync_atom_actions)
 
         self.undo_action = QAction(
             self.style().standardIcon(QStyle.StandardPixmap.SP_ArrowBack),
@@ -433,29 +697,28 @@ class MainWindow(QMainWindow):
         self.toolbar.addAction(self.redo_action)
         self.toolbar.addSeparator()
 
-        self.view_button = QToolButton(self)
-        self.view_button.setText("View")
-        self.view_button.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
-        self.view_menu = self.view_button.menu() or self._new_menu(self.view_button)
-        self.view_menu.addAction("Along a", lambda: self._set_view(0))
-        self.view_menu.addAction("Along b", lambda: self._set_view(1))
-        self.view_menu.addAction("Along c", lambda: self._set_view(2))
-        self.view_button.setMenu(self.view_menu)
-        self.toolbar.addWidget(self.view_button)
-        self.axes_action = QAction("Axes", self)
-        self.axes_action.setCheckable(True)
-        self.axes_action.setChecked(True)
-        self.axes_action.toggled.connect(self._toggle_axes)
-        self.toolbar.addAction(self.axes_action)
-        self.grid_action = QAction("Grid", self)
-        self.grid_action.setCheckable(True)
-        self.grid_action.setChecked(True)
-        self.grid_action.toggled.connect(self._toggle_grid)
-        self.toolbar.addAction(self.grid_action)
-        self.bond_action = QAction("Check bond", self)
+        self.supercell_action = QAction("Build / Transform...", self)
+        self.supercell_action.triggered.connect(self._show_supercell)
+        self.supercell_menu = QMenu(self)
+        self.supercell_menu.addAction(self.supercell_action)
+        self.supercell_button = QToolButton(self)
+        self.supercell_button.setText("Supercell")
+        self.supercell_button.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        self.supercell_button.setMenu(self.supercell_menu)
+        self.toolbar.addWidget(self.supercell_button)
+        self.add_atom_action = QAction("Add Atom", self)
+        self.add_atom_action.triggered.connect(self._show_add_atom)
+        self.toolbar.addAction(self.add_atom_action)
+        self.replace_atom_action = QAction("Replace Atom", self)
+        self.replace_atom_action.setEnabled(False)
+        self.replace_atom_action.triggered.connect(self._show_replace_atom)
+        self.toolbar.addAction(self.replace_atom_action)
+
+        self.bond_action = QAction("Show Bonds", self)
         self.bond_action.setCheckable(True)
         self.bond_action.toggled.connect(self.viewer_set_bonds)
-        self.toolbar.addAction(self.bond_action)
+        self.bond_menu = QMenu(self)
+        self.bond_menu.addAction(self.bond_action)
         self.length_measure_action = QAction("Length", self)
         self.length_measure_action.setCheckable(True)
         self.length_measure_action.toggled.connect(
@@ -466,6 +729,23 @@ class MainWindow(QMainWindow):
         self.angle_measure_action.toggled.connect(
             lambda checked: self._set_measurement_mode("angle" if checked else None)
         )
+        self.bond_menu.addSeparator()
+        self.tolerance_spin = QDoubleSpinBox(self)
+        self.tolerance_spin.setRange(0.1, 5.0)
+        self.tolerance_spin.setSingleStep(0.05)
+        self.tolerance_spin.setValue(1.2)
+        self.tolerance_spin.setPrefix("Tolerance ")
+        self.tolerance_spin.setSuffix("x")
+        self.tolerance_spin.valueChanged.connect(self.viewer_set_tolerance)
+        tolerance_action = QWidgetAction(self.bond_menu)
+        tolerance_action.setDefaultWidget(self.tolerance_spin)
+        self.bond_menu.addAction(tolerance_action)
+        self.bond_button = QToolButton(self)
+        self.bond_button.setText("Check Bonds")
+        self.bond_button.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        self.bond_button.setMenu(self.bond_menu)
+        self.toolbar.addWidget(self.bond_button)
+
         self.metrics_button = QToolButton(self)
         self.metrics_button.setText("Metrics")
         self.metrics_button.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
@@ -474,19 +754,6 @@ class MainWindow(QMainWindow):
         self.metrics_menu.addAction(self.angle_measure_action)
         self.metrics_button.setMenu(self.metrics_menu)
         self.toolbar.addWidget(self.metrics_button)
-        self.tolerance_spin = QDoubleSpinBox(self)
-        self.tolerance_spin.setRange(0.1, 5.0)
-        self.tolerance_spin.setSingleStep(0.05)
-        self.tolerance_spin.setValue(1.2)
-        self.tolerance_spin.setPrefix("tol ")
-        self.tolerance_spin.valueChanged.connect(self.viewer_set_tolerance)
-        self.toolbar.addWidget(self.tolerance_spin)
-        self.appearance_action = QAction("Appearance", self)
-        self.appearance_action.triggered.connect(self._show_appearance)
-        self.toolbar.addAction(self.appearance_action)
-        self.settings_action = QAction("Settings", self)
-        self.settings_action.triggered.connect(self._show_settings)
-        self.toolbar.addAction(self.settings_action)
 
         self.toolbar.addSeparator()
         self.previous_frame_button = QToolButton(self)
@@ -494,7 +761,7 @@ class MainWindow(QMainWindow):
         self.previous_frame_button.setToolTip("Previous frame")
         self.previous_frame_button.clicked.connect(lambda: self._step_frame(-1))
         self.toolbar.addWidget(self.previous_frame_button)
-        self.frame_label = QLabel("Current frame", self)
+        self.frame_label = QLabel("Current Frame", self)
         self.toolbar.addWidget(self.frame_label)
         self.frame_input = QLineEdit("0", self)
         self.frame_input.setMaximumWidth(58)
@@ -517,12 +784,10 @@ class MainWindow(QMainWindow):
         self.pause_button.clicked.connect(self._pause_playback)
         self.toolbar.addWidget(self.pause_button)
 
-        self.toolbar.addSeparator()
         self.zoom_minus_button = QToolButton(self)
         self.zoom_minus_button.setText("-")
         self.zoom_minus_button.setToolTip("Decrease zoom")
         self.zoom_minus_button.clicked.connect(lambda: self._change_zoom(-10))
-        self.toolbar.addWidget(self.zoom_minus_button)
         self.zoom_input = QSpinBox(self)
         self.zoom_input.setRange(10, 1000)
         self.zoom_input.setSingleStep(10)
@@ -530,20 +795,33 @@ class MainWindow(QMainWindow):
         self.zoom_input.setSuffix("%")
         self.zoom_input.setToolTip("Zoom percentage")
         self.zoom_input.valueChanged.connect(self.viewer.set_zoom_percent)
-        self.toolbar.addWidget(self.zoom_input)
         self.zoom_plus_button = QToolButton(self)
         self.zoom_plus_button.setText("+")
         self.zoom_plus_button.setToolTip("Increase zoom")
         self.zoom_plus_button.clicked.connect(lambda: self._change_zoom(10))
-        self.toolbar.addWidget(self.zoom_plus_button)
 
         self.output = QPlainTextEdit(self)
         self.output.setReadOnly(True)
         self.output.setMaximumBlockCount(1000)
         self.command = QLineEdit(self)
-        self.command.setPlaceholderText("Commands, e.g. open structures.extxyz | frame 0 | play 0:20:2")
+        self.command.setPlaceholderText(">>> Python or GUI command")
         self.command.returnPressed.connect(self._run_command)
+        self.cli = CLI(
+            log=self._log,
+            on_open=self._open,
+            on_save=self._save,
+            on_frame=self._change_frame,
+            current_index=lambda: self.current_index,
+            on_play=self._play,
+            on_pause=self._pause_playback,
+            on_select=self._select_indices,
+            on_clear=self._clear_selection,
+            on_view_reset=self._reset_view,
+            on_data_changed=self._on_cli_data_changed,
+            on_shortcut=self._create_shortcut,
+        )
         self.viewer.set_error_handler(self._log)
+        self.setAcceptDrops(True)
 
         console = QWidget(self)
         console_layout = QVBoxLayout(console)
@@ -561,6 +839,12 @@ class MainWindow(QMainWindow):
         self._sync_frame_controls()
         self._sync_history_actions()
         self._log("Ready. Supply structure lists directly or connect file I/O handlers.")
+        if not self.cli.shortcut_available():
+            QMessageBox.information(
+                self,
+                "Desktop shortcut",
+                "pyshortcuts is not installed; no desktop shortcut will be created.",
+            )
         if self.settings_warning is not None:
             self._log(self.settings_warning)
 
@@ -662,25 +946,230 @@ class MainWindow(QMainWindow):
         self.undo_action.setEnabled(len(self.undo_stack) > 0)
         self.redo_action.setEnabled(len(self.redo_stack) > 0)
 
-    def _record_coordinate_edit(self, frame_index, before_coordinates, after_coordinates):
-        """Record one committed coordinate edit and invalidate redo history.
+    def _initialize_supercell_state(self):
+        """Create identity supercell state for every retained frame.
 
         Args:
-            frame_index: Frame modified by the completed mouse gesture.
-            before_coordinates: Complete frame coordinates before the edit.
-            after_coordinates: Complete frame coordinates after the edit.
+            None.
 
-        Return:
-            None. Coordinate snapshots are retained in bounded undo history.
+        Returns:
+            None. Each current frame becomes its own transform base.
         """
-        history_entry = (
-            int(frame_index),
-            np.asarray(before_coordinates).copy(),
-            np.asarray(after_coordinates).copy(),
+        self.supercell_bases = {
+            frame: {
+                "elements": np.array(self.elements[frame], copy=True),
+                "coordinates": np.array(self.coordinates[frame], copy=True),
+                "lattice": np.array(self.lattices[frame], copy=True),
+            }
+            for frame in range(len(self.coordinates))
+        }
+        self.supercell_transforms = {
+            frame: (np.ones(3, dtype=np.int64), np.eye(3, dtype=np.int64))
+            for frame in range(len(self.coordinates))
+        }
+
+    def _ensure_supercell_state(self):
+        """Add identity state for frames introduced by file or CLI operations.
+
+        Args:
+            None.
+
+        Returns:
+            None. Existing frame state is preserved.
+        """
+        for frame in range(len(self.coordinates)):
+            if frame not in self.supercell_bases:
+                self.supercell_bases[frame] = {
+                    "elements": np.array(self.elements[frame], copy=True),
+                    "coordinates": np.array(self.coordinates[frame], copy=True),
+                    "lattice": np.array(self.lattices[frame], copy=True),
+                }
+                self.supercell_transforms[frame] = (
+                    np.ones(3, dtype=np.int64),
+                    np.eye(3, dtype=np.int64),
+                )
+        for frame in list(self.supercell_bases):
+            if frame >= len(self.coordinates):
+                self.supercell_bases.pop(frame, None)
+                self.supercell_transforms.pop(frame, None)
+
+    def _supercell_context(self, frame_index):
+        """Copy one frame's supercell base and transform state.
+
+        Args:
+            frame_index: Frame whose state is copied.
+
+        Returns:
+            A detached context dictionary suitable for a history entry.
+        """
+        self._ensure_supercell_state()
+        base = self.supercell_bases[frame_index]
+        multipliers, matrix = self.supercell_transforms[frame_index]
+        return {
+            "base": {
+                "elements": np.array(base["elements"], copy=True),
+                "coordinates": np.array(base["coordinates"], copy=True),
+                "lattice": np.array(base["lattice"], copy=True),
+            },
+            "transform": (
+                np.array(multipliers, copy=True),
+                np.array(matrix, copy=True),
+            ),
+        }
+
+    def _restore_supercell_context(self, frame_index, context):
+        """Restore one frame's remembered supercell state.
+
+        Args:
+            frame_index: Frame receiving the state.
+            context: Context returned by `_supercell_context`, or ``None``.
+
+        Returns:
+            None. Missing context leaves the current state unchanged.
+        """
+        if context is None:
+            return
+        self.supercell_bases[frame_index] = {
+            "elements": np.array(context["base"]["elements"], copy=True),
+            "coordinates": np.array(context["base"]["coordinates"], copy=True),
+            "lattice": np.array(context["base"]["lattice"], copy=True),
+        }
+        multipliers, matrix = context["transform"]
+        self.supercell_transforms[frame_index] = (
+            np.array(multipliers, copy=True),
+            np.array(matrix, copy=True),
         )
-        self.undo_stack.append(history_entry)
+
+    def _all_supercell_context(self):
+        """Copy remembered supercell state for every retained frame.
+
+        Args:
+            None.
+
+        Returns:
+            Detached dictionaries suitable for a batch history entry.
+        """
+        self._ensure_supercell_state()
+        return {
+            "bases": {
+                frame: {
+                    "elements": np.array(value["elements"], copy=True),
+                    "coordinates": np.array(value["coordinates"], copy=True),
+                    "lattice": np.array(value["lattice"], copy=True),
+                }
+                for frame, value in self.supercell_bases.items()
+            },
+            "transforms": {
+                frame: (
+                    np.array(value[0], copy=True),
+                    np.array(value[1], copy=True),
+                )
+                for frame, value in self.supercell_transforms.items()
+            },
+        }
+
+    def _restore_all_supercell_context(self, context):
+        """Restore complete remembered supercell state after a batch change.
+
+        Args:
+            context: Dictionary produced by `_all_supercell_context`.
+
+        Returns:
+            None. State is detached from the history entry.
+        """
+        self.supercell_bases = {
+            frame: {
+                "elements": np.array(value["elements"], copy=True),
+                "coordinates": np.array(value["coordinates"], copy=True),
+                "lattice": np.array(value["lattice"], copy=True),
+            }
+            for frame, value in context["bases"].items()
+        }
+        self.supercell_transforms = {
+            frame: (np.array(value[0], copy=True), np.array(value[1], copy=True))
+            for frame, value in context["transforms"].items()
+        }
+
+    def _refresh_after_change(self, frame_index=None, reset_camera=False):
+        """Refresh viewer references and selection after a committed change.
+
+        Args:
+            frame_index: Preferred frame to display, or ``None`` for current.
+            reset_camera: Whether the scene should fit a new camera.
+
+        Returns:
+            None. The viewer is redrawn with the current raw lists.
+        """
+        self._ensure_supercell_state()
+        self.viewer.elements = self.elements
+        self.viewer.coordinates = self.coordinates
+        self.viewer.lattices = self.lattices
+        if self.coordinates:
+            target = self.current_index if frame_index is None else int(frame_index)
+            self.current_index = min(max(target, 0), len(self.coordinates) - 1)
+            self.viewer.current_index = self.current_index
+            self.viewer.selected_indices = self.viewer.selected_indices[
+                (self.viewer.selected_indices >= 0)
+                & (self.viewer.selected_indices < len(self.elements[self.current_index]))
+            ]
+            self.viewer.draw_frame(reset_camera=reset_camera)
+        else:
+            self.viewer.current_index = 0
+            self.viewer.draw_frame(reset_camera=reset_camera)
+        self._sync_frame_controls()
+        self._sync_atom_actions(self.viewer.selected_indices)
+        self.cli.bind_data(self.elements, self.coordinates, self.lattices)
+
+    def _record_change(self, change, already_applied=False, frame_index=None):
+        """Record one unified change and optionally apply its after snapshot.
+
+        Args:
+            change: `StructureChange` instance to retain.
+            already_applied: Whether the caller already wrote the after state.
+            frame_index: Frame to display after applying the change.
+
+        Returns:
+            None. Redo history is discarded after a new operation.
+        """
+        if not already_applied:
+            context = change.apply(
+                self.elements, self.coordinates, self.lattices, use_after=True
+            )
+            if change.frame_indices is not None and context is not None:
+                self._restore_supercell_context(change.frame_indices[0], context)
+            elif change.frame_indices is None and context is not None:
+                self._restore_all_supercell_context(context)
+        self.undo_stack.append(change)
         self.redo_stack.clear()
+        self._refresh_after_change(frame_index=frame_index)
         self._sync_history_actions()
+
+    def _record_coordinate_edit(self, frame_index, before_coordinates, after_coordinates):
+        """Record one completed mouse coordinate edit.
+
+        Args:
+            frame_index: Frame modified by the gesture.
+            before_coordinates: Complete coordinates before the gesture.
+            after_coordinates: Complete coordinates after the gesture.
+
+        Returns:
+            None. The already-applied edit enters unified history.
+        """
+        if not 0 <= int(frame_index) < len(self.coordinates):
+            return
+        change = StructureChange.for_frame(
+            "Move atoms",
+            int(frame_index),
+            self.elements[frame_index],
+            before_coordinates,
+            self.lattices[frame_index],
+            self.elements[frame_index],
+            after_coordinates,
+            self.lattices[frame_index],
+            before_context=self._supercell_context(frame_index),
+            after_context=self._supercell_context(frame_index),
+        )
+        self._record_change(change, already_applied=True, frame_index=frame_index)
 
     def _undo(self, checked=False):
         """Restore the coordinate snapshot before the latest edit.
@@ -693,17 +1182,19 @@ class MainWindow(QMainWindow):
         """
         if len(self.undo_stack) == 0:
             return
-        frame_index, before_coordinates, after_coordinates = self.undo_stack[-1]
-        has_valid_frame = 0 <= frame_index < len(self.coordinates)
-        has_matching_shape = has_valid_frame and self.coordinates[frame_index].shape == before_coordinates.shape
-        if not has_valid_frame or not has_matching_shape:
-            self._log("Undo unavailable: the recorded frame no longer matches the current data.")
-            return
+        change = self.undo_stack[-1]
         try:
-            self.coordinates[frame_index][...] = before_coordinates
+            context = change.apply(
+                self.elements, self.coordinates, self.lattices, use_after=False
+            )
+            if change.frame_indices is not None and context is not None:
+                self._restore_supercell_context(change.frame_indices[0], context)
+            elif change.frame_indices is None and context is not None:
+                self._restore_all_supercell_context(context)
             self.undo_stack.pop()
-            self.redo_stack.append((frame_index, before_coordinates, after_coordinates))
-            self._change_frame(frame_index)
+            self.redo_stack.append(change)
+            frame_index = change.frame_indices[0] if change.frame_indices else self.current_index
+            self._refresh_after_change(frame_index=frame_index)
         except (IndexError, RuntimeError, TypeError, ValueError) as error:
             self._log(f"Undo error: {error}")
         self._sync_history_actions()
@@ -719,17 +1210,19 @@ class MainWindow(QMainWindow):
         """
         if len(self.redo_stack) == 0:
             return
-        frame_index, before_coordinates, after_coordinates = self.redo_stack[-1]
-        has_valid_frame = 0 <= frame_index < len(self.coordinates)
-        has_matching_shape = has_valid_frame and self.coordinates[frame_index].shape == after_coordinates.shape
-        if not has_valid_frame or not has_matching_shape:
-            self._log("Redo unavailable: the recorded frame no longer matches the current data.")
-            return
+        change = self.redo_stack[-1]
         try:
-            self.coordinates[frame_index][...] = after_coordinates
+            context = change.apply(
+                self.elements, self.coordinates, self.lattices, use_after=True
+            )
+            if change.frame_indices is not None and context is not None:
+                self._restore_supercell_context(change.frame_indices[0], context)
+            elif change.frame_indices is None and context is not None:
+                self._restore_all_supercell_context(context)
             self.redo_stack.pop()
-            self.undo_stack.append((frame_index, before_coordinates, after_coordinates))
-            self._change_frame(frame_index)
+            self.undo_stack.append(change)
+            frame_index = change.frame_indices[0] if change.frame_indices else self.current_index
+            self._refresh_after_change(frame_index=frame_index)
         except (IndexError, RuntimeError, TypeError, ValueError) as error:
             self._log(f"Redo error: {error}")
         self._sync_history_actions()
@@ -786,11 +1279,371 @@ class MainWindow(QMainWindow):
         """Update bond cutoff tolerance."""
         self.viewer.set_bond_tolerance(tolerance)
 
+    def _show_supercell(self) -> None:
+        """Apply the selected transform to the current frame's base cell.
+
+        Args:
+            None.
+
+        Returns:
+            None. The committed transform is recorded in unified history.
+        """
+        if not self.coordinates:
+            QMessageBox.information(
+                self, "Supercell", "Open structure data before building a supercell."
+            )
+            return
+        frame_index = int(self.viewer.current_index)
+        if not 0 <= frame_index < len(self.coordinates):
+            QMessageBox.warning(self, "Supercell", "The current frame is not available.")
+            return
+
+        self._ensure_supercell_state()
+        multipliers, matrix = self.supercell_transforms[frame_index]
+        dialog = SupercellDialog(multipliers, matrix, self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        if dialog.resize_requested:
+            self._resize_supercell()
+            return
+        multipliers, matrix = dialog.values()
+        effective_transform = matrix @ np.diag(multipliers)
+        try:
+            base = self.supercell_bases[frame_index]
+            new_elements, new_coordinates, new_lattice = transform_structure(
+                base["elements"],
+                base["coordinates"],
+                base["lattice"],
+                effective_transform,
+            )
+        except ValueError as error:
+            QMessageBox.warning(self, "Supercell", str(error))
+            return
+
+        topology_changed = (
+            len(new_elements) != len(self.elements[frame_index])
+            or not np.array_equal(new_elements, self.elements[frame_index])
+        )
+        if topology_changed and not self._confirm_metrics_topology_change():
+            return
+
+        previous_atom_count = len(self.elements[frame_index])
+        before_context = self._supercell_context(frame_index)
+        self.supercell_transforms[frame_index] = (
+            np.array(multipliers, copy=True),
+            np.array(matrix, copy=True),
+        )
+        after_context = self._supercell_context(frame_index)
+        change = StructureChange.for_frame(
+            "Supercell",
+            frame_index,
+            self.elements[frame_index],
+            self.coordinates[frame_index],
+            self.lattices[frame_index],
+            new_elements,
+            new_coordinates,
+            new_lattice,
+            before_context=before_context,
+            after_context=after_context,
+        )
+        self._record_change(change, frame_index=frame_index)
+        blocker = QSignalBlocker(self.zoom_input)
+        self.zoom_input.setValue(100)
+        del blocker
+        QMessageBox.information(
+            self,
+            "Supercell",
+            "Transformed the current frame from "
+            f"{previous_atom_count} to {len(new_elements)} atoms.",
+        )
+
+    def _resize_supercell(self) -> None:
+        """Rebase the current frame and reset its remembered transform.
+
+        Args:
+            None.
+
+        Returns:
+            None. The visible structure is unchanged and future transforms start
+            from the current frame with identity settings.
+        """
+        if not self.coordinates:
+            self._log("Open structure data before resizing a supercell.")
+            return
+        frame_index = int(self.current_index)
+        before_context = self._supercell_context(frame_index)
+        self.supercell_bases[frame_index] = {
+            "elements": np.array(self.elements[frame_index], copy=True),
+            "coordinates": np.array(self.coordinates[frame_index], copy=True),
+            "lattice": np.array(self.lattices[frame_index], copy=True),
+        }
+        self.supercell_transforms[frame_index] = (
+            np.ones(3, dtype=np.int64),
+            np.eye(3, dtype=np.int64),
+        )
+        after_context = self._supercell_context(frame_index)
+        change = StructureChange.for_frame(
+            "Resize supercell base",
+            frame_index,
+            self.elements[frame_index],
+            self.coordinates[frame_index],
+            self.lattices[frame_index],
+            self.elements[frame_index],
+            self.coordinates[frame_index],
+            self.lattices[frame_index],
+            before_context=before_context,
+            after_context=after_context,
+        )
+        self._record_change(change, already_applied=True, frame_index=frame_index)
+        self._log("Current frame is now the supercell base (1 1 1).")
+
+    @staticmethod
+    def _identity_supercell_context(elements, coordinates, lattice):
+        """Build a new identity supercell context for changed topology.
+
+        Args:
+            elements: Element array becoming the new base.
+            coordinates: Coordinate array becoming the new base.
+            lattice: Lattice array becoming the new base.
+
+        Returns:
+            Detached identity-base context.
+        """
+        return {
+            "base": {
+                "elements": np.array(elements, copy=True),
+                "coordinates": np.array(coordinates, copy=True),
+                "lattice": np.array(lattice, copy=True),
+            },
+            "transform": (
+                np.ones(3, dtype=np.int64),
+                np.eye(3, dtype=np.int64),
+            ),
+        }
+
+    def _show_add_atom(self) -> None:
+        """Open the atom dialog and start direct or reference placement.
+
+        Args:
+            None.
+
+        Returns:
+            None. Direct coordinates commit immediately; reference mode delegates
+            placement to the viewer.
+        """
+        if not self.coordinates:
+            self._log("Open structure data before adding an atom.")
+            return
+        dialog = AddAtomDialog(self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        try:
+            symbol, coordinates, reference_requested = dialog.values()
+        except ValueError as error:
+            QMessageBox.warning(self, "Invalid atom", str(error))
+            return
+        if reference_requested:
+            self.viewer.begin_atom_addition(symbol)
+            return
+        self._commit_added_atoms(
+            int(self.current_index),
+            np.asarray([symbol], dtype="<U3"),
+            np.asarray([coordinates], dtype=float),
+            "Add atom",
+        )
+
+    def _confirm_metrics_topology_change(self) -> bool:
+        """Ask whether persistent measurements may be removed before topology edits.
+
+        Args:
+            None.
+
+        Returns:
+            ``True`` when the edit may continue, otherwise ``False``.
+        """
+        has_metrics = len(self.viewer.length_measurements) > 0 or len(
+            self.viewer.angle_measurements
+        ) > 0
+        if not has_metrics:
+            return True
+        answer = QMessageBox.question(
+            self,
+            "Remove Metrics",
+            "This change will permanently remove all metrics (cannot undo). Continue?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return False
+        self.viewer.length_measurements.clear()
+        self.viewer.angle_measurements.clear()
+        return True
+
+    def _commit_added_atoms(self, frame_index, symbols, coordinates, description):
+        """Append atoms to one frame through unified history.
+
+        Args:
+            frame_index: Frame receiving the new atoms.
+            symbols: One-dimensional element symbols.
+            coordinates: Cartesian positions shaped ``(N, 3)``.
+            description: History description.
+
+        Returns:
+            None. The full scene is rebuilt after one atomic commit.
+        """
+        if not 0 <= int(frame_index) < len(self.coordinates):
+            return
+        frame_index = int(frame_index)
+        symbols = np.asarray(symbols, dtype="<U3").reshape(-1)
+        coordinates = np.asarray(coordinates, dtype=float).reshape((-1, 3))
+        if len(symbols) != len(coordinates) or len(symbols) == 0:
+            return
+        if not self._confirm_metrics_topology_change():
+            return
+        before_elements = self.elements[frame_index]
+        before_coordinates = self.coordinates[frame_index]
+        before_lattice = self.lattices[frame_index]
+        after_elements = np.concatenate((before_elements, symbols))
+        after_coordinates = np.vstack((before_coordinates, coordinates))
+        before_context = self._supercell_context(frame_index)
+        after_context = self._identity_supercell_context(
+            after_elements, after_coordinates, before_lattice
+        )
+        change = StructureChange.for_frame(
+            description,
+            frame_index,
+            before_elements,
+            before_coordinates,
+            before_lattice,
+            after_elements,
+            after_coordinates,
+            before_lattice,
+            before_context=before_context,
+            after_context=after_context,
+        )
+        self._record_change(change, frame_index=frame_index)
+
+    def _commit_reference_atoms(self, frame_index, symbols, coordinates):
+        """Commit a complete reference-placement chain as one change.
+
+        Args:
+            frame_index: Frame receiving the pending atoms.
+            symbols: Pending element symbols.
+            coordinates: Pending Cartesian coordinates.
+
+        Returns:
+            None. Delegates to the common atom-appending path.
+        """
+        self._commit_added_atoms(frame_index, symbols, coordinates, "Add atoms")
+
+    def _delete_selected_atoms(self, frame_index, indices):
+        """Delete selected atoms and record one reversible topology change.
+
+        Args:
+            frame_index: Frame containing the selection.
+            indices: Integer atom indices to remove.
+
+        Returns:
+            None. Invalid selections are ignored after a concise log message.
+        """
+        if not 0 <= int(frame_index) < len(self.coordinates):
+            return
+        frame_index = int(frame_index)
+        indices = np.unique(np.asarray(indices, dtype=int))
+        if len(indices) == 0 or np.any(indices < 0) or np.any(
+            indices >= len(self.elements[frame_index])
+        ):
+            self._log("Delete ignored: atom selection is out of range.")
+            return
+        if not self._confirm_metrics_topology_change():
+            return
+        before_elements = self.elements[frame_index]
+        before_coordinates = self.coordinates[frame_index]
+        before_lattice = self.lattices[frame_index]
+        after_elements = np.delete(before_elements, indices)
+        after_coordinates = np.delete(before_coordinates, indices, axis=0)
+        before_context = self._supercell_context(frame_index)
+        after_context = self._identity_supercell_context(
+            after_elements, after_coordinates, before_lattice
+        )
+        change = StructureChange.for_frame(
+            "Delete atoms",
+            frame_index,
+            before_elements,
+            before_coordinates,
+            before_lattice,
+            after_elements,
+            after_coordinates,
+            before_lattice,
+            before_context=before_context,
+            after_context=after_context,
+        )
+        self._record_change(change, frame_index=frame_index)
+
     def _show_appearance(self):
         """Open the atom and bond appearance editor for the current frame."""
         elements = self.elements[self.current_index] if len(self.elements) > 0 else []
         dialog = AppearanceDialog(self.viewer, elements, self)
         dialog.exec()
+
+    def _show_replace_atom(self) -> None:
+        """Replace the element type of all currently selected atoms.
+
+        Args:
+            None.
+
+        Returns:
+            None. The replacement is recorded as one reversible structure change.
+        """
+        frame_index = int(self.current_index)
+        indices = np.asarray(self.viewer.selected_indices, dtype=int)
+        if not 0 <= frame_index < len(self.elements) or len(indices) == 0:
+            return
+        dialog = AddAtomDialog(self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        try:
+            symbol, _, reference_requested = dialog.values()
+        except ValueError as error:
+            QMessageBox.warning(self, "Invalid atom", str(error))
+            return
+        if reference_requested:
+            QMessageBox.information(
+                self, "Replace Atom", "Reference placement is not available for replacement."
+            )
+            return
+        before_elements = self.elements[frame_index]
+        before_coordinates = self.coordinates[frame_index]
+        before_lattice = self.lattices[frame_index]
+        after_elements = before_elements.copy()
+        after_elements[indices] = symbol
+        before_context = self._supercell_context(frame_index)
+        change = StructureChange.for_frame(
+            "Replace atoms",
+            frame_index,
+            before_elements,
+            before_coordinates,
+            before_lattice,
+            after_elements,
+            before_coordinates,
+            before_lattice,
+            before_context=before_context,
+            after_context=before_context,
+        )
+        self._record_change(change, frame_index=frame_index)
+
+    def _sync_atom_actions(self, indices=None):
+        """Enable replacement only when the current frame has a valid selection."""
+        if not hasattr(self, "replace_atom_action"):
+            return
+        selected = self.viewer.selected_indices if indices is None else np.asarray(indices, dtype=int)
+        has_selection = (
+            len(selected) > 0
+            and 0 <= self.current_index < len(self.elements)
+            and np.all(selected >= 0)
+            and np.all(selected < len(self.elements[self.current_index]))
+        )
+        self.replace_atom_action.setEnabled(bool(has_selection))
 
     def _sync_frame_controls(self):
         """Synchronize frame input and maximum-frame display with retained lists."""
@@ -807,6 +1660,7 @@ class MainWindow(QMainWindow):
         self.next_frame_button.setEnabled(has_frames)
         self.play_button.setEnabled(has_frames)
         self.pause_button.setEnabled(has_frames)
+        self._sync_atom_actions(self.viewer.selected_indices)
 
     def _change_frame(self, index):
         """Display a valid frame and update the frame controls.
@@ -857,29 +1711,47 @@ class MainWindow(QMainWindow):
         self.zoom_input.setValue(self.zoom_input.value() + delta)
 
     def _create_menus(self):
-        """Create file and playback menu actions.
+        """Create File, Settings, Appearance, and View menus.
 
         Args:
             None.
 
         Return:
-            None. Connects menu actions to the same commands as the console.
+            None. Connects top-level actions and embeds zoom controls in View.
         """
-        file_menu = self.menuBar().addMenu("File")
+        menu_bar = self.menuBar()
+        file_menu = menu_bar.addMenu("File")
         open_action = file_menu.addAction("Open...")
         open_action.setShortcut("Ctrl+O")
         open_action.triggered.connect(self._open_dialog)
         save_action = file_menu.addAction("Save As...")
         save_action.setShortcut("Ctrl+Shift+S")
         save_action.triggered.connect(self._save_dialog)
-        export_action = file_menu.addAction("Export batch...")
+        shortcut_action = file_menu.addAction("Create Desktop Shortcut")
+        shortcut_action.triggered.connect(self._create_shortcut)
+        export_action = file_menu.addAction("Export Batch...")
         export_action.triggered.connect(self._export_dialog)
-        playback_menu = self.menuBar().addMenu("Playback")
-        play_action = playback_menu.addAction("Play")
-        play_action.setShortcut("Space")
-        play_action.triggered.connect(self._start_default_playback)
-        pause_action = playback_menu.addAction("Pause")
-        pause_action.triggered.connect(self._pause_playback)
+        settings_action = QAction("Settings", self)
+        settings_action.triggered.connect(self._show_settings)
+        menu_bar.addAction(settings_action)
+        appearance_action = QAction("Appearance", self)
+        appearance_action.triggered.connect(self._show_appearance)
+        menu_bar.addAction(appearance_action)
+
+        view_menu = menu_bar.addMenu("View")
+        view_menu.addAction("Along A", lambda: self._set_view(0))
+        view_menu.addAction("Along B", lambda: self._set_view(1))
+        view_menu.addAction("Along C", lambda: self._set_view(2))
+        view_menu.addSeparator()
+        zoom_controls = QWidget(view_menu)
+        zoom_layout = QHBoxLayout(zoom_controls)
+        zoom_layout.setContentsMargins(8, 4, 8, 4)
+        zoom_layout.addWidget(self.zoom_minus_button)
+        zoom_layout.addWidget(self.zoom_input)
+        zoom_layout.addWidget(self.zoom_plus_button)
+        zoom_action = QWidgetAction(view_menu)
+        zoom_action.setDefaultWidget(zoom_controls)
+        view_menu.addAction(zoom_action)
 
     def set_data(self, elements, coordinates, lattices):
         """Set the three raw frame-ordered array lists.
@@ -900,6 +1772,8 @@ class MainWindow(QMainWindow):
         self.elements = elements
         self.coordinates = coordinates
         self.lattices = lattices
+        self._initialize_supercell_state()
+        self.cli.bind_data(self.elements, self.coordinates, self.lattices)
         self.current_index = 0
         self.viewer.set_data(elements, coordinates, lattices)
         blocker = QSignalBlocker(self.zoom_input)
@@ -943,6 +1817,69 @@ class MainWindow(QMainWindow):
                 self._open(paths)
             except (ImportError, OSError, RuntimeError, TypeError, ValueError) as error:
                 self._log(f"Open error: {error}")
+                QMessageBox.warning(self, "Open structure", self._open_error_message(error))
+
+    @staticmethod
+    def _open_error_message(error):
+        """Choose the user-facing message for a failed external structure read.
+
+        Args:
+            error: Exception raised by the configured input handler.
+
+        Returns:
+            A concise diagnostic, including the required unknown-format text.
+        """
+        if isinstance(error, RuntimeError) and "BUCToolkit" in str(error):
+            return str(error)
+        return (
+            "Unknown file format! Please check your input file. "
+            "Support cif, xyz, vasp files."
+        )
+
+    def _open_dropped_files(self, paths):
+        """Load local files dropped onto the viewer.
+
+        Args:
+            paths: Local file paths emitted by StructureViewer.
+
+        Returns:
+            None. Errors are logged and shown without exposing a Qt traceback.
+        """
+        try:
+            self._open(paths)
+        except (ImportError, OSError, RuntimeError, TypeError, ValueError) as error:
+            self._log(f"Open error: {error}")
+            QMessageBox.warning(self, "Open structure", self._open_error_message(error))
+
+    def dragEnterEvent(self, event):
+        """Accept local files dropped on the main window frame.
+
+        Args:
+            event: Qt drag-enter event.
+
+        Returns:
+            None. Local URL drops are accepted for loading.
+        """
+        if event.mimeData().hasUrls():
+            event.acceptProposedAction()
+            return
+        super().dragEnterEvent(event)
+
+    def dropEvent(self, event):
+        """Load local files dropped outside the viewer child widget.
+
+        Args:
+            event: Qt drop event.
+
+        Returns:
+            None. Non-local drops are delegated to Qt.
+        """
+        paths = [url.toLocalFile() for url in event.mimeData().urls() if url.isLocalFile()]
+        if paths:
+            self._open_dropped_files(paths)
+            event.acceptProposedAction()
+            return
+        super().dropEvent(event)
 
     def _save_dialog(self):
         """Save the current raw lists through a Qt file dialog.
@@ -1032,6 +1969,10 @@ class MainWindow(QMainWindow):
             self.elements = elements
             self.coordinates = coordinates
             self.lattices = lattices
+            if previous_count == 0:
+                self._initialize_supercell_state()
+            else:
+                self._ensure_supercell_state()
             self.viewer.set_data(elements, coordinates, lattices)
             self._change_frame(min(previous_count, len(coordinates) - 1))
             self._log(f"Appended {len(coordinates) - previous_count} frame(s) from selected files")
@@ -1048,6 +1989,8 @@ class MainWindow(QMainWindow):
             self.current_index = self.viewer.current_index
             self._sync_frame_controls()
             self._log(f"Appended {len(elements)} frame(s) from selected files")
+            self._ensure_supercell_state()
+        self.cli.bind_data(self.elements, self.coordinates, self.lattices)
 
     def _save(self, path):
         """Save only the currently displayed frame to a file.
@@ -1134,73 +2077,108 @@ class MainWindow(QMainWindow):
         self.command.clear()
         if not source:
             return
-        self._log(f"> {source}")
+        prompt = "..." if self.cli._continuation else ">>>"
+        self._log(f"{prompt} {source}")
         try:
-            self._execute(shlex.split(source))
+            continuation = self.cli.execute(source)
+            self.command.setPlaceholderText(
+                "... continue Python block" if continuation else ">>> Python or GUI command"
+            )
         except (ImportError, OSError, RuntimeError, TypeError, ValueError, IndexError) as error:
             self._log(f"Command error: {error}")
 
-    def _execute(self, parts):
-        """Dispatch a parsed console command.
+    def _select_indices(self, indices):
+        """Apply a CLI atom selection and redraw the current frame.
 
         Args:
-            parts: Shell-like tokens from one console line.
+            indices: Unique integer atom indices.
 
         Return:
-            None. Executes the command or reports its usage.
+            None. The viewer selection is updated in place.
         """
-        if not parts:
-            return
-        name, args = parts[0].lower(), parts[1:]
-        if name == "help":
-            self._log("open PATH | save PATH | frame INDEX | play [START:STOP:STEP] [--fps N] | pause | stop | select INDEX... | clear | view reset")
-        elif name == "open" and len(args) == 1:
-            self._open(args[0])
-        elif name == "save":
-            if len(args) != 1:
-                raise ValueError("usage: save PATH")
-            self._save(args[0])
-        elif name == "frame" and len(args) == 1:
-            index = int(args[0])
-            self._change_frame(index)
-        elif name == "play":
-            specification = None
-            fps = 10
-            index = 0
-            while index < len(args):
-                if args[index] == "--fps" and index + 1 < len(args):
-                    fps = int(args[index + 1])
-                    index += 2
-                elif specification is None:
-                    specification = args[index]
-                    index += 1
-                else:
-                    raise ValueError("usage: play [START:STOP:STEP] [--fps N]")
-            self._play(specification, fps)
-        elif name == "pause" and not args:
-            self._pause_playback()
-        elif name == "stop" and not args:
-            self._pause_playback()
-            if len(self.coordinates) > 0:
-                self._change_frame(0)
-        elif name == "select" and args:
-            if len(self.coordinates) == 0:
-                raise ValueError("open a structure before selecting atoms")
-            indices = np.asarray([int(value) for value in args], dtype=int)
-            if np.any(indices < 0) or np.any(indices >= len(self.elements[self.current_index])):
-                raise ValueError("atom index is out of range")
-            self.viewer.selected_indices = np.unique(indices)
-            self.viewer.draw_frame()
-        elif name == "clear" and not args:
-            self.viewer.selected_indices = np.empty(0, dtype=int)
-            self.viewer.draw_frame()
-        elif name == "view" and args == ["reset"]:
-            self.viewer.reset_view()
-            blocker = QSignalBlocker(self.zoom_input)
-            self.zoom_input.setValue(100)
-            del blocker
-        else:
-            raise ValueError("unknown command or invalid arguments; enter help")
+        self.viewer.selected_indices = np.asarray(indices, dtype=int)
+        self.viewer.draw_frame()
+        self._sync_atom_actions(self.viewer.selected_indices)
+
+    def _clear_selection(self):
+        """Clear the viewer atom selection.
+
+        Args:
+            None.
+
+        Return:
+            None. The current frame is redrawn without selected atoms.
+        """
+        self.viewer.selected_indices = np.empty(0, dtype=int)
+        self.viewer.draw_frame()
+        self._sync_atom_actions(self.viewer.selected_indices)
+
+    def _reset_view(self):
+        """Reset the camera and synchronize the zoom control.
+
+        Args:
+            None.
+
+        Return:
+            None. The viewer returns to its default camera view.
+        """
+        self.viewer.reset_view()
+        blocker = QSignalBlocker(self.zoom_input)
+        self.zoom_input.setValue(100)
+        del blocker
+
+    def _on_cli_data_changed(self, elements, coordinates, lattices):
+        """Refresh the GUI after a validated CLI list edit.
+
+        Args:
+            elements: Validated element arrays.
+            coordinates: Validated Cartesian coordinate arrays.
+            lattices: Validated lattice arrays.
+
+        Return:
+            None. The current frame is redrawn without replacing list owners.
+        """
+        validate_data(elements, coordinates, lattices)
+        before_context = self._all_supercell_context()
+        before_elements = [np.array(value, copy=True) for value in self.elements]
+        before_coordinates = [np.array(value, copy=True) for value in self.coordinates]
+        before_lattices = [np.array(value, copy=True) for value in self.lattices]
+        self._pause_playback()
+        self.elements = elements
+        self.coordinates = coordinates
+        self.lattices = lattices
+        self._initialize_supercell_state()
+        after_context = self._all_supercell_context()
+        change = StructureChange.for_batch(
+            "CLI data edit",
+            before_elements,
+            before_coordinates,
+            before_lattices,
+            elements,
+            coordinates,
+            lattices,
+            before_context=before_context,
+            after_context=after_context,
+        )
+        self._record_change(change, already_applied=True)
+        self._restore_all_supercell_context(after_context)
+
+    def _create_shortcut(self):
+        """Create an optional desktop shortcut and report missing dependencies.
+
+        Args:
+            None.
+
+        Return:
+            None. A warning is shown when pyshortcuts is unavailable.
+        """
+        try:
+            self.cli.create_shortcut()
+        except RuntimeError as error:
+            QMessageBox.information(self, "Desktop shortcut", str(error))
+            self._log(str(error))
+        except (OSError, TypeError, ValueError) as error:
+            self._log(f"Desktop shortcut error: {error}")
 
     def _log(self, message):
         """Append one line to the command output pane.
