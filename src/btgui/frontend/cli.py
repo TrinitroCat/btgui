@@ -107,6 +107,7 @@ class CLI:
         on_view_reset: Callable,
         on_data_changed: Callable,
         on_shortcut: Callable,
+        on_executed: Callable | None = None,
         buctoolkit_paths=None,
     ) -> None:
         self._log = log
@@ -121,6 +122,7 @@ class CLI:
         self._on_view_reset = on_view_reset
         self._on_data_changed = on_data_changed
         self._on_shortcut = on_shortcut
+        self._on_executed = on_executed
         self._targets = {"coo": [], "cell": [], "elements": []}
         self._backup = {name: [] for name in self._IN_VAR_SET}
         self._work = {name: [] for name in self._IN_VAR_SET}
@@ -418,6 +420,20 @@ class CLI:
         )
 
     def execute(self, source: str) -> bool:
+        """Execute input and notify the GUI after each completed command or cell.
+
+        Args:
+            source: Text entered in the command field.
+
+        Returns:
+            ``True`` while an incomplete Python block awaits more input.
+        """
+        continuation = self._execute(source)
+        if not continuation and self._on_executed is not None:
+            self._on_executed()
+        return continuation
+
+    def _execute(self, source: str) -> bool:
         """Execute one GUI command or Python interpreter line.
 
         Args:

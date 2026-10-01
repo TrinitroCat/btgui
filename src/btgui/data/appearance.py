@@ -11,21 +11,12 @@ from pathlib import Path
 _DATA_DIR = Path(__file__).parent
 _COVALENT = json.loads((_DATA_DIR / "covar_radii_stub.json").read_text(encoding="utf-8"))
 _VDW = json.loads((_DATA_DIR / "vdw_radii_stub.json").read_text(encoding="utf-8"))
+ELEMENT_COLORS = json.loads(
+    (_DATA_DIR / "colours_stub.json").read_text(encoding="utf-8")
+)
 
-ELEMENT_SYMBOLS = (
-    "H He Li Be B C N O F Ne Na Mg Al Si P S Cl Ar K Ca Sc Ti V Cr Mn Fe Co Ni Cu Zn Ga Ge As Se Br Kr "
-    "Rb Sr Y Zr Nb Mo Tc Ru Rh Pd Ag Cd In Sn Sb Te I Xe Cs Ba La Ce Pr Nd Pm Sm Eu Gd Tb Dy Ho Er Tm Yb Lu "
-    "Hf Ta W Re Os Ir Pt Au Hg Tl Pb Bi Po At Rn Fr Ra Ac Th Pa U Np Pu Am Cm Bk Cf Es Fm Md No Lr Rf Db Sg Bh Hs Mt Ds Rg"
-).split()
+ELEMENT_SYMBOLS = [symbol for symbol in ELEMENT_COLORS if symbol != "X"]
 
-ELEMENT_COLORS = {
-    "H": "#f2f2f2", "He": "#d9ffff", "Li": "#cc80ff", "Be": "#c2ff00", "B": "#ffb5b5",
-    "C": "#4a4a4a", "N": "#3050f8", "O": "#ff2020", "F": "#90e050", "Ne": "#b3e3f5",
-    "Na": "#ab5cf2", "Mg": "#8aff00", "Al": "#bfa6a6", "Si": "#f0c8a0", "P": "#ff8000",
-    "S": "#ffff30", "Cl": "#1ff01f", "Ar": "#80d1e3", "K": "#8f40d4", "Ca": "#3dff00",
-    "Fe": "#e06633", "Co": "#f090a0", "Ni": "#50d050", "Cu": "#c88033", "Zn": "#7d80b0",
-    "Br": "#a62929", "I": "#940094", "Au": "#ffd123", "Hg": "#b8b8d0",
-}
 _SYMBOL_TO_NAME = dict(item.split(":") for item in (
     "H:Hydrogen He:Helium "
     "Li:Lithium Be:Beryllium B:Boron C:Carbon N:Nitrogen O:Oxygen F:Fluorine Ne:Neon "
@@ -78,4 +69,4 @@ def vdw_radius(symbol):
 
 def default_color(symbol):
     """Return a hex color for an element symbol."""
-    return ELEMENT_COLORS.get(symbol, "#5a9b72")
+    return ELEMENT_COLORS.get(str(symbol), ELEMENT_COLORS["X"])

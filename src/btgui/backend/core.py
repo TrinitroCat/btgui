@@ -2,6 +2,8 @@
 
 import numpy as np
 
+from btgui.data.appearance import ELEMENT_COLORS
+
 
 def distance_between(coordinates: np.ndarray, first: int, second: int) -> float:
     """Return the Euclidean distance between two atoms in one frame.
@@ -90,8 +92,6 @@ def validate_data(
     """
     if not (len(elements) == len(coordinates) == len(lattices)):
         raise ValueError("elements, coordinates, and lattices must have equal frame counts")
-    if not elements:
-        raise ValueError("at least one structure is required")
     for frame, (frame_elements, frame_coordinates, lattice) in enumerate(
         zip(elements, coordinates, lattices)
     ):
@@ -181,3 +181,69 @@ def parse_frame_range(specification: str, frame_count: int) -> list[int]:
         raise ValueError("frame step cannot be zero")
     start, stop, step = slice(*values).indices(frame_count)
     return list(range(start, stop, step))
+
+
+def parse_atom_selection(specification: str, elements: np.ndarray | list) -> list[int]:
+    """Parse one-based atom numbers, ranges, and exact element-stub keys.
+
+    Args:
+        specification: Comma-separated selector text; empty selects all atoms.
+        elements: Current-frame element symbols.
+
+    Return:
+        Sorted unique zero-based atom indices.
+
+    Raises:
+        ValueError: If a token is malformed, unknown, reversed, or out of range.
+    """
+    values = np.asarray(elements, dtype=str).reshape(-1)
+    text = str(specification).strip()
+    if not text:
+        return list(range(len(values)))
+    selected = set()
+    for raw_token in text.split(","):
+        token = raw_token.strip()
+        if not token:
+            raise ValueError("atom selector contains an empty item")
+        if token in ELEMENT_COLORS:
+            selected.update(np.flatnonzero(values == token).tolist())
+            continue
+        parts = token.split("-")
+        if len(parts) > 2 or any(not part.strip().isdigit() for part in parts):
+            raise ValueError(f"invalid atom selector token: {token}")
+        start = int(parts[0])
+        stop = int(parts[-1])
+        if start <= 0 or stop <= 0 or start > stop or stop > len(values):
+            raise ValueError(f"atom selector must stay within 1-{len(values)}")
+        selected.update(range(start - 1, stop))
+    return sorted(selected)
+
+
+def format_atom_selection(indices: list[int] | np.ndarray, elements: np.ndarray | list) -> str:
+    """Format selected one-based atom indices with compact runs of three or more.
+
+    Args:
+        indices: Zero-based selected atom indices.
+        elements: Current-frame element symbols used for optional grouping context.
+
+    Return:
+        Canonical comma-separated one-based selector text.
+    """
+    del elements
+    values = sorted(set(int(index) for index in np.asarray(indices, dtype=int).tolist()))
+    if not values:
+        return ""
+    result = []
+    start = previous = values[0]
+    for value in values[1:] + [None]:
+        if value is not None and value == previous + 1:
+            previous = value
+            continue
+        length = previous - start + 1
+        if length >= 3:
+            result.append(f"{start + 1}-{previous + 1}")
+        else:
+            result.extend(str(index + 1) for index in range(start, previous + 1))
+        if value is not None:
+            start = previous = value
+    return ",".join(result)

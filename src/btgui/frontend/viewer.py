@@ -39,6 +39,8 @@ class StructureViewer(QtInteractor):
         self.selected_indices = np.empty(0, dtype=int)
         self.property_renderers = {}
         self.atom_styles = {}
+        self.atom_frame_styles = []
+        self.frame_metrics = []
         self.default_atom_style = "covalent"
         self.default_custom_radius = 0.76
         self._background_color_value = "#f5f7f7"
@@ -151,10 +153,29 @@ class StructureViewer(QtInteractor):
         self.lattices = lattices
         self.current_index = 0
         self.selected_indices = np.empty(0, dtype=int)
-        self.length_measurements.clear()
-        self.angle_measurements.clear()
+        self.length_measurements = {}
+        self.angle_measurements = {}
         self.set_measurement_mode(None)
         self.draw_frame(reset_camera=True)
+
+    def set_frame_state(self, atom_styles, metrics):
+        """Attach frame-aligned atom styles and measurement mappings.
+
+        Args:
+            atom_styles: Per-frame lists of per-atom style dictionaries.
+            metrics: Per-frame dictionaries containing length and angle mappings.
+
+        Return:
+            None. The provided containers remain owned by the main window.
+        """
+        self.atom_frame_styles = atom_styles
+        self.frame_metrics = metrics
+        if 0 <= self.current_index < len(metrics):
+            self.length_measurements = metrics[self.current_index]["length"]
+            self.angle_measurements = metrics[self.current_index]["angle"]
+        else:
+            self.length_measurements = {}
+            self.angle_measurements = {}
 
     def set_frame(self, index):
         """Display one frame while retaining the current camera.
@@ -169,6 +190,12 @@ class StructureViewer(QtInteractor):
             raise IndexError("frame index is out of range")
         self.current_index = index
         self.selected_indices = np.empty(0, dtype=int)
+        if 0 <= index < len(self.frame_metrics):
+            self.length_measurements = self.frame_metrics[index]["length"]
+            self.angle_measurements = self.frame_metrics[index]["angle"]
+        else:
+            self.length_measurements = {}
+            self.angle_measurements = {}
         self.draw_frame()
 
     def draw_frame(self, reset_camera=False):
@@ -180,7 +207,7 @@ class StructureViewer(QtInteractor):
         Return:
             None. Atom coordinates remain owned by the caller and are not copied.
         """
-        camera_position = None if reset_camera else self.camera_position
+        camera_state = None if reset_camera else self._camera_state()
         self.clear()
         self._configure_lights()
         self.selected_actors = []
@@ -205,8 +232,8 @@ class StructureViewer(QtInteractor):
         ]
         selected_mask[valid_selected] = True
         for index, symbol in enumerate(elements):
-            style = self._style_for(symbol)
-            radius = self._style_radius(symbol)
+            style = self._style_for(symbol, index)
+            radius = self._style_radius(symbol, index)
             key = (style["color"], style["alpha"], radius, selected_mask[index])
             groups.setdefault(key, []).append(index)
         material = self._material_properties()
@@ -255,7 +282,9 @@ class StructureViewer(QtInteractor):
             selected_elements = elements[valid_selected]
             for symbol in np.unique(selected_elements):
                 indices = valid_selected[selected_elements == symbol]
-                radius = self._style_radius(symbol) * 1.08 + 0.025
+                radius = max(
+                    self._style_radius(elements[index], int(index)) for index in indices
+                ) * 1.08 + 0.025
                 source = pv.Sphere(radius=radius, theta_resolution=24, phi_resolution=16)
                 shells = pv.PolyData(positions[indices]).glyph(
                     orient=False,
@@ -285,12 +314,45 @@ class StructureViewer(QtInteractor):
             self.camera_position = "iso"
             self.reset_camera()
             self._capture_zoom_reference()
-        elif camera_position is not None:
-            self.camera_position = camera_position
-            self.reset_camera_clipping_range()
+        elif camera_state is not None:
+            self._restore_camera_state(camera_state)
         self.render()
 
-    def _style_for(self, symbol):
+    def _camera_state(self):
+        """Snapshot immutable numeric camera state before rebuilding actors.
+
+        Args:
+            None.
+
+        Return:
+            Numeric position, focal point, view-up, scale, angle, and clipping range.
+        """
+        return {
+            "position": tuple(float(value) for value in self.camera.position),
+            "focal_point": tuple(float(value) for value in self.camera.focal_point),
+            "view_up": tuple(float(value) for value in self.camera.up),
+            "parallel_scale": float(self.camera.parallel_scale),
+            "view_angle": float(self.camera.view_angle),
+            "clipping_range": tuple(float(value) for value in self.camera.clipping_range),
+        }
+
+    def _restore_camera_state(self, state):
+        """Restore a numeric camera snapshot exactly after a scene rebuild.
+
+        Args:
+            state: Dictionary returned by :meth:`_camera_state`.
+
+        Return:
+            None. No zoom reference is recaptured.
+        """
+        self.camera.position = state["position"]
+        self.camera.focal_point = state["focal_point"]
+        self.camera.up = state["view_up"]
+        self.camera.parallel_scale = state["parallel_scale"]
+        self.camera.view_angle = state["view_angle"]
+        self.camera.clipping_range = state["clipping_range"]
+
+    def _style_for(self, symbol, atom_index=None):
         """Return one element style merged with defaults.
 
         Args:
@@ -300,6 +362,12 @@ class StructureViewer(QtInteractor):
             A dictionary containing display type, color, opacity, and radius.
         """
         style = self.atom_styles.get(symbol, {})
+        if (
+            atom_index is not None
+            and 0 <= self.current_index < len(self.atom_frame_styles)
+            and 0 <= atom_index < len(self.atom_frame_styles[self.current_index])
+        ):
+            style = {**style, **self.atom_frame_styles[self.current_index][atom_index]}
         return {
             "style": style.get("style", self.default_atom_style),
             "color": style.get("color", default_color(symbol)),
@@ -343,7 +411,7 @@ class StructureViewer(QtInteractor):
         }
         self.material_ambient, self.material_diffuse, self.material_specular, self.material_roughness, self.material_metallic = presets[material]
 
-    def _style_radius(self, symbol):
+    def _style_radius(self, symbol, atom_index=None):
         """Resolve one atom's physical display radius in angstroms.
 
         Args:
@@ -352,7 +420,7 @@ class StructureViewer(QtInteractor):
         Return:
             Radius used by the VTK sphere geometry.
         """
-        style = self._style_for(symbol)
+        style = self._style_for(symbol, atom_index)
         if style["style"] == "point":
             return 0.12
         if style["style"] == "covalent":
@@ -380,8 +448,8 @@ class StructureViewer(QtInteractor):
                 if distance == 0 or distance > (radii[left] + radii[right]) * self.bond_tolerance:
                     continue
                 color = self._blend_colors(
-                    self._style_for(elements[left])["color"],
-                    self._style_for(elements[right])["color"],
+                    self._style_for(elements[left], left)["color"],
+                    self._style_for(elements[right], right)["color"],
                 )
                 cylinder = pv.Cylinder(
                     center=(positions[left] + positions[right]) / 2,
@@ -797,15 +865,22 @@ class StructureViewer(QtInteractor):
                 return value
         return str(color)
 
-    def _measurement_color(self):
-        """Return a line color with high contrast against the background."""
-        value = self._normalize_color(self._background_color_value).lstrip("#")
-        try:
-            red, green, blue = (int(value[index:index + 2], 16) for index in (0, 2, 4))
-            luminance = (0.299 * red + 0.587 * green + 0.114 * blue) / 255.0
-        except (TypeError, ValueError):
-            luminance = 1.0
-        return "#202020" if luminance > 0.5 else "#f5f5f5"
+    @staticmethod
+    def default_metric_style():
+        """Return one detached default measurement style dictionary.
+
+        Args:
+            None.
+
+        Return:
+            Default yellow dashed line and label settings.
+        """
+        return {
+            "line_color": "#FFFF00",
+            "text_color": "#FFFF00",
+            "line_style": "dashed",
+            "font_size": 14,
+        }
 
     def _draw_measurements(self, positions):
         """Draw persistent dashed distance and angle annotations for this frame.
@@ -816,26 +891,28 @@ class StructureViewer(QtInteractor):
         Return:
             None. Measurement values in both dictionaries are refreshed in place.
         """
-        color = self._measurement_color()
         for pair in self.length_measurements:
             first, second = sorted(pair)
             if max(first, second) >= len(positions):
                 continue
             first_point = np.asarray(positions[first], dtype=float)
             second_point = np.asarray(positions[second], dtype=float)
+            metric = self.length_measurements[pair]
+            style = {**self.default_metric_style(), **metric.get("style", {})}
             line = pv.Line(first_point, second_point)
-            actor = self.add_mesh(line, color=color, line_width=2.0, lighting=False, render=False)
+            actor = self.add_mesh(line, color=style["line_color"], line_width=2.0, lighting=False, render=False)
             self.measurement_actors.append(actor)
-            actor.GetProperty().SetLineStipplePattern(0xF0F0)
-            actor.GetProperty().SetLineStippleRepeatFactor(1)
+            if style["line_style"] == "dashed":
+                actor.GetProperty().SetLineStipplePattern(0xF0F0)
+                actor.GetProperty().SetLineStippleRepeatFactor(1)
             midpoint = (first_point + second_point) / 2.0
             value = distance_between(positions, first, second)
-            self.length_measurements[pair] = value
+            metric["value"] = value
             label_actor = self.add_point_labels(
                 pv.PolyData(np.asarray([midpoint])),
                 [f"{value:.2f}"],
-                font_size=14,
-                text_color=color,
+                font_size=int(style["font_size"]),
+                text_color=style["text_color"],
                 shape=None,
                 show_points=False,
                 always_visible=True,
@@ -846,20 +923,23 @@ class StructureViewer(QtInteractor):
             first, second = sorted(endpoints)
             if max(vertex, first, second) >= len(positions):
                 continue
+            metric = self.angle_measurements[(vertex, endpoints)]
+            style = {**self.default_metric_style(), **metric.get("style", {})}
             vertex_point = np.asarray(positions[vertex], dtype=float)
             first_point = np.asarray(positions[first], dtype=float)
             second_point = np.asarray(positions[second], dtype=float)
             for endpoint in (first_point, second_point):
                 actor = self.add_mesh(
                     pv.Line(vertex_point, endpoint),
-                    color=color,
+                    color=style["line_color"],
                     line_width=2.0,
                     lighting=False,
                     render=False,
                 )
                 self.measurement_actors.append(actor)
-                actor.GetProperty().SetLineStipplePattern(0xF0F0)
-                actor.GetProperty().SetLineStippleRepeatFactor(1)
+                if style["line_style"] == "dashed":
+                    actor.GetProperty().SetLineStipplePattern(0xF0F0)
+                    actor.GetProperty().SetLineStippleRepeatFactor(1)
             direction = (first_point - vertex_point) + (second_point - vertex_point)
             direction_norm = float(np.linalg.norm(direction))
             label_position = vertex_point + direction / direction_norm * min(
@@ -870,12 +950,12 @@ class StructureViewer(QtInteractor):
                 value = angle_between(positions, vertex, first, second)
             except ValueError:
                 continue
-            self.angle_measurements[(vertex, endpoints)] = value
+            metric["value"] = value
             label_actor = self.add_point_labels(
                 pv.PolyData(np.asarray([label_position])),
                 [f"{value:.2f} deg"],
-                font_size=14,
-                text_color=color,
+                font_size=int(style["font_size"]),
+                text_color=style["text_color"],
                 shape=None,
                 show_points=False,
                 always_visible=True,
@@ -941,6 +1021,9 @@ class StructureViewer(QtInteractor):
             mesh.GetPoints().Modified()
             mesh.Modified()
         self.current_index = index
+        if 0 <= index < len(self.frame_metrics):
+            self.length_measurements = self.frame_metrics[index]["length"]
+            self.angle_measurements = self.frame_metrics[index]["angle"]
         self.render()
         return True
 
@@ -1586,11 +1669,14 @@ class StructureViewer(QtInteractor):
                                         if key in self.length_measurements:
                                             del self.length_measurements[key]
                                         else:
-                                            self.length_measurements[key] = distance_between(
-                                                self.coordinates[self.current_index],
-                                                self.measurement_selection[0],
-                                                self.measurement_selection[1],
-                                            )
+                                            self.length_measurements[key] = {
+                                                "value": distance_between(
+                                                    self.coordinates[self.current_index],
+                                                    self.measurement_selection[0],
+                                                    self.measurement_selection[1],
+                                                ),
+                                                "style": self.default_metric_style(),
+                                            }
                                 else:
                                     vertex = self.measurement_selection[1]
                                     endpoints = frozenset(
@@ -1601,12 +1687,15 @@ class StructureViewer(QtInteractor):
                                         if key in self.angle_measurements:
                                             del self.angle_measurements[key]
                                         else:
-                                            self.angle_measurements[key] = angle_between(
-                                                self.coordinates[self.current_index],
-                                                vertex,
-                                                self.measurement_selection[0],
-                                                self.measurement_selection[2],
-                                            )
+                                            self.angle_measurements[key] = {
+                                                "value": angle_between(
+                                                    self.coordinates[self.current_index],
+                                                    vertex,
+                                                    self.measurement_selection[0],
+                                                    self.measurement_selection[2],
+                                                ),
+                                                "style": self.default_metric_style(),
+                                            }
                                 self.set_measurement_mode(None)
                 elif self.dragged:
                     screen = self._project_atoms()
@@ -1667,7 +1756,7 @@ class StructureViewer(QtInteractor):
         self.drag_last_mouse = None
         self.drag_outer_angle = 0.0
         self.drag_preview_matrix = np.eye(4)
-        if finished_drag_mode != "rotate_view":
+        if finished_drag_mode not in ("rotate_view", "select"):
             try:
                 self.draw_frame()
             except (IndexError, RuntimeError, TypeError, ValueError) as error:
@@ -1692,7 +1781,9 @@ class StructureViewer(QtInteractor):
         for index, (position, symbol) in enumerate(
             zip(self.coordinates[self.current_index], self.elements[self.current_index])
         ):
-            edge = np.asarray(position, dtype=float) + right * self._style_radius(str(symbol))
+            edge = np.asarray(position, dtype=float) + right * self._style_radius(
+                str(symbol), index
+            )
             self.renderer.SetWorldPoint(float(edge[0]), float(edge[1]), float(edge[2]), 1.0)
             self.renderer.WorldToDisplay()
             edge_screen = np.asarray(self.renderer.GetDisplayPoint())[:2]
@@ -1724,7 +1815,19 @@ class StructureViewer(QtInteractor):
             self.selected_indices = np.asarray(sorted(selected), dtype=int)
         else:
             self.selected_indices = picked.astype(int, copy=True)
+        self.refresh_selection_overlay()
         self.selectionChanged.emit(self.selected_indices.copy())
+
+    def refresh_selection_overlay(self):
+        """Refresh selected atom actors while preserving the camera state.
+
+        Args:
+            None.
+
+        Return:
+            None. Camera and zoom-reference state are untouched.
+        """
+        self.draw_frame(reset_camera=False)
 
     def _camera_basis(self):
         """Return camera-right, camera-up, and viewing unit vectors.

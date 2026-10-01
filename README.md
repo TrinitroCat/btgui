@@ -50,8 +50,9 @@ The standalone entry point uses built-in serial readers and writers. File Open s
 
 Metrics > Length and Metrics > Angle temporarily replace normal atom selection. Pick
 two atoms for a distance or three atoms in endpoint-vertex-endpoint order for an
-angle. Measurements remain visible across frames and update from the current
-coordinates; clicking empty space exits the special selector.
+angle. Measurements belong to their source frame and update from that frame's
+coordinates; clicking empty space exits the special selector. Metrics > Style
+changes the current frame's line and label appearance.
 
 Selected-atom transforms are previewed through VTK actors while dragging. The
 coordinate array and covalent bonds are updated once on release. Use `Ctrl+Z`
@@ -60,7 +61,7 @@ edits. The undo limit and default atom material, lighting, and boundary style
 are editable through Settings and stored in `src/btgui/settings.json` (or the
 equivalent installed package directory).
 
-The top menu bar contains File, Settings, Appearance, and View. The toolbar
+The top menu bar contains File, Settings, Appearance, Windows, and View. The toolbar
 below it contains structure operations and current-frame playback/navigation.
 Axes and Grid are optional Appearance settings and default to off. Bond display
 and its tolerance are grouped under Check Bonds; Resize is available from the
@@ -68,10 +69,13 @@ Supercell menu. The View menu contains lattice-axis views and zoom controls. The
 toolbar frame controls use zero-based indices. Save As writes only the
 currently displayed frame. Opening another file appends
 its frames to the current batch; the current frame field rejects invalid or
-out-of-range input without changing the displayed frame. Appearance contains
-per-element settings and global VTK material, lighting, and atom-boundary
-settings. Global atom radius mode and renderer background color are configured
-in Appearance; per-element controls retain only color and opacity.
+out-of-range input without changing the displayed frame. `Ctrl+W` and the close
+button remove the current frame. Windows > Show Frames opens a frame sidebar for
+navigation, duplication, deletion, and undoable drag reordering. File > New adds
+an empty or populated frame. Appearance contains an atom selector plus per-element
+settings and global VTK material, lighting, and atom-boundary settings. An empty
+selector applies atom appearance globally; element symbols and one-based atom
+numbers/ranges limit the change to matching atoms in the current frame.
 
 Enter `help` in the bottom command line for available commands. Property overlays can be added with `MainWindow.register_property_renderer(name, callback)`; the callback receives `(plotter, frame_index, positions)`.
 
@@ -80,7 +84,7 @@ the user clicks empty space. Replace Atom is enabled only for a valid selection
 and records the element replacement in the same undo history as other edits.
 Topology-changing operations ask before discarding persistent metrics because
 atom indices may no longer refer to the same atoms; Undo restores the structure
-but does not restore discarded metrics.
+and its discarded metrics.
 
 The command pane is a persistent Python-style console: expression results are
 shown with `repr`, `print` output and tracebacks stay in the pane, and `>>>` /
@@ -97,7 +101,8 @@ three ordinary editable variables: `elements`, `coo`, and `cell`, each a
 `List[np.ndarray]`, plus NumPy as `np`. Every command edits detached working
 copies. Shape, dtype, frame-count, and finite-value checks run before a valid
 change is committed to the viewer; invalid changes print `Invalid change for
-inner variables` and leave the displayed data unchanged. When BUCToolkit is
+inner variables` and leave the displayed data unchanged. Completed commands also
+refresh the renderer so in-place edits become visible immediately. When BUCToolkit is
 available at runtime, `to_bt()` returns a copied `BatchStructures` object;
 `to_bt("1, 3-4")` uses the one-based inclusive frame syntax and
 `to_bt([0, 2])` uses zero-based Python indices. The optional `shortcut` command
