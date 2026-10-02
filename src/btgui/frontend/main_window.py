@@ -22,6 +22,7 @@ from PySide6.QtWidgets import (
     QDoubleSpinBox,
     QFormLayout,
     QFrame,
+    QInputDialog,
     QLabel,
     QListWidget,
     QListWidgetItem,
@@ -30,6 +31,7 @@ from PySide6.QtWidgets import (
     QMenu,
     QPlainTextEdit,
     QPushButton,
+    QSlider,
     QSpinBox,
     QSizePolicy,
     QSplitter,
@@ -45,11 +47,18 @@ from PySide6.QtWidgets import (
     QMessageBox,
 )
 
-from btgui.backend.core import parse_frame_range, parse_frame_selection, validate_data
+from btgui.backend.core import (
+    build_bond_adjacency,
+    parse_frame_range,
+    parse_frame_scope,
+    parse_frame_selection,
+    validate_data,
+    wrap_coordinates,
+)
 from btgui.backend.core import format_atom_selection, parse_atom_selection
 from btgui.data.appearance import ELEMENT_COLORS, default_color
 from btgui.frontend.cli import CLI
-from btgui.frontend.changes import StructureChange
+from btgui.frontend.changes import AppearanceChange, FramePermutationChange, StructureChange
 from btgui.frontend.viewer import StructureViewer
 
 
@@ -75,6 +84,13 @@ class AppearanceDialog(QDialog):
         self.styles = {key: dict(value) for key, value in viewer.atom_styles.items()}
         self.elements = list(dict.fromkeys(np.asarray(elements, dtype=str).tolist()))
         self.frame_elements = np.asarray(elements, dtype=str)
+        self.initial_element_styles = {
+            symbol: {
+                "color": viewer._style_for(symbol).get("color", default_color(symbol)),
+                "alpha": float(viewer._style_for(symbol).get("alpha", 1.0)),
+            }
+            for symbol in self.elements
+        }
         self.accepted_values = None
         self.selector_edit = QLineEdit(self)
         self.selector_edit.setPlaceholderText("All atoms")
@@ -106,7 +122,6 @@ class AppearanceDialog(QDialog):
         self.material_combo.addItem("Metallic", "metallic")
         material_index = self.material_combo.findData(viewer.atom_material)
         self.material_combo.setCurrentIndex(max(0, material_index))
-        self.material_combo.currentIndexChanged.connect(self._load_material_preset)
         material_values = viewer._material_properties()
         self.ambient_spin = QDoubleSpinBox(self)
         self.ambient_spin.setRange(0.0, 1.0)
@@ -128,6 +143,7 @@ class AppearanceDialog(QDialog):
         self.metallic_spin.setRange(0.0, 1.0)
         self.metallic_spin.setSingleStep(0.05)
         self.metallic_spin.setValue(material_values["metallic"])
+        self.material_combo.currentIndexChanged.connect(self._load_material_preset)
         self.lighting_check = QCheckBox("Lighting", self)
         self.lighting_check.setChecked(viewer.atom_lighting)
         self.edges_check = QCheckBox("Atom boundaries", self)
@@ -161,17 +177,10 @@ class AppearanceDialog(QDialog):
         self.background_button.clicked.connect(self._choose_background_color)
         form = QFormLayout()
         form.addRow("Atoms", self.selector_edit)
-        form.addRow("Atom opacity", self.opacity_spin)
         form.addRow("Atom color", self.color_button)
-        separator = QFrame(self)
-        separator.setFrameShape(QFrame.Shape.HLine)
-        separator.setFrameShadow(QFrame.Shadow.Sunken)
-        form.addRow(separator)
-        form.addRow("Global atom display", self.global_style_combo)
-        form.addRow("Global custom radius", self.global_radius_spin)
-        form.addRow("Background color", self.background_button)
-        form.addRow("Bond width", self.bond_width_spin)
-        form.addRow("Bond opacity", self.bond_alpha_spin)
+        form.addRow("Atom opacity", self.opacity_spin)
+        form.addRow("Atom display", self.global_style_combo)
+        form.addRow("Custom radius", self.global_radius_spin)
         form.addRow("Sphere material", self.material_combo)
         form.addRow("Ambient", self.ambient_spin)
         form.addRow("Diffuse", self.diffuse_spin)
@@ -180,10 +189,17 @@ class AppearanceDialog(QDialog):
         form.addRow("PBR metallic", self.metallic_spin)
         form.addRow(self.lighting_check)
         form.addRow(self.edges_check)
-        form.addRow(self.axes_check)
-        form.addRow(self.grid_check)
         form.addRow("Boundary width", self.edge_width_spin)
         form.addRow("Boundary color", self.edge_color_button)
+        separator = QFrame(self)
+        separator.setFrameShape(QFrame.Shape.HLine)
+        separator.setFrameShadow(QFrame.Shadow.Sunken)
+        form.addRow(separator)
+        form.addRow("Background color", self.background_button)
+        form.addRow("Bond width", self.bond_width_spin)
+        form.addRow("Bond opacity", self.bond_alpha_spin)
+        form.addRow(self.axes_check)
+        form.addRow(self.grid_check)
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel, self)
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
@@ -309,6 +325,48 @@ class AppearanceDialog(QDialog):
             "grid": self.grid_check.isChecked(),
             "bond_width": self.bond_width_spin.value(),
             "bond_alpha": self.bond_alpha_spin.value(),
+        }
+        self.accepted_values["changed_symbols"] = {
+            symbol
+            for symbol in self.elements
+            if {
+                "color": self.styles.get(symbol, {}).get(
+                    "color", default_color(symbol)
+                ),
+                "alpha": float(self.styles.get(symbol, {}).get("alpha", 1.0)),
+            }
+            != self.initial_element_styles[symbol]
+        }
+        atom_attribute_names = {
+            "atom_style": "default_atom_style",
+            "custom_radius": "default_custom_radius",
+            "material": "atom_material",
+            "lighting": "atom_lighting",
+            "edges": "atom_edges",
+            "edge_color": "atom_edge_color",
+            "edge_width": "atom_edge_width",
+            "ambient": "material_ambient",
+            "diffuse": "material_diffuse",
+            "specular": "material_specular",
+            "roughness": "material_roughness",
+            "metallic": "material_metallic",
+        }
+        self.accepted_values["changed_atom_values"] = {
+            name: self.accepted_values[name]
+            for name, attribute in atom_attribute_names.items()
+            if self.accepted_values[name] != getattr(self.viewer, attribute)
+        }
+        scene_attribute_names = {
+            "background": "_background_color_value",
+            "axes": "axes_visible",
+            "grid": "grid_visible",
+            "bond_width": "bond_width",
+            "bond_alpha": "bond_alpha",
+        }
+        self.accepted_values["changed_scene_values"] = {
+            name: self.accepted_values[name]
+            for name, attribute in scene_attribute_names.items()
+            if self.accepted_values[name] != getattr(self.viewer, attribute)
         }
         super().accept()
 
@@ -830,13 +888,18 @@ class MainWindow(QMainWindow):
         self.elements = []
         self.coordinates = []
         self.lattices = []
+        self.frame_names = []
+        self._frame_name_serial = 0
         self.atom_frame_styles = []
         self.frame_metrics = []
+        self.bond_adjacencies = []
+        self.bond_frame_indices = []
         self.open_handler = open_handler
         self.save_handler = save_handler
         self.current_index = 0
         self.play_indices = []
         self.play_position = 0
+        self.playback_loop = False
         self.settings_path = Path(__file__).resolve().parents[1] / "settings.json"
         self.settings_warning = None
         self.settings = self._load_settings()
@@ -863,7 +926,7 @@ class MainWindow(QMainWindow):
         self.viewer.atomsAdded.connect(self._commit_reference_atoms)
         self.viewer.filesDropped.connect(self._open_dropped_files)
         self.viewer.measurementModeChanged.connect(self._sync_measurement_actions)
-        self.viewer.selectionChanged.connect(self._sync_atom_actions)
+        self.viewer.selectionChanged.connect(self._on_selection_changed)
 
         self.undo_action = QAction(
             self.style().standardIcon(QStyle.StandardPixmap.SP_ArrowBack),
@@ -902,11 +965,23 @@ class MainWindow(QMainWindow):
         self.replace_atom_action.triggered.connect(self._show_replace_atom)
         self.toolbar.addAction(self.replace_atom_action)
 
-        self.bond_action = QAction("Show Bonds", self)
+        self.bond_menu = QMenu(self)
+        bond_frames_widget = QWidget(self.bond_menu)
+        bond_frames_layout = QHBoxLayout(bond_frames_widget)
+        bond_frames_layout.setContentsMargins(8, 4, 8, 4)
+        bond_frames_layout.addWidget(QLabel("Frames:", bond_frames_widget))
+        self.bond_frames_edit = QLineEdit(bond_frames_widget)
+        self.bond_frames_edit.setPlaceholderText("current or all")
+        self.bond_frames_edit.setMinimumWidth(160)
+        bond_frames_layout.addWidget(self.bond_frames_edit)
+        bond_frames_action = QWidgetAction(self.bond_menu)
+        bond_frames_action.setDefaultWidget(bond_frames_widget)
+        self.bond_menu.addAction(bond_frames_action)
+        self.check_bonds_action = self.bond_menu.addAction("Check bonds")
+        self.check_bonds_action.triggered.connect(self._check_bonds)
+        self.bond_action = self.bond_menu.addAction("Show bonds")
         self.bond_action.setCheckable(True)
         self.bond_action.toggled.connect(self.viewer_set_bonds)
-        self.bond_menu = QMenu(self)
-        self.bond_menu.addAction(self.bond_action)
         self.length_measure_action = QAction("Length", self)
         self.length_measure_action.setCheckable(True)
         self.length_measure_action.toggled.connect(
@@ -917,7 +992,6 @@ class MainWindow(QMainWindow):
         self.angle_measure_action.toggled.connect(
             lambda checked: self._set_measurement_mode("angle" if checked else None)
         )
-        self.bond_menu.addSeparator()
         self.tolerance_spin = QDoubleSpinBox(self)
         self.tolerance_spin.setRange(0.1, 5.0)
         self.tolerance_spin.setSingleStep(0.05)
@@ -928,11 +1002,22 @@ class MainWindow(QMainWindow):
         tolerance_action = QWidgetAction(self.bond_menu)
         tolerance_action.setDefaultWidget(self.tolerance_spin)
         self.bond_menu.addAction(tolerance_action)
+        self.clear_bonds_action = self.bond_menu.addAction("Clear bonds")
+        self.clear_bonds_action.triggered.connect(self._clear_bonds)
         self.bond_button = QToolButton(self)
-        self.bond_button.setText("Check Bonds")
+        self.bond_button.setText("Bonds")
         self.bond_button.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
         self.bond_button.setMenu(self.bond_menu)
         self.toolbar.addWidget(self.bond_button)
+
+        self.pbc_wrap_button = QToolButton(self)
+        self.pbc_wrap_button.setText("PBC wrap")
+        self.pbc_wrap_button.clicked.connect(self._wrap_pbc)
+        self.toolbar.addWidget(self.pbc_wrap_button)
+        self.pbc_frames_edit = QLineEdit(self)
+        self.pbc_frames_edit.setPlaceholderText("current or all")
+        self.pbc_frames_edit.setMaximumWidth(130)
+        self.toolbar.addWidget(self.pbc_frames_edit)
 
         self.metrics_button = QToolButton(self)
         self.metrics_button.setText("Metrics")
@@ -967,13 +1052,76 @@ class MainWindow(QMainWindow):
         self.next_frame_button.clicked.connect(lambda: self._step_frame(1))
         self.toolbar.addWidget(self.next_frame_button)
         self.play_button = QToolButton(self)
-        self.play_button.setText("Play")
-        self.play_button.clicked.connect(lambda: self._start_default_playback())
+        self.play_button.setIcon(
+            self.style().standardIcon(QStyle.StandardPixmap.SP_MediaPlay)
+        )
+        self.play_button.setToolTip("Play")
+        self.play_button.clicked.connect(self._toggle_playback)
         self.toolbar.addWidget(self.play_button)
-        self.pause_button = QToolButton(self)
-        self.pause_button.setText("Pause")
-        self.pause_button.clicked.connect(self._pause_playback)
-        self.toolbar.addWidget(self.pause_button)
+        self._set_play_button_state(False)
+
+        self.playback_menu = QMenu(self)
+        fps_widget = QWidget(self.playback_menu)
+        fps_layout = QHBoxLayout(fps_widget)
+        fps_layout.setContentsMargins(8, 4, 8, 4)
+        fps_layout.addWidget(QLabel("fps:", fps_widget))
+        self.playback_fps_slider = QSlider(Qt.Orientation.Horizontal, fps_widget)
+        self.playback_fps_slider.setRange(1, 60)
+        self.playback_fps_slider.setValue(3)
+        self.playback_fps_slider.setMinimumWidth(150)
+        fps_layout.addWidget(self.playback_fps_slider)
+        self.playback_fps_label = QLabel("3", fps_widget)
+        self.playback_fps_slider.valueChanged.connect(
+            lambda value: self.playback_fps_label.setText(str(value))
+        )
+        fps_layout.addWidget(self.playback_fps_label)
+        fps_action = QWidgetAction(self.playback_menu)
+        fps_action.setDefaultWidget(fps_widget)
+        self.playback_menu.addAction(fps_action)
+
+        range_widget = QWidget(self.playback_menu)
+        range_layout = QHBoxLayout(range_widget)
+        range_layout.setContentsMargins(8, 4, 8, 4)
+        range_layout.addWidget(QLabel("range:", range_widget))
+        self.playback_range_start = QLineEdit(range_widget)
+        self.playback_range_end = QLineEdit(range_widget)
+        for edit in (self.playback_range_start, self.playback_range_end):
+            edit.setFixedWidth(54)
+            edit.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        range_layout.addWidget(self.playback_range_start)
+        range_layout.addWidget(QLabel("~", range_widget))
+        range_layout.addWidget(self.playback_range_end)
+        self.playback_range_hint = QLabel("0 ~ 0", range_widget)
+        range_layout.addWidget(self.playback_range_hint)
+        range_action = QWidgetAction(self.playback_menu)
+        range_action.setDefaultWidget(range_widget)
+        self.playback_menu.addAction(range_action)
+
+        stride_widget = QWidget(self.playback_menu)
+        stride_layout = QHBoxLayout(stride_widget)
+        stride_layout.setContentsMargins(8, 4, 8, 4)
+        stride_layout.addWidget(QLabel("stride:", stride_widget))
+        self.playback_stride = QLineEdit("1", stride_widget)
+        self.playback_stride.setFixedWidth(54)
+        self.playback_stride.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        stride_layout.addWidget(self.playback_stride)
+        stride_layout.addStretch(1)
+        self.playback_repeat_button = QPushButton("once", stride_widget)
+        self.playback_repeat_button.clicked.connect(self._toggle_playback_repeat)
+        stride_layout.addWidget(self.playback_repeat_button)
+        stride_action = QWidgetAction(self.playback_menu)
+        stride_action.setDefaultWidget(stride_widget)
+        self.playback_menu.addAction(stride_action)
+
+        self.playback_options_button = QToolButton(self)
+        self.playback_options_button.setText("V")
+        self.playback_options_button.setFixedWidth(42)
+        self.playback_options_button.setPopupMode(
+            QToolButton.ToolButtonPopupMode.InstantPopup
+        )
+        self.playback_options_button.setMenu(self.playback_menu)
+        self.toolbar.addWidget(self.playback_options_button)
+        self.toolbar.addSeparator()
         spacer = QWidget(self)
         spacer.setSizePolicy(
             QSizePolicy.Policy.Expanding,
@@ -1222,6 +1370,21 @@ class MainWindow(QMainWindow):
         self.frame_metrics = [
             {"length": {}, "angle": {}} for _ in self.coordinates
         ]
+        self.bond_adjacencies = [None for _ in self.coordinates]
+
+    def _ensure_frame_names(self):
+        """Keep fixed frame names aligned with the structure lists.
+
+        Args:
+            None.
+
+        Returns:
+            None. Existing names are retained and only new frames receive names.
+        """
+        del self.frame_names[len(self.elements):]
+        while len(self.frame_names) < len(self.elements):
+            self._frame_name_serial += 1
+            self.frame_names.append(f"Frame {self._frame_name_serial}")
 
     def _ensure_frame_state(self):
         """Align auxiliary frame and atom containers with structure lists.
@@ -1237,8 +1400,11 @@ class MainWindow(QMainWindow):
             self.atom_frame_styles.append([dict() for _ in self.elements[frame]])
         while len(self.frame_metrics) < len(self.elements):
             self.frame_metrics.append({"length": {}, "angle": {}})
+        while len(self.bond_adjacencies) < len(self.elements):
+            self.bond_adjacencies.append(None)
         del self.atom_frame_styles[len(self.elements):]
         del self.frame_metrics[len(self.elements):]
+        del self.bond_adjacencies[len(self.elements):]
         for frame, frame_elements in enumerate(self.elements):
             styles = self.atom_frame_styles[frame]
             if len(styles) < len(frame_elements):
@@ -1357,6 +1523,8 @@ class MainWindow(QMainWindow):
             "metrics": deepcopy(self.frame_metrics),
             "appearance": self._appearance_context(),
             "current_index": int(self.current_index),
+            "frame_names": list(self.frame_names),
+            "frame_name_serial": int(self._frame_name_serial),
         }
 
     def _restore_all_supercell_context(self, context):
@@ -1388,6 +1556,11 @@ class MainWindow(QMainWindow):
             self._restore_appearance_context(context["appearance"])
         if "current_index" in context:
             self.current_index = int(context["current_index"])
+        if "frame_names" in context:
+            self.frame_names = list(context["frame_names"])
+            self._frame_name_serial = int(
+                context.get("frame_name_serial", len(self.frame_names))
+            )
 
     def _appearance_context(self):
         """Copy renderer-wide appearance values for unified history.
@@ -1421,18 +1594,27 @@ class MainWindow(QMainWindow):
             setattr(self.viewer, name, deepcopy(value))
         self.viewer.set_background(self.viewer._background_color_value)
 
-    def _refresh_after_change(self, frame_index=None, reset_camera=False):
+    def _refresh_after_change(
+        self,
+        frame_index=None,
+        reset_camera=False,
+        changed_frame_indices=None,
+    ):
         """Refresh viewer references and selection after a committed change.
 
         Args:
             frame_index: Preferred frame to display, or ``None`` for current.
             reset_camera: Whether the scene should fit a new camera.
+            changed_frame_indices: Frames whose cached bond geometry is stale,
+                or ``None`` when the complete frame collection changed.
 
         Returns:
             None. The viewer is redrawn with the current raw lists.
         """
+        self.viewer.invalidate_bond_meshes(changed_frame_indices)
         self._ensure_supercell_state()
         self._ensure_frame_state()
+        self._ensure_frame_names()
         self.viewer.elements = self.elements
         self.viewer.coordinates = self.coordinates
         self.viewer.lattices = self.lattices
@@ -1440,7 +1622,11 @@ class MainWindow(QMainWindow):
             target = self.current_index if frame_index is None else int(frame_index)
             self.current_index = min(max(target, 0), len(self.coordinates) - 1)
             self.viewer.current_index = self.current_index
-            self.viewer.set_frame_state(self.atom_frame_styles, self.frame_metrics)
+            self.viewer.set_frame_state(
+                self.atom_frame_styles,
+                self.frame_metrics,
+                self.bond_adjacencies,
+            )
             self.viewer.selected_indices = self.viewer.selected_indices[
                 (self.viewer.selected_indices >= 0)
                 & (self.viewer.selected_indices < len(self.elements[self.current_index]))
@@ -1448,7 +1634,11 @@ class MainWindow(QMainWindow):
             self.viewer.draw_frame(reset_camera=reset_camera)
         else:
             self.viewer.current_index = 0
-            self.viewer.set_frame_state(self.atom_frame_styles, self.frame_metrics)
+            self.viewer.set_frame_state(
+                self.atom_frame_styles,
+                self.frame_metrics,
+                self.bond_adjacencies,
+            )
             self.viewer.draw_frame(reset_camera=reset_camera)
         self._sync_frame_controls()
         self._sync_frame_list()
@@ -1466,7 +1656,7 @@ class MainWindow(QMainWindow):
         Returns:
             None. Redo history is discarded after a new operation.
         """
-        if not already_applied:
+        if not already_applied and isinstance(change, StructureChange):
             context = change.apply(
                 self.elements, self.coordinates, self.lattices, use_after=True
             )
@@ -1474,10 +1664,69 @@ class MainWindow(QMainWindow):
                 self._restore_supercell_context(change.frame_indices[0], context)
             elif change.frame_indices is None and context is not None:
                 self._restore_all_supercell_context(context)
+        elif not already_applied:
+            change.apply(self, use_after=True)
         self.undo_stack.append(change)
         self.redo_stack.clear()
-        self._refresh_after_change(frame_index=frame_index)
+        if isinstance(change, FramePermutationChange):
+            self.viewer.invalidate_bond_meshes()
+            self._refresh_after_permutation(sync_frame_list=False)
+        elif isinstance(change, AppearanceChange):
+            self._refresh_after_appearance(change)
+        else:
+            self._refresh_after_change(
+                frame_index=frame_index,
+                changed_frame_indices=getattr(change, "frame_indices", None),
+            )
         self._sync_history_actions()
+
+    def _refresh_after_appearance(self, change):
+        """Refresh only renderer state affected by an appearance change.
+
+        Args:
+            change: Applied appearance history entry.
+
+        Returns:
+            None. Structure arrays and unrelated actors remain untouched.
+        """
+        changed_global = set(change.before_global) | set(change.after_global)
+        atom_fields = {
+            "atom_styles",
+            "atom_material",
+            "atom_lighting",
+            "atom_edges",
+            "atom_edge_color",
+            "atom_edge_width",
+            "default_atom_style",
+            "default_custom_radius",
+            "material_ambient",
+            "material_diffuse",
+            "material_specular",
+            "material_roughness",
+            "material_metallic",
+        }
+        if change.before_atom_styles or changed_global & atom_fields:
+            affected_frames = None
+            if not changed_global & atom_fields:
+                affected_frames = {
+                    frame_index for frame_index, _ in change.before_atom_styles
+                }
+            self.viewer.invalidate_bond_meshes(affected_frames)
+            self.viewer.draw_frame()
+            return
+
+        if {"axes_visible", "grid_visible"} & changed_global and self.coordinates:
+            self.viewer._apply_reference_widgets(
+                np.asarray(self.coordinates[self.current_index], dtype=float),
+                np.asarray(self.lattices[self.current_index], dtype=float),
+            )
+        for actor in self.viewer.bond_actors:
+            actor.GetProperty().SetOpacity(self.viewer.bond_alpha)
+        if "bond_width" in changed_global:
+            self.viewer.invalidate_bond_meshes()
+            self.viewer.refresh_bonds()
+        else:
+            self.viewer.render()
 
     def _record_coordinate_edit(self, frame_index, before_coordinates, after_coordinates):
         """Record one completed mouse coordinate edit.
@@ -1519,17 +1768,33 @@ class MainWindow(QMainWindow):
             return
         change = self.undo_stack[-1]
         try:
-            context = change.apply(
-                self.elements, self.coordinates, self.lattices, use_after=False
-            )
-            if change.frame_indices is not None and context is not None:
-                self._restore_supercell_context(change.frame_indices[0], context)
-            elif change.frame_indices is None and context is not None:
-                self._restore_all_supercell_context(context)
+            if isinstance(change, StructureChange):
+                context = change.apply(
+                    self.elements, self.coordinates, self.lattices, use_after=False
+                )
+                if change.frame_indices is not None and context is not None:
+                    self._restore_supercell_context(change.frame_indices[0], context)
+                elif change.frame_indices is None and context is not None:
+                    self._restore_all_supercell_context(context)
+            else:
+                change.apply(self, use_after=False)
             self.undo_stack.pop()
             self.redo_stack.append(change)
-            frame_index = change.frame_indices[0] if change.frame_indices else self.current_index
-            self._refresh_after_change(frame_index=frame_index)
+            if isinstance(change, FramePermutationChange):
+                self._refresh_after_permutation(sync_frame_list=False)
+            elif isinstance(change, AppearanceChange):
+                self._refresh_after_appearance(change)
+            else:
+                frame_indices = getattr(change, "frame_indices", None)
+                frame_index = (
+                    frame_indices[0]
+                    if frame_indices is not None and len(frame_indices) == 1
+                    else self.current_index
+                )
+                self._refresh_after_change(
+                    frame_index=frame_index,
+                    changed_frame_indices=frame_indices,
+                )
         except (IndexError, RuntimeError, TypeError, ValueError) as error:
             self._log(f"Undo error: {error}")
         self._sync_history_actions()
@@ -1547,17 +1812,33 @@ class MainWindow(QMainWindow):
             return
         change = self.redo_stack[-1]
         try:
-            context = change.apply(
-                self.elements, self.coordinates, self.lattices, use_after=True
-            )
-            if change.frame_indices is not None and context is not None:
-                self._restore_supercell_context(change.frame_indices[0], context)
-            elif change.frame_indices is None and context is not None:
-                self._restore_all_supercell_context(context)
+            if isinstance(change, StructureChange):
+                context = change.apply(
+                    self.elements, self.coordinates, self.lattices, use_after=True
+                )
+                if change.frame_indices is not None and context is not None:
+                    self._restore_supercell_context(change.frame_indices[0], context)
+                elif change.frame_indices is None and context is not None:
+                    self._restore_all_supercell_context(context)
+            else:
+                change.apply(self, use_after=True)
             self.redo_stack.pop()
             self.undo_stack.append(change)
-            frame_index = change.frame_indices[0] if change.frame_indices else self.current_index
-            self._refresh_after_change(frame_index=frame_index)
+            if isinstance(change, FramePermutationChange):
+                self._refresh_after_permutation(sync_frame_list=False)
+            elif isinstance(change, AppearanceChange):
+                self._refresh_after_appearance(change)
+            else:
+                frame_indices = getattr(change, "frame_indices", None)
+                frame_index = (
+                    frame_indices[0]
+                    if frame_indices is not None and len(frame_indices) == 1
+                    else self.current_index
+                )
+                self._refresh_after_change(
+                    frame_index=frame_index,
+                    changed_frame_indices=frame_indices,
+                )
         except (IndexError, RuntimeError, TypeError, ValueError) as error:
             self._log(f"Redo error: {error}")
         self._sync_history_actions()
@@ -1606,13 +1887,151 @@ class MainWindow(QMainWindow):
         self.length_measure_action.blockSignals(False)
         self.angle_measure_action.blockSignals(False)
 
+    def _selected_bond_frames(self):
+        """Parse and retain the shared frame scope from the Bonds menu.
+
+        Args:
+            None.
+
+        Return:
+            Zero-based frames used by both checking and displaying bonds.
+        """
+        indices = parse_frame_scope(
+            self.bond_frames_edit.text(),
+            len(self.coordinates),
+            self.current_index,
+        )
+        self.bond_frame_indices = indices
+        self.viewer.bond_frame_indices = set(indices)
+        return indices
+
+    def _check_bonds(self, checked=False):
+        """Force recalculation of cached bond adjacency for selected frames.
+
+        Args:
+            checked: Unused QAction checked state.
+
+        Return:
+            None. Invalid frame text is rejected with a warning.
+        """
+        try:
+            indices = self._selected_bond_frames()
+            for frame_index in indices:
+                self.bond_adjacencies[frame_index] = build_bond_adjacency(
+                    self.coordinates[frame_index],
+                    self.elements[frame_index],
+                    self.viewer.bond_tolerance,
+                )
+            self.viewer.invalidate_bond_meshes(indices)
+        except (IndexError, TypeError, ValueError) as error:
+            QMessageBox.warning(self, "Bonds", str(error))
+            return
+        if self.viewer.bonds_enabled and self.current_index in indices:
+            self.viewer.refresh_bonds()
+
     def viewer_set_bonds(self, enabled):
-        """Toggle covalent-radius bond rendering."""
-        self.viewer.set_bonds(enabled)
+        """Toggle cached bond rendering and lazily fill missing selected frames.
+
+        Args:
+            enabled: Requested Show bonds check state.
+
+        Return:
+            None. Invalid input restores the previous check state.
+        """
+        if not enabled:
+            self.viewer.set_bonds(False, self.bond_frame_indices)
+            return
+        try:
+            indices = self._selected_bond_frames()
+            for frame_index in indices:
+                if self.bond_adjacencies[frame_index] is None:
+                    self.bond_adjacencies[frame_index] = build_bond_adjacency(
+                        self.coordinates[frame_index],
+                        self.elements[frame_index],
+                        self.viewer.bond_tolerance,
+                    )
+        except (IndexError, TypeError, ValueError) as error:
+            blocker = QSignalBlocker(self.bond_action)
+            self.bond_action.setChecked(not enabled)
+            del blocker
+            QMessageBox.warning(self, "Bonds", str(error))
+            return
+        self.viewer.set_bonds(True, indices)
+
+    def _clear_bonds(self, checked=False):
+        """Release all cached bond adjacency arrays without recalculating.
+
+        Args:
+            checked: Unused QAction checked state.
+
+        Return:
+            None. Visible bonds disappear until Show bonds is toggled again.
+        """
+        self.bond_adjacencies[:] = [None for _ in self.coordinates]
+        self.viewer.invalidate_bond_meshes()
+        if self.viewer.bonds_enabled:
+            self.viewer.refresh_bonds()
 
     def viewer_set_tolerance(self, tolerance):
-        """Update bond cutoff tolerance."""
+        """Update the cutoff used by the next explicit or lazy bond check."""
         self.viewer.set_bond_tolerance(tolerance)
+
+    def _wrap_pbc(self, checked=False):
+        """Wrap atoms in selected frames into their displayed unit cells.
+
+        Args:
+            checked: Unused toolbar button state.
+
+        Return:
+            None. One multi-frame structure change is added to undo history.
+        """
+        try:
+            indices = parse_frame_scope(
+                self.pbc_frames_edit.text(),
+                len(self.coordinates),
+                self.current_index,
+            )
+            wrapped = [
+                wrap_coordinates(self.coordinates[index], self.lattices[index])
+                for index in indices
+            ]
+        except (IndexError, TypeError, ValueError) as error:
+            QMessageBox.warning(self, "PBC wrap", str(error))
+            return
+        changed = [
+            (frame_index, after_coordinates)
+            for frame_index, after_coordinates in zip(indices, wrapped)
+            if not np.allclose(
+                self.coordinates[frame_index],
+                after_coordinates,
+                rtol=0.0,
+                atol=1.0e-12,
+            )
+        ]
+        if not changed:
+            return
+        frame_indices = tuple(frame_index for frame_index, _ in changed)
+        change = StructureChange(
+            description="PBC wrap",
+            before_elements=[
+                np.array(self.elements[index], copy=True) for index in frame_indices
+            ],
+            before_coordinates=[
+                np.array(self.coordinates[index], copy=True) for index in frame_indices
+            ],
+            before_lattices=[
+                np.array(self.lattices[index], copy=True) for index in frame_indices
+            ],
+            after_elements=[
+                np.array(self.elements[index], copy=True) for index in frame_indices
+            ],
+            after_coordinates=[after_coordinates for _, after_coordinates in changed],
+            after_lattices=[
+                np.array(self.lattices[index], copy=True) for index in frame_indices
+            ],
+            frame_indices=frame_indices,
+        )
+        self._record_change(change, frame_index=self.current_index)
 
     def _show_supercell(self) -> None:
         """Apply the selected transform to the current frame's base cell.
@@ -1684,6 +2103,8 @@ class MainWindow(QMainWindow):
             before_context=before_context,
             after_context=after_context,
         )
+        if topology_changed:
+            self.bond_adjacencies[frame_index] = None
         self._record_change(change, frame_index=frame_index)
         blocker = QSignalBlocker(self.zoom_input)
         self.zoom_input.setValue(100)
@@ -1863,6 +2284,7 @@ class MainWindow(QMainWindow):
             before_context=before_context,
             after_context=after_context,
         )
+        self.bond_adjacencies[frame_index] = None
         self._record_change(change, frame_index=frame_index)
 
     def _commit_reference_atoms(self, frame_index, symbols, coordinates):
@@ -1928,6 +2350,7 @@ class MainWindow(QMainWindow):
             before_context=before_context,
             after_context=after_context,
         )
+        self.bond_adjacencies[frame_index] = None
         self._record_change(change, frame_index=frame_index)
 
     def _show_appearance(self):
@@ -1944,86 +2367,98 @@ class MainWindow(QMainWindow):
         if dialog.exec() != QDialog.DialogCode.Accepted or dialog.accepted_values is None:
             return
         values = dialog.accepted_values
-        before_context = (
-            self._all_supercell_context()
-            if values["global_atoms"]
-            else self._supercell_context(frame_index)
-        )
-        targets = (
-            (
-                target_frame,
-                range(len(self.elements[target_frame])),
-            )
-            for target_frame in (
-                range(len(self.elements)) if values["global_atoms"] else [frame_index]
-            )
-        )
-        for target_frame, atom_indices in targets:
-            for atom_index in atom_indices:
-                symbol = str(self.elements[target_frame][atom_index])
-                element_style = values["styles"].get(
-                    symbol, self.viewer.atom_styles.get(symbol, {})
-                )
-                self.atom_frame_styles[target_frame][atom_index] = {
-                    "color": element_style.get("color", default_color(symbol)),
-                    "alpha": float(element_style.get("alpha", 1.0)),
-                    "style": values["atom_style"],
-                    "radius": float(values["custom_radius"]),
-                }
-            if not values["global_atoms"]:
-                break
+        atom_fields = {
+            "atom_style": ("default_atom_style", "style"),
+            "custom_radius": ("default_custom_radius", "radius"),
+            "material": ("atom_material", "material"),
+            "lighting": ("atom_lighting", "lighting"),
+            "edges": ("atom_edges", "edges"),
+            "edge_color": ("atom_edge_color", "edge_color"),
+            "edge_width": ("atom_edge_width", "edge_width"),
+            "ambient": ("material_ambient", "ambient"),
+            "diffuse": ("material_diffuse", "diffuse"),
+            "specular": ("material_specular", "specular"),
+            "roughness": ("material_roughness", "roughness"),
+            "metallic": ("material_metallic", "metallic"),
+        }
+        scene_fields = {
+            "background": "_background_color_value",
+            "axes": "axes_visible",
+            "grid": "grid_visible",
+            "bond_width": "bond_width",
+            "bond_alpha": "bond_alpha",
+        }
+        before_global = {}
+        after_global = {}
+        before_atom_styles = {}
+        after_atom_styles = {}
+
+        # Section: scene settings are independent of the atom selector.
+        for name, value in values["changed_scene_values"].items():
+            attribute = scene_fields[name]
+            before_global[attribute] = deepcopy(getattr(self.viewer, attribute))
+            after_global[attribute] = deepcopy(value)
+
+        changed_style_keys = {
+            atom_fields[name][1]: value
+            for name, value in values["changed_atom_values"].items()
+        }
+        changed_symbols = values["changed_symbols"]
         if values["global_atoms"]:
-            self.viewer.atom_styles = deepcopy(values["styles"])
-            self.viewer.default_atom_style = values["atom_style"]
-            self.viewer.default_custom_radius = float(values["custom_radius"])
-        for name in (
-            "material", "lighting", "edges", "edge_color", "edge_width",
-            "background", "ambient", "diffuse", "specular", "roughness",
-            "metallic", "axes", "grid", "bond_width", "bond_alpha",
-        ):
-            target_name = {
-                "material": "atom_material", "lighting": "atom_lighting",
-                "edges": "atom_edges", "edge_color": "atom_edge_color",
-                "edge_width": "atom_edge_width", "background": "_background_color_value",
-                "ambient": "material_ambient", "diffuse": "material_diffuse",
-                "specular": "material_specular", "roughness": "material_roughness",
-                "metallic": "material_metallic", "axes": "axes_visible",
-                "grid": "grid_visible", "bond_width": "bond_width",
-                "bond_alpha": "bond_alpha",
-            }[name]
-            setattr(self.viewer, target_name, values[name])
-        self.viewer.set_background(self.viewer._background_color_value)
-        after_context = (
-            self._all_supercell_context()
-            if values["global_atoms"]
-            else self._supercell_context(frame_index)
-        )
-        if values["global_atoms"]:
-            change = StructureChange.for_batch(
-                "Appearance",
-                self.elements,
-                self.coordinates,
-                self.lattices,
-                self.elements,
-                self.coordinates,
-                self.lattices,
-                before_context=before_context,
-                after_context=after_context,
-            )
+            # Section: All atoms updates compact renderer defaults. Existing sparse
+            # overrides for changed fields are removed so the new default reaches all.
+            for name, value in values["changed_atom_values"].items():
+                attribute = atom_fields[name][0]
+                before_global[attribute] = deepcopy(getattr(self.viewer, attribute))
+                after_global[attribute] = deepcopy(value)
+            if changed_symbols:
+                before_global["atom_styles"] = deepcopy(self.viewer.atom_styles)
+                new_styles = deepcopy(self.viewer.atom_styles)
+                for symbol in changed_symbols:
+                    new_styles[symbol] = {
+                        "color": values["styles"][symbol]["color"],
+                        "alpha": float(values["styles"][symbol]["alpha"]),
+                    }
+                after_global["atom_styles"] = new_styles
+            if changed_style_keys or changed_symbols:
+                for target_frame, frame_styles in enumerate(self.atom_frame_styles):
+                    for atom_index, old_style in enumerate(frame_styles):
+                        symbol = str(self.elements[target_frame][atom_index])
+                        new_style = dict(old_style)
+                        for style_key in changed_style_keys:
+                            new_style.pop(style_key, None)
+                        if symbol in changed_symbols:
+                            new_style.pop("color", None)
+                            new_style.pop("alpha", None)
+                        if new_style != old_style:
+                            key = (target_frame, atom_index)
+                            before_atom_styles[key] = deepcopy(old_style)
+                            after_atom_styles[key] = new_style
         else:
-            change = StructureChange.for_frame(
-                "Appearance",
-                frame_index,
-                self.elements[frame_index],
-                self.coordinates[frame_index],
-                self.lattices[frame_index],
-                self.elements[frame_index],
-                self.coordinates[frame_index],
-                self.lattices[frame_index],
-                before_context=before_context,
-                after_context=after_context,
-            )
-        self._record_change(change, already_applied=True, frame_index=frame_index)
+            # Section: a non-empty selector writes only changed fields to its atoms.
+            for atom_index in values["indices"]:
+                symbol = str(self.elements[frame_index][atom_index])
+                old_style = self.atom_frame_styles[frame_index][atom_index]
+                new_style = dict(old_style)
+                new_style.update(changed_style_keys)
+                if symbol in changed_symbols:
+                    new_style["color"] = values["styles"][symbol]["color"]
+                    new_style["alpha"] = float(values["styles"][symbol]["alpha"])
+                if new_style != old_style:
+                    key = (frame_index, atom_index)
+                    before_atom_styles[key] = deepcopy(old_style)
+                    after_atom_styles[key] = new_style
+
+        if not before_global and not before_atom_styles:
+            return
+        change = AppearanceChange(
+            "Appearance",
+            before_global,
+            after_global,
+            before_atom_styles,
+            after_atom_styles,
+        )
+        self._record_change(change, frame_index=frame_index)
 
     def _show_metric_style(self):
         """Apply one style to all current-frame metrics through unified history."""
@@ -2097,6 +2532,7 @@ class MainWindow(QMainWindow):
             before_context=before_context,
             after_context=before_context,
         )
+        self.bond_adjacencies[frame_index] = None
         self._record_change(change, frame_index=frame_index)
 
     def _sync_atom_actions(self, indices=None):
@@ -2112,6 +2548,33 @@ class MainWindow(QMainWindow):
         )
         self.replace_atom_action.setEnabled(bool(has_selection))
 
+    def _on_selection_changed(self, indices):
+        """Synchronize actions and print one ordinarily selected atom.
+
+        Args:
+            indices: Current ordinary-selection atom indices.
+
+        Returns:
+            None. Multiple selections update actions without console output.
+        """
+        indices = np.asarray(indices, dtype=int)
+        self._sync_atom_actions(indices)
+        if len(indices) != 1 or not 0 <= self.current_index < len(self.elements):
+            return
+        atom_index = int(indices[0])
+        if not 0 <= atom_index < len(self.elements[self.current_index]):
+            return
+        symbol = str(self.elements[self.current_index][atom_index])
+        x, y, z = np.asarray(
+            self.coordinates[self.current_index][atom_index], dtype=float
+        )
+        index = atom_index + 1
+        elem = symbol
+        self._log(
+            f"{index: <8d} {elem: <4s} "
+            f"{x: > 10.4f} {y: > 10.4f} {z: > 10.4f}"
+        )
+
     def _sync_frame_controls(self):
         """Synchronize frame input and maximum-frame display with retained lists."""
         frame_count = len(self.coordinates)
@@ -2122,14 +2585,18 @@ class MainWindow(QMainWindow):
         self.frame_input.setText(str(current_index))
         del blocker
         self.frame_total_label.setText(f"/ {maximum_index}")
+        self.playback_range_hint.setText(f"0 ~ {maximum_index}")
         has_frames = frame_count > 0
         self.previous_frame_button.setEnabled(has_frames)
         self.next_frame_button.setEnabled(has_frames)
         self.play_button.setEnabled(has_frames)
-        self.pause_button.setEnabled(has_frames)
+        self.playback_options_button.setEnabled(has_frames)
         self.close_frame_action.setEnabled(has_frames)
         self.add_atom_action.setEnabled(has_frames)
         self.metrics_button.setEnabled(has_frames)
+        self.bond_button.setEnabled(has_frames)
+        self.pbc_wrap_button.setEnabled(has_frames)
+        self.pbc_frames_edit.setEnabled(has_frames)
         self._sync_atom_actions(self.viewer.selected_indices)
 
     def _sync_frame_list(self):
@@ -2139,7 +2606,7 @@ class MainWindow(QMainWindow):
         self.frame_list.clear()
         for frame_index, frame_elements in enumerate(self.elements):
             item = QListWidgetItem(
-                f"Frame {frame_index + 1}  ({len(frame_elements)} atoms)"
+                f"{self.frame_names[frame_index]}  ({len(frame_elements)} atoms)"
             )
             item.setData(Qt.ItemDataRole.UserRole, frame_index)
             self.frame_list.addItem(item)
@@ -2149,6 +2616,45 @@ class MainWindow(QMainWindow):
                 min(max(target_row, 0), self.frame_list.count() - 1)
             )
         del blocker
+
+    def _apply_frame_list_permutation(self, permutation):
+        """Reorder existing sidebar items without rebuilding their widgets.
+
+        Args:
+            permutation: Indices satisfying ``new[k] = old[permutation[k]]``.
+
+        Returns:
+            None. Item names and selection state move with their frames.
+        """
+        if self.frame_list.count() != len(permutation):
+            self._sync_frame_list()
+            return
+        blocker = QSignalBlocker(self.frame_list)
+        items = [self.frame_list.takeItem(0) for _ in range(self.frame_list.count())]
+        for old_index in permutation:
+            self.frame_list.addItem(items[int(old_index)])
+        del blocker
+
+    def _refresh_after_permutation(self, sync_frame_list):
+        """Synchronize indices after a reference-only frame reorder.
+
+        Args:
+            sync_frame_list: Whether sidebar items must be reordered first.
+
+        Returns:
+            None. The unchanged logical current frame is not redrawn.
+        """
+        if sync_frame_list:
+            self._sync_frame_list()
+        for row in range(self.frame_list.count()):
+            self.frame_list.item(row).setData(Qt.ItemDataRole.UserRole, row)
+        self.viewer.current_index = self.current_index
+        self.viewer.set_frame_state(
+            self.atom_frame_styles,
+            self.frame_metrics,
+            self.bond_adjacencies,
+        )
+        self._sync_frame_controls()
 
     def _activate_frame_item(self, item):
         """Navigate only when a highlighted frame is double-clicked."""
@@ -2164,9 +2670,36 @@ class MainWindow(QMainWindow):
         menu = QMenu(self.frame_list)
         menu.addAction("Copy", lambda: self._duplicate_frame(row))
         menu.addAction("Delete", lambda: self._delete_frame(row))
+        menu.addAction("Rename", lambda: self._rename_frame(row))
         menu.exec(self.frame_list.mapToGlobal(position))
 
-    def _append_frame(self, elements, coordinates, lattice):
+    def _rename_frame(self, frame_index):
+        """Rename one frame without changing its data or history.
+
+        Args:
+            frame_index: Frame whose fixed display name is edited.
+
+        Returns:
+            None. Empty or cancelled names leave the current name unchanged.
+        """
+        if not 0 <= int(frame_index) < len(self.frame_names):
+            return
+        frame_index = int(frame_index)
+        name, accepted = QInputDialog.getText(
+            self,
+            "Rename Frame",
+            "Name",
+            text=self.frame_names[frame_index],
+        )
+        name = name.strip()
+        if not accepted or not name:
+            return
+        self.frame_names[frame_index] = name
+        item = self.frame_list.item(frame_index)
+        if item is not None:
+            item.setText(f"{name}  ({len(self.elements[frame_index])} atoms)")
+
+    def _append_frame(self, elements, coordinates, lattice, name=None):
         """Append one independent frame and all aligned auxiliary state."""
         self.elements.append(np.array(elements, copy=True))
         self.coordinates.append(np.array(coordinates, dtype=float, copy=True))
@@ -2174,6 +2707,11 @@ class MainWindow(QMainWindow):
         frame = len(self.elements) - 1
         self.atom_frame_styles.append([dict() for _ in self.elements[frame]])
         self.frame_metrics.append({"length": {}, "angle": {}})
+        self.bond_adjacencies.append(None)
+        if name is None:
+            self._frame_name_serial += 1
+            name = f"Frame {self._frame_name_serial}"
+        self.frame_names.append(str(name))
         self.supercell_bases[frame] = {
             "elements": np.array(self.elements[frame], copy=True),
             "coordinates": np.array(self.coordinates[frame], copy=True),
@@ -2193,8 +2731,16 @@ class MainWindow(QMainWindow):
         for target in (
             self.elements, self.coordinates, self.lattices,
             self.atom_frame_styles, self.frame_metrics,
+            self.bond_adjacencies,
+            self.frame_names,
         ):
             target.pop(frame_index)
+        self.bond_frame_indices = [
+            index - 1 if index > frame_index else index
+            for index in self.bond_frame_indices
+            if index != frame_index
+        ]
+        self.viewer.bond_frame_indices = set(self.bond_frame_indices)
         retained_indices = [
             index for index in range(len(self.elements) + 1) if index != frame_index
         ]
@@ -2232,8 +2778,20 @@ class MainWindow(QMainWindow):
             (self.lattices, np.array(self.lattices[frame_index], copy=True)),
             (self.atom_frame_styles, deepcopy(self.atom_frame_styles[frame_index])),
             (self.frame_metrics, deepcopy(self.frame_metrics[frame_index])),
+            (
+                self.bond_adjacencies,
+                None
+                if self.bond_adjacencies[frame_index] is None
+                else np.array(self.bond_adjacencies[frame_index], copy=True),
+            ),
+            (self.frame_names, f"{self.frame_names[frame_index]}_copy"),
         ):
             target.insert(insert_index, value)
+        self.bond_frame_indices = [
+            index + 1 if index >= insert_index else index
+            for index in self.bond_frame_indices
+        ]
+        self.viewer.bond_frame_indices = set(self.bond_frame_indices)
         source_indices = list(range(insert_index)) + [frame_index] + list(
             range(insert_index, len(self.elements) - 1)
         )
@@ -2249,43 +2807,51 @@ class MainWindow(QMainWindow):
         self._refresh_after_change(frame_index=insert_index)
         self._sync_history_actions()
 
-    def _apply_frame_permutation(self, permutation):
+    def _apply_frame_permutation(self, permutation, update_current=True):
         """Apply new[k] = old[perm[k]] to every frame-aligned list."""
         permutation = np.asarray(permutation, dtype=int)
         if sorted(permutation.tolist()) != list(range(len(self.elements))):
             raise ValueError("frame permutation is invalid")
         inverse = np.argsort(permutation)
-        for target in (self.elements, self.coordinates, self.lattices):
+        for target in (
+            self.elements,
+            self.coordinates,
+            self.lattices,
+            self.atom_frame_styles,
+            self.frame_metrics,
+            self.bond_adjacencies,
+            self.frame_names,
+        ):
             old = list(target)
             target[:] = [old[index] for index in permutation]
-        for target in (self.atom_frame_styles, self.frame_metrics):
-            old = deepcopy(target)
-            target[:] = [old[index] for index in permutation]
-        old_bases = deepcopy(self.supercell_bases)
-        old_transforms = deepcopy(self.supercell_transforms)
+        old_bases = self.supercell_bases
+        old_transforms = self.supercell_transforms
         self.supercell_bases = {new: old_bases[int(old)] for new, old in enumerate(permutation)}
         self.supercell_transforms = {
             new: old_transforms[int(old)] for new, old in enumerate(permutation)
         }
-        if len(permutation):
+        if update_current and len(permutation):
             self.current_index = int(inverse[min(self.current_index, len(permutation) - 1)])
+        self.bond_frame_indices = sorted(
+            int(inverse[index])
+            for index in self.bond_frame_indices
+            if 0 <= index < len(inverse)
+        )
+        self.viewer.bond_frame_indices = set(self.bond_frame_indices)
         return inverse
 
     def _reorder_frames(self, permutation):
         """Record one undoable frame permutation from an internal drag."""
         if list(permutation) == list(range(len(self.elements))):
             return
-        before_elements = [np.array(value, copy=True) for value in self.elements]
-        before_coordinates = [np.array(value, copy=True) for value in self.coordinates]
-        before_lattices = [np.array(value, copy=True) for value in self.lattices]
-        before_context = self._all_supercell_context()
-        self._apply_frame_permutation(permutation)
-        after_context = self._all_supercell_context()
-        change = StructureChange.for_batch(
+        before_current = int(self.current_index)
+        inverse = self._apply_frame_permutation(permutation)
+        change = FramePermutationChange(
             "Reorder frames",
-            before_elements, before_coordinates, before_lattices,
-            self.elements, self.coordinates, self.lattices,
-            before_context=before_context, after_context=after_context,
+            tuple(int(index) for index in permutation),
+            tuple(int(index) for index in inverse),
+            before_current,
+            int(self.current_index),
         )
         self._record_change(change, already_applied=True, frame_index=self.current_index)
 
@@ -2334,17 +2900,94 @@ class MainWindow(QMainWindow):
         target = min(max(self.current_index + step, 0), len(self.coordinates) - 1)
         self._change_frame(target)
 
-    def _start_default_playback(self, checked=False):
-        """Start playback over all retained frames at the default rate."""
+    def _toggle_playback_repeat(self):
+        """Toggle the playback completion behavior between once and loop.
+
+        Args:
+            None.
+
+        Return:
+            None. Updates the menu button to show the active behavior.
+        """
+        self.playback_loop = not self.playback_loop
+        self.playback_repeat_button.setText("loop" if self.playback_loop else "once")
+
+    def _toggle_playback(self, checked=False):
+        """Pause active playback or start it with the menu settings.
+
+        Args:
+            checked: Unused Qt button state.
+
+        Return:
+            None. Invalid text is rejected with a warning dialog.
+        """
+        if self.timer.isActive():
+            self._pause_playback()
+            return
+
+        frame_count = len(self.coordinates)
+        if frame_count == 0:
+            return
         try:
-            self._play(None, 10)
-        except (RuntimeError, TypeError, ValueError) as error:
-            self._log(f"Playback error: {error}")
+            start_text = self.playback_range_start.text().strip()
+            end_text = self.playback_range_end.text().strip()
+            stride_text = self.playback_stride.text().strip()
+            start = 0 if not start_text else int(start_text)
+            end = frame_count - 1 if not end_text else int(end_text)
+            stride = int(stride_text)
+            if not 0 <= start <= end < frame_count:
+                raise ValueError(
+                    f"range must satisfy 0 <= start <= end <= {frame_count - 1}"
+                )
+            maximum_stride = max(frame_count - 1, 1)
+            if stride < 1 or (frame_count > 1 and stride >= frame_count):
+                raise ValueError(f"stride must be between 1 and {maximum_stride}")
+            indices = list(range(start, end + 1, stride))
+            self._start_playback(indices, self.playback_fps_slider.value())
+        except (TypeError, ValueError) as error:
+            QMessageBox.warning(self, "Playback", str(error))
+
+    def _set_play_button_state(self, playing):
+        """Show the play or pause icon for the current timer state.
+
+        Args:
+            playing: Whether playback is currently active.
+
+        Return:
+            None. Updates only the toolbar button presentation.
+        """
+        icon = (
+            QStyle.StandardPixmap.SP_MediaPause
+            if playing
+            else QStyle.StandardPixmap.SP_MediaPlay
+        )
+        self.play_button.setIcon(self.style().standardIcon(icon))
+        self.play_button.setToolTip("Pause" if playing else "Play")
+        color = "#ef5350" if playing else "#4caf50"
+        hover = "#e53935" if playing else "#43a047"
+        self.play_button.setStyleSheet(
+            "QToolButton {"
+            f"background-color: {color};"
+            "border: 1px solid #455a64; padding: 3px;"
+            "}"
+            f"QToolButton:hover {{ background-color: {hover}; }}"
+        )
 
     def _pause_playback(self):
-        """Stop playback and rebuild dynamic geometry once."""
+        """Stop playback with the displayed frame as the authoritative index.
+
+        Args:
+            None.
+
+        Return:
+            None. Dynamic geometry is restored once for the displayed frame.
+        """
         self.timer.stop()
+        if 0 <= self.viewer.current_index < len(self.coordinates):
+            self.current_index = int(self.viewer.current_index)
         self.viewer.finish_playback()
+        self._set_play_button_state(False)
+        self._sync_frame_controls()
 
     def _change_zoom(self, delta):
         """Change the zoom spin box by one toolbar step."""
@@ -2420,12 +3063,24 @@ class MainWindow(QMainWindow):
         self.elements = elements
         self.coordinates = coordinates
         self.lattices = lattices
+        self.frame_names = []
+        self._frame_name_serial = 0
+        self._ensure_frame_names()
         self._initialize_supercell_state()
         self._initialize_frame_state()
+        self.bond_frame_indices = []
+        blocker = QSignalBlocker(self.bond_action)
+        self.bond_action.setChecked(False)
+        del blocker
+        self.viewer.bond_frame_indices = set()
         self.cli.bind_data(self.elements, self.coordinates, self.lattices)
         self.current_index = 0
         self.viewer.set_data(elements, coordinates, lattices)
-        self.viewer.set_frame_state(self.atom_frame_styles, self.frame_metrics)
+        self.viewer.set_frame_state(
+            self.atom_frame_styles,
+            self.frame_metrics,
+            self.bond_adjacencies,
+        )
         self.viewer.draw_frame(reset_camera=True)
         blocker = QSignalBlocker(self.zoom_input)
         self.zoom_input.setValue(100)
@@ -2630,11 +3285,22 @@ class MainWindow(QMainWindow):
             self.lattices = lattices
             self._ensure_supercell_state()
             self._ensure_frame_state()
+            self._ensure_frame_names()
             self.viewer.elements = elements
             self.viewer.coordinates = coordinates
             self.viewer.lattices = lattices
             self.viewer.selected_indices = np.empty(0, dtype=int)
-            self.viewer.set_frame_state(self.atom_frame_styles, self.frame_metrics)
+            self.bond_adjacencies = [None for _ in self.coordinates]
+            self.bond_frame_indices = []
+            blocker = QSignalBlocker(self.bond_action)
+            self.bond_action.setChecked(False)
+            del blocker
+            self.viewer.bond_frame_indices = set()
+            self.viewer.set_frame_state(
+                self.atom_frame_styles,
+                self.frame_metrics,
+                self.bond_adjacencies,
+            )
             self._change_frame(min(previous_count, len(coordinates) - 1))
             self._log(f"Appended {len(coordinates) - previous_count} frame(s) from selected files")
         else:
@@ -2645,7 +3311,11 @@ class MainWindow(QMainWindow):
             self.viewer.elements = self.elements
             self.viewer.coordinates = self.coordinates
             self.viewer.lattices = self.lattices
-            self.viewer.set_frame_state(self.atom_frame_styles, self.frame_metrics)
+            self.viewer.set_frame_state(
+                self.atom_frame_styles,
+                self.frame_metrics,
+                self.bond_adjacencies,
+            )
             self.viewer.selected_indices = np.empty(0, dtype=int)
             self.viewer.current_index = min(previous_count, len(self.coordinates) - 1)
             self.viewer.draw_frame(reset_camera=False)
@@ -2691,19 +3361,47 @@ class MainWindow(QMainWindow):
         """
         if len(self.coordinates) == 0:
             raise ValueError("open structure data before playback")
-        self.play_indices = (
+        indices = (
             parse_frame_range(specification, len(self.coordinates))
             if specification is not None
             else list(range(len(self.coordinates)))
         )
-        if not self.play_indices:
+        if not indices:
             raise ValueError("frame range is empty")
         if fps <= 0:
             raise ValueError("fps must be positive")
-        self.play_position = 0
+        self._start_playback(indices, fps)
+
+    def _start_playback(self, indices, fps):
+        """Start playback over explicit valid frame indices.
+
+        Args:
+            indices: Ordered frame indices to display.
+            fps: Requested timer rate in frames per second.
+
+        Return:
+            None. Playback begins at the current or next included frame.
+        """
+        if not indices:
+            raise ValueError("frame range is empty")
+        if fps <= 0:
+            raise ValueError("fps must be positive")
+        if any(index < 0 or index >= len(self.coordinates) for index in indices):
+            raise ValueError("playback contains an out-of-range frame")
+        self.play_indices = list(indices)
+        self.play_position = next(
+            (
+                position
+                for position, index in enumerate(self.play_indices)
+                if index >= self.current_index
+            ),
+            0,
+        )
         self.viewer.begin_playback()
         self.timer.start(max(1, round(1000 / fps)))
+        self._set_play_button_state(True)
         self._sync_frame_controls()
+        self._advance_frame()
 
     def _advance_frame(self):
         """Advance to the next frame in the active playback sequence.
@@ -2712,20 +3410,27 @@ class MainWindow(QMainWindow):
             None.
 
         Return:
-            None. Updates the viewer and wraps playback at the end.
+            None. Updates viewer and counter, then stops or loops at the end.
         """
         if not self.play_indices:
-            self.timer.stop()
+            self._pause_playback()
             return
         index = self.play_indices[self.play_position]
         if not self.viewer.update_frame_preview(index):
             self.viewer.finish_playback()
             self.current_index = index
             self.viewer.set_frame(index)
+            self.viewer.begin_playback()
         else:
             self.current_index = index
         self._sync_frame_controls()
-        self.play_position = (self.play_position + 1) % len(self.play_indices)
+        if self.play_position == len(self.play_indices) - 1:
+            if self.playback_loop:
+                self.play_position = 0
+            else:
+                self._pause_playback()
+        else:
+            self.play_position += 1
 
     def _run_command(self):
         """Parse and execute one console command, reporting errors in the console.
@@ -2819,6 +3524,7 @@ class MainWindow(QMainWindow):
             self._initialize_frame_state()
         else:
             self._ensure_frame_state()
+        self._ensure_frame_names()
         after_context = self._all_supercell_context()
         change = StructureChange.for_batch(
             "CLI data edit",

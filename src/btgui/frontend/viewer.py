@@ -41,6 +41,10 @@ class StructureViewer(QtInteractor):
         self.atom_styles = {}
         self.atom_frame_styles = []
         self.frame_metrics = []
+        self.bond_adjacencies = []
+        self.bond_frame_indices = set()
+        self.bond_mesh_cache = {}
+        self.bond_actor_cache = {}
         self.default_atom_style = "covalent"
         self.default_custom_radius = 0.76
         self._background_color_value = "#f5f7f7"
@@ -83,6 +87,7 @@ class StructureViewer(QtInteractor):
         self.bond_actors = []
         self.atom_meshes = []
         self.lattice_actors = []
+        self.lattice_mesh = None
         self.measurement_actors = []
         self.playback_active = False
         self._playback_base_positions = None
@@ -153,23 +158,31 @@ class StructureViewer(QtInteractor):
         self.lattices = lattices
         self.current_index = 0
         self.selected_indices = np.empty(0, dtype=int)
+        self.bond_adjacencies = []
+        self.bond_frame_indices = set()
+        self.bond_mesh_cache = {}
+        self.bond_actor_cache = {}
+        self.bonds_enabled = False
         self.length_measurements = {}
         self.angle_measurements = {}
         self.set_measurement_mode(None)
         self.draw_frame(reset_camera=True)
 
-    def set_frame_state(self, atom_styles, metrics):
+    def set_frame_state(self, atom_styles, metrics, bond_adjacencies=None):
         """Attach frame-aligned atom styles and measurement mappings.
 
         Args:
             atom_styles: Per-frame lists of per-atom style dictionaries.
             metrics: Per-frame dictionaries containing length and angle mappings.
+            bond_adjacencies: Optional per-frame sparse bond index arrays.
 
         Return:
             None. The provided containers remain owned by the main window.
         """
         self.atom_frame_styles = atom_styles
         self.frame_metrics = metrics
+        if bond_adjacencies is not None:
+            self.bond_adjacencies = bond_adjacencies
         if 0 <= self.current_index < len(metrics):
             self.length_measurements = metrics[self.current_index]["length"]
             self.angle_measurements = metrics[self.current_index]["angle"]
@@ -215,6 +228,7 @@ class StructureViewer(QtInteractor):
         self.bond_actors = []
         self.atom_meshes = []
         self.lattice_actors = []
+        self.lattice_mesh = None
         self.measurement_actors = []
         has_frame = 0 <= self.current_index < len(self.coordinates)
         if not has_frame:
@@ -234,10 +248,29 @@ class StructureViewer(QtInteractor):
         for index, symbol in enumerate(elements):
             style = self._style_for(symbol, index)
             radius = self._style_radius(symbol, index)
-            key = (style["color"], style["alpha"], radius, selected_mask[index])
+            material = self._material_properties(style)
+            key = (
+                style["color"],
+                style["alpha"],
+                radius,
+                selected_mask[index],
+                style["lighting"],
+                style["edges"],
+                style["edge_color"],
+                style["edge_width"],
+                material["ambient"],
+                material["diffuse"],
+                material["specular"],
+                material["roughness"],
+                material["metallic"],
+            )
             groups.setdefault(key, []).append(index)
-        material = self._material_properties()
-        for (color, alpha, radius, is_selected), indices in groups.items():
+        for key, indices in groups.items():
+            (
+                color, alpha, radius, is_selected, lighting, edges,
+                edge_color, edge_width, ambient, diffuse, specular,
+                roughness, metallic,
+            ) = key
             source = pv.Sphere(radius=radius, theta_resolution=24, phi_resolution=16)
             glyphs = pv.PolyData(positions[np.asarray(indices, dtype=int)]).glyph(
                 orient=False,
@@ -249,14 +282,14 @@ class StructureViewer(QtInteractor):
                 color=color,
                 opacity=alpha,
                 smooth_shading=True,
-                lighting=self.atom_lighting,
-                show_edges=self.atom_edges,
-                edge_color=self.atom_edge_color,
-                line_width=self.atom_edge_width,
-                ambient=material["ambient"],
-                diffuse=material["diffuse"],
-                specular=material["specular"],
-                specular_power=material["specular_power"],
+                lighting=lighting,
+                show_edges=edges,
+                edge_color=edge_color,
+                line_width=edge_width,
+                ambient=ambient,
+                diffuse=diffuse,
+                specular=specular,
+                specular_power=max(1.0, 128.0 * (1.0 - roughness)),
                 render=False,
             )
             actor_property = actor.GetProperty()
@@ -264,47 +297,58 @@ class StructureViewer(QtInteractor):
             if has_pbr:
                 actor_property.SetInterpolationToPBR()
                 if hasattr(actor_property, "SetMetallic"):
-                    actor_property.SetMetallic(material["metallic"])
+                    actor_property.SetMetallic(metallic)
                 if hasattr(actor_property, "SetRoughness"):
-                    actor_property.SetRoughness(material["roughness"])
+                    actor_property.SetRoughness(roughness)
             else:
                 actor_property.SetInterpolationToPhong()
-            actor_property.SetAmbient(material["ambient"])
-            actor_property.SetDiffuse(material["diffuse"])
-            actor_property.SetSpecular(material["specular"])
-            actor_property.SetSpecularPower(material["specular_power"])
+            actor_property.SetAmbient(ambient)
+            actor_property.SetDiffuse(diffuse)
+            actor_property.SetSpecular(specular)
+            actor_property.SetSpecularPower(max(1.0, 128.0 * (1.0 - roughness)))
             self.atom_meshes.append((glyphs, np.asarray(indices, dtype=int), glyphs.points.copy()))
             if is_selected:
                 self.selected_actors.append(actor)
 
         # Section: selection outline. A wireframe shell stays in world units.
         if len(valid_selected):
-            selected_elements = elements[valid_selected]
-            for symbol in np.unique(selected_elements):
-                indices = valid_selected[selected_elements == symbol]
-                radius = max(
-                    self._style_radius(elements[index], int(index)) for index in indices
-                ) * 1.08 + 0.025
-                source = pv.Sphere(radius=radius, theta_resolution=24, phi_resolution=16)
-                shells = pv.PolyData(positions[indices]).glyph(
-                    orient=False,
-                    scale=False,
-                    geom=source,
-                )
-                actor = self.add_mesh(
-                    shells,
-                    color="#18a999",
-                    style="wireframe",
-                    line_width=2.0,
-                    lighting=False,
-                    render=False,
-                )
-                self.selected_actors.append(actor)
-                self.selection_shell_actors.append(actor)
+            self._add_selection_shells(positions, elements, valid_selected)
+
+        # Section: measurement selection. Amber shells distinguish temporary picks.
+        valid_measurement = np.asarray(
+            [
+                index
+                for index in self.measurement_selection
+                if 0 <= index < len(elements)
+            ],
+            dtype=int,
+        )
+        for index in valid_measurement:
+            radius = self._style_radius(elements[index], int(index)) * 1.08 + 0.025
+            shell = pv.Sphere(radius=radius, theta_resolution=24, phi_resolution=16)
+            actor = self.add_mesh(
+                shell.translate(positions[index], inplace=False),
+                color="#ff8c42",
+                style="wireframe",
+                line_width=2.5,
+                lighting=False,
+                render=False,
+            )
+            self.selection_shell_actors.append(actor)
 
         self._draw_lattice(np.asarray(self.lattices[self.current_index], dtype=float))
-        if self.bonds_enabled:
-            self._draw_bonds(positions, elements)
+        show_bonds = (
+            self.bonds_enabled
+            and self.current_index in self.bond_frame_indices
+            and 0 <= self.current_index < len(self.bond_adjacencies)
+            and self.bond_adjacencies[self.current_index] is not None
+        )
+        if show_bonds:
+            self._draw_bonds(
+                positions,
+                elements,
+                self.bond_adjacencies[self.current_index],
+            )
         self._draw_measurements(positions)
         for renderer in self.property_renderers.values():
             renderer(self, self.current_index, positions)
@@ -373,13 +417,23 @@ class StructureViewer(QtInteractor):
             "color": style.get("color", default_color(symbol)),
             "alpha": style.get("alpha", 1.0),
             "radius": style.get("radius", self.default_custom_radius),
+            "material": style.get("material", self.atom_material),
+            "lighting": style.get("lighting", self.atom_lighting),
+            "edges": style.get("edges", self.atom_edges),
+            "edge_color": style.get("edge_color", self.atom_edge_color),
+            "edge_width": style.get("edge_width", self.atom_edge_width),
+            "ambient": style.get("ambient", self.material_ambient),
+            "diffuse": style.get("diffuse", self.material_diffuse),
+            "specular": style.get("specular", self.material_specular),
+            "roughness": style.get("roughness", self.material_roughness),
+            "metallic": style.get("metallic", self.material_metallic),
         }
 
-    def _material_properties(self):
+    def _material_properties(self, style=None):
         """Return VTK material coefficients for the selected preset.
 
         Args:
-            None.
+            style: Optional atom-specific material and PBR overrides.
 
         Return:
             Material coefficients accepted by ``Plotter.add_mesh``.
@@ -390,15 +444,16 @@ class StructureViewer(QtInteractor):
             "glossy": {"ambient": 0.10, "diffuse": 0.72, "specular": 0.75, "roughness": 0.18, "metallic": 0.0},
             "metallic": {"ambient": 0.12, "diffuse": 0.55, "specular": 0.85, "roughness": 0.24, "metallic": 0.65},
         }
-        material = dict(presets.get(self.atom_material, presets["default"]))
+        style = {} if style is None else style
+        material = dict(presets.get(style.get("material", self.atom_material), presets["default"]))
         material.update(
-            ambient=self.material_ambient,
-            diffuse=self.material_diffuse,
-            specular=self.material_specular,
-            roughness=self.material_roughness,
-            metallic=self.material_metallic,
-            specular_power=max(1.0, 128.0 * (1.0 - self.material_roughness)),
+            ambient=style.get("ambient", self.material_ambient),
+            diffuse=style.get("diffuse", self.material_diffuse),
+            specular=style.get("specular", self.material_specular),
+            roughness=style.get("roughness", self.material_roughness),
+            metallic=style.get("metallic", self.material_metallic),
         )
+        material["specular_power"] = max(1.0, 128.0 * (1.0 - material["roughness"]))
         return material
 
     def _set_material_preset(self, material):
@@ -429,47 +484,190 @@ class StructureViewer(QtInteractor):
             return vdw_radius(symbol)
         return max(0.01, float(style["radius"]))
 
-    def _draw_bonds(self, positions, elements):
-        """Draw Euclidean covalent-radius bonds as world-coordinate cylinders.
+    def _draw_bonds(self, positions, elements, adjacency):
+        """Draw cached covalent bonds as one batched world-coordinate tube mesh.
 
         Args:
             positions: Current frame Cartesian positions.
             elements: Current frame element symbols.
+            adjacency: Sparse COO index array shaped ``(2, E)``.
 
         Return:
             None. Bond actors are added to the current renderer.
         """
-        radii = np.asarray([covalent_radius(symbol) for symbol in elements])
-        meshes_by_color = {}
-        for left in range(len(positions)):
-            for right in range(left + 1, len(positions)):
-                vector = positions[right] - positions[left]
-                distance = float(np.linalg.norm(vector))
-                if distance == 0 or distance > (radii[left] + radii[right]) * self.bond_tolerance:
-                    continue
-                color = self._blend_colors(
-                    self._style_for(elements[left], left)["color"],
-                    self._style_for(elements[right], right)["color"],
+        adjacency = np.asarray(adjacency, dtype=np.int64)
+        if adjacency.ndim != 2 or adjacency.shape[0] != 2:
+            return
+        cached = self.bond_mesh_cache.get(self.current_index)
+        if cached is None:
+            # Section: one batched tube mesh. VTK expands the complete sparse
+            # edge list in one native pipeline instead of Python constructing
+            # and merging a separate cylinder for every bond.
+            left = adjacency[0]
+            right = adjacency[1]
+            valid = (
+                (left >= 0)
+                & (left < len(positions))
+                & (right >= 0)
+                & (right < len(positions))
+            )
+            left = left[valid]
+            right = right[valid]
+            nonzero = np.linalg.norm(positions[right] - positions[left], axis=1) > 0.0
+            left = left[nonzero]
+            right = right[nonzero]
+            cached = []
+            if len(left):
+                points = np.empty((len(left) * 2, 3), dtype=float)
+                points[0::2] = positions[left]
+                points[1::2] = positions[right]
+                line_cells = np.column_stack(
+                    (
+                        np.full(len(left), 2, dtype=np.int64),
+                        np.arange(len(left) * 2, dtype=np.int64).reshape(-1, 2),
+                    )
+                ).ravel()
+                lines = pv.PolyData(points, lines=line_cells)
+                atom_colors = [
+                    self._style_for(symbol, index)["color"]
+                    for index, symbol in enumerate(elements)
+                ]
+                colors = np.asarray(
+                    [
+                        [
+                            int(color[1:3], 16),
+                            int(color[3:5], 16),
+                            int(color[5:7], 16),
+                        ]
+                        for color in (
+                            self._blend_colors(atom_colors[a], atom_colors[b])
+                            for a, b in zip(left, right)
+                        )
+                    ],
+                    dtype=np.uint8,
                 )
-                cylinder = pv.Cylinder(
-                    center=(positions[left] + positions[right]) / 2,
-                    direction=vector,
+                lines.cell_data["bond_colors"] = colors
+                tubes = lines.tube(
                     radius=self.bond_width,
-                    height=distance,
-                    resolution=16,
-                    capping=True,
+                    n_sides=8,
+                    capping=False,
                 )
-                meshes_by_color.setdefault(color, []).append(cylinder)
-        for color, meshes in meshes_by_color.items():
-            mesh = meshes[0] if len(meshes) == 1 else pv.merge(meshes, merge_points=False)
+                cached.append(("bond_colors", tubes))
+            self.bond_mesh_cache[self.current_index] = cached
+            while len(self.bond_mesh_cache) > 4:
+                oldest = next(iter(self.bond_mesh_cache))
+                self.bond_mesh_cache.pop(oldest, None)
+                self.bond_actor_cache.pop(oldest, None)
+
+        # Section: actor reuse. ``draw_frame`` clears the renderer, but the
+        # mapper and tube mesh remain valid. Reattach the existing actors
+        # instead of wrapping every cached mesh in a new VTK actor.
+        actors = self.bond_actor_cache.get(self.current_index)
+        if actors is None:
+            actors = []
+            for scalars, mesh in cached:
+                actor = self.add_mesh(
+                    mesh,
+                    scalars=scalars,
+                    rgb=True,
+                    opacity=self.bond_alpha,
+                    smooth_shading=True,
+                    show_scalar_bar=False,
+                    pickable=False,
+                    render=False,
+                )
+                actors.append(actor)
+            self.bond_actor_cache[self.current_index] = actors
+        else:
+            for actor in actors:
+                actor.GetProperty().SetOpacity(self.bond_alpha)
+                self.renderer.AddActor(actor)
+
+        self.bond_actors.extend(actors)
+
+    def refresh_bonds(self, positions=None, render=True):
+        """Replace only current-frame bond actors and render once.
+
+        Args:
+            positions: Optional preview coordinates for the current frame.
+            render: Whether to render immediately after replacing the actor.
+
+        Return:
+            None. Atom, lattice, measurement, and overlay actors are retained.
+        """
+        for actor in self.bond_actors:
+            self.renderer.RemoveActor(actor)
+        self.bond_actors = []
+        show_bonds = (
+            self.bonds_enabled
+            and self.current_index in self.bond_frame_indices
+            and 0 <= self.current_index < len(self.bond_adjacencies)
+            and self.bond_adjacencies[self.current_index] is not None
+            and 0 <= self.current_index < len(self.coordinates)
+        )
+        if show_bonds:
+            if positions is None:
+                positions = self.coordinates[self.current_index]
+            self._draw_bonds(
+                np.asarray(positions, dtype=float),
+                np.asarray(self.elements[self.current_index], dtype=str),
+                self.bond_adjacencies[self.current_index],
+            )
+        if render:
+            self.render()
+
+    def _add_selection_shells(self, positions, elements, indices):
+        """Add ordinary-selection wireframes without rebuilding base geometry.
+
+        Args:
+            positions: Current frame Cartesian coordinates.
+            elements: Current frame element symbols.
+            indices: Valid selected atom indices.
+
+        Return:
+            None. New shell actors are tracked for lightweight replacement.
+        """
+        selected_elements = elements[indices]
+        for symbol in np.unique(selected_elements):
+            symbol_indices = indices[selected_elements == symbol]
+            radius = max(
+                self._style_radius(elements[index], int(index))
+                for index in symbol_indices
+            ) * 1.08 + 0.025
+            source = pv.Sphere(radius=radius, theta_resolution=24, phi_resolution=16)
+            shells = pv.PolyData(positions[symbol_indices]).glyph(
+                orient=False,
+                scale=False,
+                geom=source,
+            )
             actor = self.add_mesh(
-                mesh,
-                color=color,
-                opacity=self.bond_alpha,
-                smooth_shading=True,
+                shells,
+                color="#18a999",
+                style="wireframe",
+                line_width=2.0,
+                lighting=False,
                 render=False,
             )
-            self.bond_actors.append(actor)
+            self.selected_actors.append(actor)
+            self.selection_shell_actors.append(actor)
+
+    def invalidate_bond_meshes(self, frame_indices=None):
+        """Drop cached bond geometry after coordinates or styles change.
+
+        Args:
+            frame_indices: Optional iterable of zero-based frames; ``None`` clears all.
+
+        Return:
+            None. Bond adjacency indices remain available for reuse.
+        """
+        if frame_indices is None:
+            self.bond_mesh_cache.clear()
+            self.bond_actor_cache.clear()
+            return
+        for index in frame_indices:
+            frame_index = int(index)
+            self.bond_mesh_cache.pop(frame_index, None)
+            self.bond_actor_cache.pop(frame_index, None)
 
     def _blend_colors(self, first, second):
         """Return the visual midpoint of two hexadecimal colors.
@@ -510,6 +708,7 @@ class StructureViewer(QtInteractor):
         )
         cell = pv.PolyData(corners)
         cell.lines = np.asarray([[2, start, end] for start, end in edges], dtype=np.int64)
+        self.lattice_mesh = cell
         self.lattice_actors.append(
             self.add_mesh(cell, color="#687577", line_width=1.5, lighting=False, render=False)
         )
@@ -670,17 +869,20 @@ class StructureViewer(QtInteractor):
         self.grid_visible = bool(visible)
         self.draw_frame()
 
-    def set_bonds(self, enabled):
-        """Enable or disable Euclidean covalent-radius bonds.
+    def set_bonds(self, enabled, frame_indices=None):
+        """Enable or disable cached bonds for selected frames.
 
         Args:
             enabled: Requested bond visibility.
+            frame_indices: Optional zero-based frames allowed to show bonds.
 
         Return:
             None. The current scene is redrawn.
         """
         self.bonds_enabled = bool(enabled)
-        self.draw_frame()
+        if frame_indices is not None:
+            self.bond_frame_indices = {int(index) for index in frame_indices}
+        self.refresh_bonds()
 
     def set_bond_tolerance(self, tolerance):
         """Set the multiplicative covalent-radius bond cutoff.
@@ -689,11 +891,9 @@ class StructureViewer(QtInteractor):
             tolerance: Nonnegative cutoff multiplier.
 
         Return:
-            None. Visible bonds are redrawn immediately.
+            None. Cached adjacency remains unchanged until explicitly rebuilt.
         """
         self.bond_tolerance = max(0.0, float(tolerance))
-        if self.bonds_enabled:
-            self.draw_frame()
 
     def set_bond_width(self, width):
         """Set the physical bond-cylinder radius in angstroms.
@@ -705,8 +905,9 @@ class StructureViewer(QtInteractor):
             None. Visible bonds are redrawn immediately.
         """
         self.bond_width = max(0.001, float(width))
+        self.invalidate_bond_meshes()
         if self.bonds_enabled:
-            self.draw_frame()
+            self.refresh_bonds()
 
     def set_bond_alpha(self, alpha):
         """Set bond-cylinder opacity.
@@ -719,7 +920,9 @@ class StructureViewer(QtInteractor):
         """
         self.bond_alpha = float(np.clip(alpha, 0.0, 1.0))
         if self.bonds_enabled:
-            self.draw_frame()
+            for actor in self.bond_actors:
+                actor.GetProperty().SetOpacity(self.bond_alpha)
+            self.render()
 
     def set_atom_styles(self, styles):
         """Replace per-element display styles.
@@ -970,7 +1173,7 @@ class StructureViewer(QtInteractor):
             None.
 
         Return:
-            None. Dynamic bond, lattice, and measurement actors are hidden until playback ends.
+            None. Measurements and selection shells are hidden.
         """
         if self.playback_active:
             return
@@ -983,16 +1186,13 @@ class StructureViewer(QtInteractor):
         self._playback_base_elements = np.asarray(
             self.elements[self.current_index], dtype=str
         ).copy()
-        for actor in (
-            self.bond_actors
-            + self.lattice_actors
-            + self.measurement_actors
-            + self.selection_shell_actors
-        ):
+        self.selected_indices = np.empty(0, dtype=int)
+        self.selectionChanged.emit(self.selected_indices.copy())
+        for actor in self.measurement_actors + self.selection_shell_actors:
             actor.SetVisibility(False)
 
     def update_frame_preview(self, index):
-        """Move existing atom glyph meshes to one compatible frame.
+        """Move atom glyphs and update the lattice for one compatible frame.
 
         Args:
             index: Frame index to preview.
@@ -1020,21 +1220,36 @@ class StructureViewer(QtInteractor):
             mesh.points = base_points + np.repeat(displacement, repeats, axis=0)
             mesh.GetPoints().Modified()
             mesh.Modified()
+        lattice = np.asarray(self.lattices[index], dtype=float)
+        corners = np.array(
+            [
+                [0.0, 0.0, 0.0],
+                lattice[0], lattice[1], lattice[2],
+                lattice[0] + lattice[1], lattice[0] + lattice[2],
+                lattice[1] + lattice[2], lattice.sum(axis=0),
+            ]
+        )
+        if self.lattice_mesh is not None:
+            self.lattice_mesh.points = corners
+            self.lattice_mesh.GetPoints().Modified()
+            self.lattice_mesh.Modified()
         self.current_index = index
+        self.refresh_bonds(render=False)
         if 0 <= index < len(self.frame_metrics):
             self.length_measurements = self.frame_metrics[index]["length"]
             self.angle_measurements = self.frame_metrics[index]["angle"]
+        self.reset_camera_clipping_range()
         self.render()
         return True
 
     def finish_playback(self):
-        """Leave lightweight animation mode and rebuild dynamic geometry once."""
+        """Leave animation mode and restore current-frame dynamic geometry once."""
         if not self.playback_active:
             return
         self.playback_active = False
         self._playback_base_positions = None
         self._playback_base_elements = None
-        self.draw_frame()
+        self.draw_frame(reset_camera=False)
 
     def set_atom_material(self, material):
         """Set the global VTK sphere material preset.
@@ -1219,6 +1434,17 @@ class StructureViewer(QtInteractor):
         for actor in self.selected_actors:
             actor.SetUserTransform(transform)
         self.drag_preview_matrix = np.asarray(matrix, dtype=float)
+        if self.bond_actors and 0 <= self.current_index < len(self.coordinates):
+            positions = np.asarray(
+                self.coordinates[self.current_index], dtype=float
+            ).copy()
+            rotation = self.drag_preview_matrix[:3, :3]
+            translation = self.drag_preview_matrix[:3, 3]
+            positions[self.selected_indices] = (
+                self.drag_start_positions @ rotation.T + translation
+            )
+            self.invalidate_bond_meshes((self.current_index,))
+            self.refresh_bonds(positions=positions, render=False)
         self.render()
 
     def _camera_mouse_event(self, event, button, buttons):
@@ -1425,7 +1651,7 @@ class StructureViewer(QtInteractor):
         self._update_add_preview(point)
 
     def keyPressEvent(self, event):
-        """Handle deletion and Enter/Escape controls for atom addition.
+        """Handle deletion and Enter/Escape controls for temporary modes.
 
         Args:
             event: Qt keyboard event.
@@ -1435,6 +1661,11 @@ class StructureViewer(QtInteractor):
         """
         if event.key() == Qt.Key.Key_Escape and self.add_mode:
             self.cancel_atom_addition()
+            event.accept()
+            return
+        if event.key() == Qt.Key.Key_Escape and self.measurement_mode is not None:
+            self.set_measurement_mode(None)
+            self.draw_frame(reset_camera=False)
             event.accept()
             return
         if event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter) and self.add_mode:
@@ -1487,6 +1718,9 @@ class StructureViewer(QtInteractor):
         Return:
             None. Gesture state is captured without invoking VTK's default bindings.
         """
+        if self.playback_active and event.button() != Qt.MouseButton.RightButton:
+            event.accept()
+            return
         if event.button() not in (Qt.MouseButton.LeftButton, Qt.MouseButton.RightButton):
             super().mousePressEvent(event)
             return
@@ -1500,8 +1734,14 @@ class StructureViewer(QtInteractor):
             event.accept()
             return
         if event.button() == Qt.MouseButton.RightButton:
-            shift = bool(self.press_modifiers & Qt.KeyboardModifier.ShiftModifier)
-            alt = bool(self.press_modifiers & Qt.KeyboardModifier.AltModifier)
+            shift = (
+                not self.playback_active
+                and bool(self.press_modifiers & Qt.KeyboardModifier.ShiftModifier)
+            )
+            alt = (
+                not self.playback_active
+                and bool(self.press_modifiers & Qt.KeyboardModifier.AltModifier)
+            )
             self.drag_mode = "rotate_atoms" if shift and alt else "translate_atoms" if shift else "rotate_view"
             has_frame = 0 <= self.current_index < len(self.coordinates)
             has_valid_selection = (
@@ -1511,6 +1751,7 @@ class StructureViewer(QtInteractor):
                 and bool(np.all(self.selected_indices < len(self.coordinates[self.current_index])))
             )
             if self.drag_mode in ("translate_atoms", "rotate_atoms") and has_valid_selection:
+                self.draw_frame(reset_camera=False)
                 frame_coordinates = self.coordinates[self.current_index]
                 self.drag_start_coordinates = frame_coordinates.copy()
                 self.drag_start_positions = frame_coordinates[self.selected_indices].copy()
@@ -1528,8 +1769,6 @@ class StructureViewer(QtInteractor):
                 inner_half_width = min(render_width, render_height) * 0.25
                 offset = np.abs(self.drag_start_mouse - self.drag_center_screen)
                 self.drag_rotation_zone = "inner" if np.all(offset <= inner_half_width) else "outer"
-                for actor in self.bond_actors:
-                    actor.SetVisibility(False)
                 self.render()
             elif self.drag_mode in ("translate_atoms", "rotate_atoms") and len(self.selected_indices) > 0:
                 self.selected_indices = np.empty(0, dtype=int)
@@ -1559,6 +1798,9 @@ class StructureViewer(QtInteractor):
         Return:
             None. Selected actors move during preview; coordinates remain unchanged.
         """
+        if self.playback_active and self.drag_mode != "rotate_view":
+            event.accept()
+            return
         current = self._display_position(event)
         if self.add_mode and self.pressed_button == Qt.MouseButton.NoButton:
             self._update_add_preview(current)
@@ -1633,6 +1875,9 @@ class StructureViewer(QtInteractor):
         Return:
             None. Coordinates and bonds are updated once before drag state is cleared.
         """
+        if self.playback_active and self.drag_mode != "rotate_view":
+            event.accept()
+            return
         finished_drag_mode = self.drag_mode
         try:
             if event.button() != self.pressed_button:
@@ -1657,6 +1902,7 @@ class StructureViewer(QtInteractor):
                         picked = self._pick_atom(finish)
                         if len(picked) == 0:
                             self.set_measurement_mode(None)
+                            self.draw_frame(reset_camera=False)
                         else:
                             atom_index = int(picked[0])
                             if atom_index not in self.measurement_selection:
@@ -1697,6 +1943,9 @@ class StructureViewer(QtInteractor):
                                                 "style": self.default_metric_style(),
                                             }
                                 self.set_measurement_mode(None)
+                                self.draw_frame(reset_camera=False)
+                            else:
+                                self.draw_frame(reset_camera=False)
                 elif self.dragged:
                     screen = self._project_atoms()
                     inside = (
@@ -1827,7 +2076,20 @@ class StructureViewer(QtInteractor):
         Return:
             None. Camera and zoom-reference state are untouched.
         """
-        self.draw_frame(reset_camera=False)
+        for actor in self.selection_shell_actors:
+            self.remove_actor(actor, render=False)
+        self.selection_shell_actors = []
+        self.selected_actors = []
+        if 0 <= self.current_index < len(self.coordinates):
+            positions = np.asarray(self.coordinates[self.current_index], dtype=float)
+            elements = np.asarray(self.elements[self.current_index], dtype=str)
+            valid = self.selected_indices[
+                (self.selected_indices >= 0)
+                & (self.selected_indices < len(elements))
+            ]
+            if len(valid):
+                self._add_selection_shells(positions, elements, valid)
+        self.render()
 
     def _camera_basis(self):
         """Return camera-right, camera-up, and viewing unit vectors.

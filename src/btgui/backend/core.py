@@ -2,7 +2,7 @@
 
 import numpy as np
 
-from btgui.data.appearance import ELEMENT_COLORS
+from btgui.data.appearance import ELEMENT_COLORS, covalent_radius
 
 
 def distance_between(coordinates: np.ndarray, first: int, second: int) -> float:
@@ -73,6 +73,108 @@ def parse_frame_selection(specification: str, frame_count: int) -> list[int]:
     if not selected:
         raise ValueError("frame selection is empty")
     return sorted(selected)
+
+
+def parse_frame_scope(
+    specification: str,
+    frame_count: int,
+    current_index: int,
+) -> list[int]:
+    """Parse a current/all/one-based inclusive frame selector.
+
+    Args:
+        specification: Empty text, ``all``, or comma-separated frame ranges.
+        frame_count: Number of available frames.
+        current_index: Zero-based frame returned for an empty selector.
+
+    Return:
+        Sorted unique zero-based frame indices.
+
+    Raises:
+        ValueError: If no frame exists or the selector is invalid.
+    """
+    if frame_count <= 0:
+        raise ValueError("there are no frames")
+    text = str(specification).strip()
+    if not text:
+        if not 0 <= current_index < frame_count:
+            raise ValueError("the current frame is unavailable")
+        return [int(current_index)]
+    if text.lower() == "all":
+        return list(range(frame_count))
+    return parse_frame_selection(text, frame_count)
+
+
+def build_bond_adjacency(
+    coordinates: np.ndarray,
+    elements: np.ndarray | list,
+    tolerance: float,
+) -> np.ndarray:
+    """Build a sparse upper-triangle covalent-bond adjacency array.
+
+    Args:
+        coordinates: Cartesian coordinates with shape ``(N, 3)``.
+        elements: Element symbols aligned with the coordinates.
+        tolerance: Nonnegative covalent-radius cutoff multiplier.
+
+    Return:
+        An ``int64`` COO index array shaped ``(2, E)`` with ``left < right``.
+
+    Raises:
+        ValueError: If array shapes, symbols, or tolerance are invalid.
+    """
+    positions = np.asarray(coordinates, dtype=float)
+    symbols = np.asarray(elements, dtype=str).reshape(-1)
+    if positions.ndim != 2 or positions.shape[1] != 3:
+        raise ValueError("coordinates must have shape (N, 3)")
+    if len(positions) != len(symbols):
+        raise ValueError("elements and coordinates must have equal lengths")
+    tolerance = float(tolerance)
+    if not np.isfinite(tolerance) or tolerance < 0.0:
+        raise ValueError("bond tolerance must be a finite nonnegative number")
+    radii = np.asarray([covalent_radius(symbol) for symbol in symbols], dtype=float)
+    left_parts = []
+    right_parts = []
+    for left in range(max(len(positions) - 1, 0)):
+        vectors = positions[left + 1:] - positions[left]
+        distances_squared = np.einsum("ij,ij->i", vectors, vectors)
+        cutoffs = (radii[left] + radii[left + 1:]) * tolerance
+        matches = np.flatnonzero(
+            (distances_squared > 0.0) & (distances_squared <= cutoffs * cutoffs)
+        )
+        if len(matches):
+            left_parts.append(np.full(len(matches), left, dtype=np.int64))
+            right_parts.append((matches + left + 1).astype(np.int64, copy=False))
+    if not left_parts:
+        return np.empty((2, 0), dtype=np.int64)
+    return np.vstack((np.concatenate(left_parts), np.concatenate(right_parts)))
+
+
+def wrap_coordinates(coordinates: np.ndarray, lattice: np.ndarray) -> np.ndarray:
+    """Return Cartesian coordinates wrapped into one row-vector unit cell.
+
+    Args:
+        coordinates: Cartesian coordinates with shape ``(N, 3)``.
+        lattice: Nonsingular row-vector lattice matrix with shape ``(3, 3)``.
+
+    Return:
+        A new Cartesian array whose fractional coordinates lie in ``[0, 1)``.
+
+    Raises:
+        ValueError: If input shapes are invalid or the lattice is singular.
+    """
+    positions = np.asarray(coordinates, dtype=float)
+    cell = np.asarray(lattice, dtype=float)
+    if positions.ndim != 2 or positions.shape[1] != 3:
+        raise ValueError("coordinates must have shape (N, 3)")
+    if cell.shape != (3, 3):
+        raise ValueError("lattice must have shape (3, 3)")
+    try:
+        fractional = np.linalg.solve(cell.T, positions.T).T
+    except np.linalg.LinAlgError as error:
+        raise ValueError("cannot wrap coordinates in a singular lattice") from error
+    fractional -= np.floor(fractional)
+    return fractional @ cell
 
 
 def validate_data(

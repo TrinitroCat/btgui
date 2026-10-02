@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Any
+from copy import deepcopy
 
 import numpy as np
 
@@ -211,3 +212,72 @@ class StructureChange:
                     else:
                         target[frame_index] = np.array(value, copy=True)
         return self.after_context if use_after else self.before_context
+
+
+@dataclass
+class AppearanceChange:
+    """Store a renderer appearance edit without copying structure arrays.
+
+    Args:
+        description: Short operation name used by the history UI.
+        before_global: Renderer attributes before the edit.
+        after_global: Renderer attributes after the edit.
+        before_atom_styles: Sparse ``(frame, atom)`` style snapshots before edit.
+        after_atom_styles: Sparse ``(frame, atom)`` style snapshots after edit.
+
+    Returns:
+        A lightweight history entry for global or selected-atom appearance edits.
+    """
+
+    description: str
+    before_global: dict[str, Any]
+    after_global: dict[str, Any]
+    before_atom_styles: dict[tuple[int, int], dict]
+    after_atom_styles: dict[tuple[int, int], dict]
+
+    def apply(self, window, use_after: bool) -> None:
+        """Apply the selected renderer and sparse atom-style snapshot.
+
+        Args:
+            window: Main window owning renderer and per-frame atom styles.
+            use_after: Whether to apply the state after the edit.
+
+        Returns:
+            None. Only named renderer fields and sparse atom styles are changed.
+        """
+        global_values = self.after_global if use_after else self.before_global
+        atom_values = self.after_atom_styles if use_after else self.before_atom_styles
+        for name, value in global_values.items():
+            setattr(window.viewer, name, deepcopy(value))
+        for (frame, atom), style in atom_values.items():
+            if 0 <= frame < len(window.atom_frame_styles):
+                styles = window.atom_frame_styles[frame]
+                if 0 <= atom < len(styles):
+                    styles[atom] = deepcopy(style)
+        window.viewer.renderer.set_background(window.viewer._background_color_value)
+
+
+@dataclass
+class FramePermutationChange:
+    """Store only the forward and inverse indices for a frame reorder."""
+
+    description: str
+    permutation: tuple[int, ...]
+    inverse: tuple[int, ...]
+    before_current: int
+    after_current: int
+
+    def apply(self, window, use_after: bool) -> None:
+        """Apply one reference-only frame permutation to the main window.
+
+        Args:
+            window: Main window owning every frame-aligned list.
+            use_after: Whether to apply the forward or inverse permutation.
+
+        Returns:
+            None. Array contents are not copied.
+        """
+        indices = self.permutation if use_after else self.inverse
+        window._apply_frame_permutation(indices, update_current=False)
+        window._apply_frame_list_permutation(indices)
+        window.current_index = self.after_current if use_after else self.before_current

@@ -51,8 +51,10 @@ The standalone entry point uses built-in serial readers and writers. File Open s
 Metrics > Length and Metrics > Angle temporarily replace normal atom selection. Pick
 two atoms for a distance or three atoms in endpoint-vertex-endpoint order for an
 angle. Measurements belong to their source frame and update from that frame's
-coordinates; clicking empty space exits the special selector. Metrics > Style
-changes the current frame's line and label appearance.
+coordinates. Temporary metric picks use amber outlines; completing the required
+picks immediately returns to normal selection, while `Esc` or clicking empty space
+cancels an incomplete pick. Metrics > Style changes the current frame's line and
+label appearance.
 
 Selected-atom transforms are previewed through VTK actors while dragging. The
 coordinate array and covalent bonds are updated once on release. Use `Ctrl+Z`
@@ -64,18 +66,29 @@ equivalent installed package directory).
 The top menu bar contains File, Settings, Appearance, Windows, and View. The toolbar
 below it contains structure operations and current-frame playback/navigation.
 Axes and Grid are optional Appearance settings and default to off. Bond display
-and its tolerance are grouped under Check Bonds; Resize is available from the
-Supercell menu. The View menu contains lattice-axis views and zoom controls. The
+and its tolerance are grouped under Bonds. Check bonds rebuilds cached sparse
+adjacency only for the selected frames; Show bonds only displays those cached
+connections, and Clear bonds releases all adjacency caches. Resize is available
+from the Supercell menu. PBC wrap applies fractional-coordinate wrapping to the
+selected frames and is undoable. The View menu contains lattice-axis views and
+zoom controls. The
 toolbar frame controls use zero-based indices. Save As writes only the
 currently displayed frame. Opening another file appends
 its frames to the current batch; the current frame field rejects invalid or
-out-of-range input without changing the displayed frame. `Ctrl+W` and the close
+out-of-range input without changing the displayed frame. The play/pause icon starts
+at the current frame; its adjacent menu controls FPS, an inclusive frame range,
+stride, and once/loop completion behavior. Playback updates atom and lattice geometry
+incrementally, while the right mouse button remains available for camera rotation.
+`Ctrl+W` and the close
 button remove the current frame. Windows > Show Frames opens a frame sidebar for
-navigation, duplication, deletion, and undoable drag reordering. File > New adds
-an empty or populated frame. Appearance contains an atom selector plus per-element
-settings and global VTK material, lighting, and atom-boundary settings. An empty
-selector applies atom appearance globally; element symbols and one-based atom
-numbers/ranges limit the change to matching atoms in the current frame.
+navigation, duplication, deletion, renaming, and undoable drag reordering. Frame
+names remain attached to their data while reordering, and copies use an `_copy`
+suffix. File > New adds an empty or populated frame. Appearance contains an atom
+selector plus per-element settings. An empty selector applies color, opacity,
+display radius, material, lighting, PBR, and atom-boundary settings to all atoms;
+element symbols and one-based atom numbers/ranges limit those settings to matching
+atoms in the current frame. Background, axes, grid, and bond settings remain
+scene-wide.
 
 Enter `help` in the bottom command line for available commands. Property overlays can be added with `MainWindow.register_property_renderer(name, callback)`; the callback receives `(plotter, frame_index, positions)`.
 
