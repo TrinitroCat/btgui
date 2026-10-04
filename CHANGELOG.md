@@ -16,7 +16,7 @@
 - Updated the optional BUCToolkit save path to write transformed current-frame metadata correctly.
 - Brightened the Default, Matte, Glossy, and Metallic material presets.
 - Extracted the command console into `frontend/cli.py` with validated raw-list
-  workspaces, runtime `to_bt` conversion, and optional pyshortcuts support.
+  workspaces and runtime `to_bt` conversion.
 - Added reversible supercell rebasing, rectangle selection feedback, file drag
   and drop, Delete atom removal, and direct/reference-based Add Atom placement.
 - Added persistent Python-console prompts, protected-list rollback, and concise

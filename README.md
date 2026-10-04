@@ -79,9 +79,11 @@ out-of-range input without changing the displayed frame. The play/pause icon sta
 at the current frame; its adjacent menu controls FPS, an inclusive frame range,
 stride, and once/loop completion behavior. Playback updates atom and lattice geometry
 incrementally, while the right mouse button remains available for camera rotation.
-`Ctrl+W` and the close
-button remove the current frame. Windows > Show Frames opens a frame sidebar for
-navigation, duplication, deletion, renaming, and undoable drag reordering. Frame
+The display-window close button closes the focused display window without
+removing its frame. Windows > Delete removes selected frames, and Windows > Show Frames
+opens a frame sidebar for navigation, multi-selection, duplication, deletion, renaming, and
+undoable drag reordering. Single-clicking a frame switches the focused viewer;
+double-clicking or choosing Open creates a new shared-data viewer window. Frame
 names remain attached to their data while reordering, and copies use an `_copy`
 suffix. File > New adds an empty or populated frame. Appearance contains an atom
 selector plus per-element settings. An empty selector applies color, opacity,
@@ -118,9 +120,7 @@ inner variables` and leave the displayed data unchanged. Completed commands also
 refresh the renderer so in-place edits become visible immediately. When BUCToolkit is
 available at runtime, `to_bt()` returns a copied `BatchStructures` object;
 `to_bt("1, 3-4")` uses the one-based inclusive frame syntax and
-`to_bt([0, 2])` uses zero-based Python indices. The optional `shortcut` command
-uses `pyshortcuts` when installed and reports availability without creating a
-file otherwise.
+`to_bt([0, 2])` uses zero-based Python indices.
 
 ### Supercell transformations
 

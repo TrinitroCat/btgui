@@ -5,11 +5,8 @@ from __future__ import annotations
 import code
 from contextlib import redirect_stderr, redirect_stdout
 import importlib
-import importlib.util
 import io
 import shlex
-import sys
-from pathlib import Path
 from typing import Callable
 
 import numpy as np
@@ -84,7 +81,6 @@ class CLI:
         on_clear: Callback clearing atom selection.
         on_view_reset: Callback resetting the camera.
         on_data_changed: Callback atomically applying validated raw lists.
-        on_shortcut: Callback requesting a desktop shortcut.
 
     Notes:
         ``coo``, ``cell``, and ``elements`` always reference detached working
@@ -106,7 +102,6 @@ class CLI:
         on_clear: Callable,
         on_view_reset: Callable,
         on_data_changed: Callable,
-        on_shortcut: Callable,
         on_executed: Callable | None = None,
         buctoolkit_paths=None,
     ) -> None:
@@ -121,7 +116,6 @@ class CLI:
         self._on_clear = on_clear
         self._on_view_reset = on_view_reset
         self._on_data_changed = on_data_changed
-        self._on_shortcut = on_shortcut
         self._on_executed = on_executed
         self._targets = {"coo": [], "cell": [], "elements": []}
         self._backup = {name: [] for name in self._IN_VAR_SET}
@@ -401,7 +395,6 @@ class CLI:
             "  clear                      clear atom selection\n"
             "  view reset                 reset camera and zoom\n"
             "  to_bt [1,3-5]             store selected frames in Python variable bt\n"
-            "  shortcut                   create an optional desktop shortcut\n"
             "\nPython console:\n"
             "  coo       List[np.ndarray], Cartesian coordinates shaped (N, 3)\n"
             "  cell      List[np.ndarray], row-vector cells shaped (3, 3)\n"
@@ -522,9 +515,6 @@ class CLI:
                 self._namespace["bt"] = batch
                 self._log("Created BUCToolkit BatchStructures as Python variable bt.")
             return False
-        if name == "shortcut" and len(args) == 0:
-            self._on_shortcut()
-            return False
         return self._push_python(source)
 
     def to_bt(self, index: list[int] | str | None = None):
@@ -589,35 +579,3 @@ class CLI:
         )
         batch.generate_atom_list(force_update=True)
         return batch
-
-    def create_shortcut(self) -> None:
-        """Create a desktop shortcut through optional pyshortcuts.
-
-        Args:
-            None.
-
-        Returns:
-            None. No file is created when the dependency is unavailable.
-
-        Raises:
-            RuntimeError: If pyshortcuts is not installed.
-        """
-        try:
-            pyshortcuts = importlib.import_module("pyshortcuts")
-        except ImportError as error:
-            raise RuntimeError(
-                "pyshortcuts is not installed; desktop shortcut was not created"
-            ) from error
-        pyshortcuts.make_shortcut(str(Path(sys.argv[0]).resolve()), name="btgui")
-
-    @staticmethod
-    def shortcut_available() -> bool:
-        """Report whether optional pyshortcuts can be imported.
-
-        Args:
-            None.
-
-        Returns:
-            ``True`` when the desktop-shortcut dependency is installed.
-        """
-        return importlib.util.find_spec("pyshortcuts") is not None

@@ -15,6 +15,7 @@ from PySide6.QtWidgets import (
     QComboBox,
     QCheckBox,
     QAbstractItemView,
+    QApplication,
     QDialog,
     QDialogButtonBox,
     QDockWidget,
@@ -29,6 +30,8 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QMainWindow,
     QMenu,
+    QMdiArea,
+    QMdiSubWindow,
     QPlainTextEdit,
     QPushButton,
     QSlider,
@@ -528,6 +531,217 @@ class FrameListWidget(QListWidget):
         self.permutationChanged.emit(permutation)
 
 
+class FrameSelectionDialog(QDialog):
+    """Collect a frame scope using the shared current/all/range syntax."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Delete Frames")
+        self.selection = QLineEdit(self)
+        self.selection.setPlaceholderText("current, all, or e.g. 1-3, 5")
+        layout = QFormLayout(self)
+        layout.addRow("Frames (1-based)", self.selection)
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel,
+            self,
+        )
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def values(self, frame_count, current_index):
+        """Return zero-based indices parsed as current/all/range scope."""
+        return parse_frame_scope(self.selection.text(), frame_count, current_index)
+
+
+class ManagedSubWindow(QMdiSubWindow):
+    """Let the window manager own the viewer shutdown sequence."""
+
+    closed = Signal(object)
+
+    def closeEvent(self, event):
+        """Delegate cleanup before accepting the MDI close event."""
+        self.closed.emit(self)
+        event.accept()
+
+
+class WindowManager:
+    """Manage equal frame-indexed viewers hosted by the MDI area."""
+
+    def __init__(self, owner, area):
+        self.owner = owner
+        self.area = area
+        self.records = []
+        self._activating = False
+        self._closing = set()
+        self.area.subWindowActivated.connect(self._activated)
+
+    def add(self, viewer, frame_index, title="Frame", show=True):
+        """Add one viewer subwindow and retain its current frame index."""
+        subwindow = ManagedSubWindow(self.area)
+        subwindow.setWidget(viewer)
+        self.area.addSubWindow(subwindow)
+        subwindow.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, False)
+        flags = (
+            Qt.WindowType.SubWindow
+            | Qt.WindowType.WindowTitleHint
+            | Qt.WindowType.WindowSystemMenuHint
+            | Qt.WindowType.WindowMinMaxButtonsHint
+            | Qt.WindowType.WindowCloseButtonHint
+        )
+        subwindow.setWindowFlags(flags)
+        subwindow.setWindowTitle(title)
+        subwindow.setOption(QMdiSubWindow.SubWindowOption.RubberBandMove, True)
+        subwindow.setOption(QMdiSubWindow.SubWindowOption.RubberBandResize, True)
+        record = {"viewer": viewer, "subwindow": subwindow, "frame_index": int(frame_index)}
+        self.records.append(record)
+        subwindow.closed.connect(self._close_record)
+        if show:
+            viewer.show()
+            subwindow.show()
+            self.area.setActiveSubWindow(subwindow)
+        return record
+
+    def show_hidden(self):
+        """Show windows that were populated while hidden without changing focus."""
+        for record in self.records:
+            if not record["subwindow"].isVisible():
+                record["viewer"].show()
+                record["subwindow"].show()
+            QTimer.singleShot(0, lambda item=record: self._render_if_open(item))
+
+    def _render_if_open(self, record):
+        """Render a still-open viewer after Qt has realized its native surface."""
+        if record not in self.records or not record["subwindow"].isVisible():
+            return
+        record["viewer"].render()
+
+    def find_frame(self, frame_index):
+        """Return the open window record displaying ``frame_index``, if any."""
+        frame_index = int(frame_index)
+        return next(
+            (record for record in self.records if record["frame_index"] == frame_index),
+            None,
+        )
+
+    def _close_record(self, subwindow):
+        """Close and destroy one viewer without leaving queued render callbacks."""
+        record = next(
+            (item for item in self.records if item["subwindow"] is subwindow),
+            None,
+        )
+        if record is None:
+            return
+        if subwindow in self._closing:
+            return
+        self._closing.add(subwindow)
+        self.records.remove(record)
+        viewer = record["viewer"]
+        if self.owner.viewer is viewer and self.owner.timer.isActive():
+            self.owner._pause_playback()
+        replacement = self.active_record()
+        owner_viewer_was_closed = self.owner.viewer is viewer
+        if owner_viewer_was_closed:
+            if replacement is not None:
+                self.owner._activate_viewer(replacement["viewer"])
+            else:
+                self.owner.viewer = None
+        subwindow.setWidget(None)
+        subwindow.hide()
+
+        def finalize_close():
+            """Release native rendering resources after queued paints drain."""
+            viewer.setUpdatesEnabled(False)
+            viewer.close()
+            viewer.setParent(None)
+            viewer.deleteLater()
+            subwindow.deleteLater()
+            self._closing.discard(subwindow)
+
+        QTimer.singleShot(0, finalize_close)
+
+    def _activated(self, subwindow):
+        """Make the activated viewer the owner's current viewer."""
+        if self._activating or subwindow is None:
+            return
+        for record in self.records:
+            if record["subwindow"] is subwindow:
+                self.owner._activate_viewer(record["viewer"])
+                break
+
+    def active_record(self):
+        """Return the record for the active subwindow, if any."""
+        active = self.area.activeSubWindow()
+        for record in self.records:
+            if record["subwindow"] is active:
+                return record
+        return self.records[0] if self.records else None
+
+    def close_all(self):
+        """Close every displayed structure window."""
+        for record in list(self.records):
+            record["subwindow"].close()
+
+    def close_for_frames(self, indices):
+        """Close windows displaying any frame in ``indices``."""
+        targets = set(int(index) for index in indices)
+        for record in list(self.records):
+            if record["frame_index"] in targets:
+                record["subwindow"].close()
+
+    def remove_frames(self, indices):
+        """Drop deleted indices and shift surviving window references."""
+        deleted = set(int(index) for index in indices)
+        for record in self.records:
+            index = record["frame_index"]
+            record["frame_index"] = index - sum(old < index for old in deleted)
+
+    def apply_permutation(self, inverse):
+        """Update every displayed frame through an old-to-new permutation."""
+        for record in self.records:
+            index = record["frame_index"]
+            if 0 <= index < len(inverse):
+                record["frame_index"] = int(inverse[index])
+
+    def refresh_all(self, reset_camera=False):
+        """Redraw all open viewers against the owner's shared frame lists."""
+        for record in list(self.records):
+            viewer = record["viewer"]
+            index = record["frame_index"]
+            if not self.owner.coordinates:
+                viewer.elements = self.owner.elements
+                viewer.coordinates = self.owner.coordinates
+                viewer.lattices = self.owner.lattices
+                viewer.current_index = 0
+                viewer.set_frame_state(
+                    self.owner.atom_frame_styles,
+                    self.owner.frame_metrics,
+                    self.owner.bond_adjacencies,
+                )
+                viewer.draw_frame(reset_camera=reset_camera)
+                continue
+            index = min(max(index, 0), len(self.owner.coordinates) - 1)
+            record["frame_index"] = index
+            viewer.elements = self.owner.elements
+            viewer.coordinates = self.owner.coordinates
+            viewer.lattices = self.owner.lattices
+            viewer.bond_frame_indices = set(self.owner.bond_frame_indices)
+            viewer.bond_adjacencies = self.owner.bond_adjacencies
+            viewer.invalidate_bond_meshes()
+            viewer.current_index = index
+            viewer.set_frame_state(
+                self.owner.atom_frame_styles,
+                self.owner.frame_metrics,
+                self.owner.bond_adjacencies,
+            )
+            viewer.selected_indices = viewer.selected_indices[
+                (viewer.selected_indices >= 0)
+                & (viewer.selected_indices < len(self.owner.elements[index]))
+            ]
+            viewer.draw_frame(reset_camera=reset_camera)
+        self.show_hidden()
+
+
 class SettingsDialog(QDialog):
     """Edit persistent history and default rendering preferences.
 
@@ -915,18 +1129,8 @@ class MainWindow(QMainWindow):
         self.toolbar.setMovable(False)
         self.addToolBar(Qt.ToolBarArea.TopToolBarArea, self.toolbar)
         self.viewer = StructureViewer(self)
-        self.viewer.atom_material = self.settings["default_atom_material"]
-        self.viewer._set_material_preset(self.viewer.atom_material)
-        self.viewer.atom_lighting = self.settings["atom_lighting"]
-        self.viewer.atom_edges = self.settings["atom_edges"]
-        self.viewer.atom_edge_color = self.settings["atom_edge_color"]
-        self.viewer.atom_edge_width = self.settings["atom_edge_width"]
-        self.viewer.coordinatesEdited.connect(self._record_coordinate_edit)
-        self.viewer.deleteRequested.connect(self._delete_selected_atoms)
-        self.viewer.atomsAdded.connect(self._commit_reference_atoms)
-        self.viewer.filesDropped.connect(self._open_dropped_files)
-        self.viewer.measurementModeChanged.connect(self._sync_measurement_actions)
-        self.viewer.selectionChanged.connect(self._on_selection_changed)
+        self._configure_viewer(self.viewer)
+        self.viewer.hide()
 
         self.undo_action = QAction(
             self.style().standardIcon(QStyle.StandardPixmap.SP_ArrowBack),
@@ -1128,15 +1332,6 @@ class MainWindow(QMainWindow):
             QSizePolicy.Policy.Preferred,
         )
         self.toolbar.addWidget(spacer)
-        self.close_frame_action = QAction(
-            self.style().standardIcon(QStyle.StandardPixmap.SP_TitleBarCloseButton),
-            "Close Current Frame",
-            self,
-        )
-        self.close_frame_action.setShortcut("Ctrl+W")
-        self.close_frame_action.triggered.connect(self._close_current_frame)
-        self.toolbar.addAction(self.close_frame_action)
-
         self.zoom_minus_button = QToolButton(self)
         self.zoom_minus_button.setText("-")
         self.zoom_minus_button.setToolTip("Decrease zoom")
@@ -1147,7 +1342,7 @@ class MainWindow(QMainWindow):
         self.zoom_input.setValue(100)
         self.zoom_input.setSuffix("%")
         self.zoom_input.setToolTip("Zoom percentage")
-        self.zoom_input.valueChanged.connect(self.viewer.set_zoom_percent)
+        self.zoom_input.valueChanged.connect(lambda value: self.viewer.set_zoom_percent(value))
         self.zoom_plus_button = QToolButton(self)
         self.zoom_plus_button.setText("+")
         self.zoom_plus_button.setToolTip("Increase zoom")
@@ -1171,7 +1366,6 @@ class MainWindow(QMainWindow):
             on_clear=self._clear_selection,
             on_view_reset=self._reset_view,
             on_data_changed=self._on_cli_data_changed,
-            on_shortcut=self._create_shortcut,
             on_executed=self._refresh_after_cli_execution,
             buctoolkit_paths=self.settings["buctoolkit_paths"],
         )
@@ -1184,7 +1378,11 @@ class MainWindow(QMainWindow):
         console_layout.addWidget(self.output)
         console_layout.addWidget(self.command)
         splitter = QSplitter(Qt.Orientation.Vertical, self)
-        splitter.addWidget(self.viewer)
+        self.mdi_area = QMdiArea(self)
+        self.mdi_area.setViewMode(QMdiArea.ViewMode.SubWindowView)
+        self.mdi_area.setTabsClosable(False)
+        self.window_manager = WindowManager(self, self.mdi_area)
+        splitter.addWidget(self.mdi_area)
         splitter.addWidget(console)
         splitter.setStretchFactor(0, 5)
         splitter.setStretchFactor(1, 1)
@@ -1193,26 +1391,25 @@ class MainWindow(QMainWindow):
         self.frame_dock = QDockWidget("Frames", self)
         self.frame_dock.setObjectName("framesDock")
         self.frame_list = FrameListWidget(self.frame_dock)
-        self.frame_list.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.frame_list.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
         self.frame_list.setDragDropMode(QAbstractItemView.DragDropMode.InternalMove)
         self.frame_list.setDefaultDropAction(Qt.DropAction.MoveAction)
         self.frame_list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
-        self.frame_list.itemDoubleClicked.connect(self._activate_frame_item)
+        self._pending_frame_row = None
+        self._frame_click_timer = QTimer(self)
+        self._frame_click_timer.setSingleShot(True)
+        self._frame_click_timer.timeout.connect(self._commit_frame_click)
+        self.frame_list.itemClicked.connect(self._queue_frame_item_click)
+        self.frame_list.itemDoubleClicked.connect(self._open_frame_item)
         self.frame_list.customContextMenuRequested.connect(self._show_frame_context_menu)
         self.frame_list.permutationChanged.connect(self._reorder_frames)
         self.frame_dock.setWidget(self.frame_list)
         self.addDockWidget(Qt.DockWidgetArea.LeftDockWidgetArea, self.frame_dock)
-        self.frame_dock.hide()
+        self.frame_dock.show()
         self._create_menus()
         self._sync_frame_controls()
         self._sync_history_actions()
         self._log("Ready. Supply structure lists directly or connect file I/O handlers.")
-        if not self.cli.shortcut_available():
-            QMessageBox.information(
-                self,
-                "Desktop shortcut",
-                "pyshortcuts is not installed; no desktop shortcut will be created.",
-            )
         if self.settings_warning is not None:
             self._log(self.settings_warning)
 
@@ -1278,6 +1475,77 @@ class MainWindow(QMainWindow):
         except (json.JSONDecodeError, OSError, TypeError, ValueError) as error:
             self.settings_warning = f"Settings warning: {error}; using defaults."
         return settings
+
+    def _configure_viewer(self, viewer):
+        """Apply shared viewer settings and connect the standard callbacks."""
+        viewer.atom_material = self.settings["default_atom_material"]
+        viewer._set_material_preset(viewer.atom_material)
+        viewer.atom_lighting = self.settings["atom_lighting"]
+        viewer.atom_edges = self.settings["atom_edges"]
+        viewer.atom_edge_color = self.settings["atom_edge_color"]
+        viewer.atom_edge_width = self.settings["atom_edge_width"]
+        viewer.coordinatesEdited.connect(self._record_coordinate_edit)
+        viewer.deleteRequested.connect(self._delete_selected_atoms)
+        viewer.atomsAdded.connect(self._commit_reference_atoms)
+        viewer.filesDropped.connect(self._open_dropped_files)
+        viewer.measurementModeChanged.connect(self._sync_measurement_actions)
+        viewer.selectionChanged.connect(self._on_selection_changed)
+        viewer.set_error_handler(self._log)
+
+    def _activate_viewer(self, viewer):
+        """Make one displayed viewer the target of toolbar and edit actions."""
+        self.viewer = viewer
+        for record in self.window_manager.records:
+            if record["viewer"] is viewer:
+                self.current_index = record["frame_index"]
+                break
+        self._sync_frame_controls()
+
+    def _ensure_data_window(self):
+        """Create the first structure window when data exists but none is open."""
+        if self.window_manager.records or not self.coordinates:
+            return
+        if self.viewer is None:
+            self.viewer = StructureViewer(self)
+            self._configure_viewer(self.viewer)
+        frame_index = min(max(self.current_index, 0), len(self.coordinates) - 1)
+        self.window_manager.add(
+            self.viewer, frame_index, self.frame_names[frame_index], show=True
+        )
+        QApplication.processEvents()
+        self.viewer.set_data(self.elements, self.coordinates, self.lattices)
+        self.viewer.set_frame_state(
+            self.atom_frame_styles, self.frame_metrics, self.bond_adjacencies
+        )
+        self.viewer.current_index = frame_index
+        self.viewer.set_frame(frame_index)
+
+    def _connect_extra_viewer(self, viewer):
+        """Connect shared edit and drop signals for an additional viewer."""
+        viewer.coordinatesEdited.connect(
+            lambda frame, before, after, view=viewer: (
+                self._activate_viewer(view),
+                self._record_coordinate_edit(frame, before, after),
+            )
+        )
+        viewer.deleteRequested.connect(
+            lambda frame, indices, view=viewer: (
+                self._activate_viewer(view),
+                self._delete_selected_atoms(frame, indices),
+            )
+        )
+        viewer.atomsAdded.connect(
+            lambda frame, symbols, positions, view=viewer: (
+                self._activate_viewer(view),
+                self._commit_reference_atoms(frame, symbols, positions),
+            )
+        )
+        viewer.selectionChanged.connect(
+            lambda indices, view=viewer: (
+                self._activate_viewer(view),
+                self._on_selection_changed(indices),
+            )
+        )
 
     def _persist_settings(self):
         """Write current settings to ``settings.json`` beside the package.
@@ -1611,38 +1879,26 @@ class MainWindow(QMainWindow):
         Returns:
             None. The viewer is redrawn with the current raw lists.
         """
-        self.viewer.invalidate_bond_meshes(changed_frame_indices)
+        if self.viewer is not None:
+            self.viewer.invalidate_bond_meshes(changed_frame_indices)
         self._ensure_supercell_state()
         self._ensure_frame_state()
         self._ensure_frame_names()
-        self.viewer.elements = self.elements
-        self.viewer.coordinates = self.coordinates
-        self.viewer.lattices = self.lattices
         if self.coordinates:
             target = self.current_index if frame_index is None else int(frame_index)
             self.current_index = min(max(target, 0), len(self.coordinates) - 1)
-            self.viewer.current_index = self.current_index
-            self.viewer.set_frame_state(
-                self.atom_frame_styles,
-                self.frame_metrics,
-                self.bond_adjacencies,
-            )
-            self.viewer.selected_indices = self.viewer.selected_indices[
-                (self.viewer.selected_indices >= 0)
-                & (self.viewer.selected_indices < len(self.elements[self.current_index]))
-            ]
-            self.viewer.draw_frame(reset_camera=reset_camera)
         else:
-            self.viewer.current_index = 0
-            self.viewer.set_frame_state(
-                self.atom_frame_styles,
-                self.frame_metrics,
-                self.bond_adjacencies,
-            )
-            self.viewer.draw_frame(reset_camera=reset_camera)
+            self.current_index = 0
+        self._ensure_data_window()
+        active = self.window_manager.active_record()
+        if active is not None:
+            active["frame_index"] = self.current_index
+        self.window_manager.refresh_all(reset_camera=reset_camera)
         self._sync_frame_controls()
         self._sync_frame_list()
-        self._sync_atom_actions(self.viewer.selected_indices)
+        self._sync_atom_actions(
+            self.viewer.selected_indices if self.viewer is not None else np.empty(0, dtype=int)
+        )
         self.cli.bind_data(self.elements, self.coordinates, self.lattices)
 
     def _record_change(self, change, already_applied=False, frame_index=None):
@@ -1706,13 +1962,12 @@ class MainWindow(QMainWindow):
             "material_metallic",
         }
         if change.before_atom_styles or changed_global & atom_fields:
-            affected_frames = None
-            if not changed_global & atom_fields:
-                affected_frames = {
-                    frame_index for frame_index, _ in change.before_atom_styles
-                }
-            self.viewer.invalidate_bond_meshes(affected_frames)
-            self.viewer.draw_frame()
+            for record in self.window_manager.records:
+                viewer = record["viewer"]
+                for name in atom_fields:
+                    if hasattr(self.viewer, name):
+                        setattr(viewer, name, deepcopy(getattr(self.viewer, name)))
+            self.window_manager.refresh_all()
             return
 
         if {"axes_visible", "grid_visible"} & changed_global and self.coordinates:
@@ -2591,17 +2846,19 @@ class MainWindow(QMainWindow):
         self.next_frame_button.setEnabled(has_frames)
         self.play_button.setEnabled(has_frames)
         self.playback_options_button.setEnabled(has_frames)
-        self.close_frame_action.setEnabled(has_frames)
         self.add_atom_action.setEnabled(has_frames)
         self.metrics_button.setEnabled(has_frames)
         self.bond_button.setEnabled(has_frames)
         self.pbc_wrap_button.setEnabled(has_frames)
         self.pbc_frames_edit.setEnabled(has_frames)
-        self._sync_atom_actions(self.viewer.selected_indices)
+        self._sync_atom_actions(
+            self.viewer.selected_indices if self.viewer is not None else np.empty(0, dtype=int)
+        )
 
     def _sync_frame_list(self):
         """Rebuild the file-like frame list while retaining its highlight."""
         selected_row = self.frame_list.currentRow()
+        selected_rows = [index.row() for index in self.frame_list.selectedIndexes()]
         blocker = QSignalBlocker(self.frame_list)
         self.frame_list.clear()
         for frame_index, frame_elements in enumerate(self.elements):
@@ -2615,6 +2872,9 @@ class MainWindow(QMainWindow):
             self.frame_list.setCurrentRow(
                 min(max(target_row, 0), self.frame_list.count() - 1)
             )
+            for row in selected_rows:
+                if 0 <= row < self.frame_list.count():
+                    self.frame_list.item(row).setSelected(True)
         del blocker
 
     def _apply_frame_list_permutation(self, permutation):
@@ -2648,28 +2908,88 @@ class MainWindow(QMainWindow):
             self._sync_frame_list()
         for row in range(self.frame_list.count()):
             self.frame_list.item(row).setData(Qt.ItemDataRole.UserRole, row)
-        self.viewer.current_index = self.current_index
-        self.viewer.set_frame_state(
-            self.atom_frame_styles,
-            self.frame_metrics,
-            self.bond_adjacencies,
-        )
+        for record in self.window_manager.records:
+            record["viewer"].set_frame_state(
+                self.atom_frame_styles,
+                self.frame_metrics,
+                self.bond_adjacencies,
+            )
+        self.window_manager.refresh_all()
         self._sync_frame_controls()
 
-    def _activate_frame_item(self, item):
-        """Navigate only when a highlighted frame is double-clicked."""
-        self._change_frame(self.frame_list.row(item))
+    def _queue_frame_item_click(self, item):
+        """Delay a single-click switch long enough to detect a double-click."""
+        self._pending_frame_row = self.frame_list.row(item)
+        self._frame_click_timer.start(QApplication.doubleClickInterval())
+
+    def _commit_frame_click(self):
+        """Switch the focused viewer after a click is confirmed as single."""
+        if self._pending_frame_row is None:
+            return
+        row = self._pending_frame_row
+        self._pending_frame_row = None
+        if 0 <= row < len(self.coordinates):
+            self._change_frame(row)
+
+    def _open_frame_item(self, item):
+        """Open the double-clicked frame in a new structure window."""
+        self._frame_click_timer.stop()
+        self._pending_frame_row = None
+        self._open_frame_window(self.frame_list.row(item))
+
+    def _open_frame_window(self, frame_index):
+        """Create one shared-data viewer for a valid frame index."""
+        if not 0 <= int(frame_index) < len(self.elements):
+            return
+        frame_index = int(frame_index)
+        existing = self.window_manager.find_frame(frame_index)
+        if existing is not None:
+            existing["subwindow"].show()
+            self.mdi_area.setActiveSubWindow(existing["subwindow"])
+            return
+        viewer = StructureViewer(self.mdi_area)
+        source_viewer = self.viewer
+        if source_viewer is None:
+            active = self.window_manager.active_record()
+            source_viewer = None if active is None else active["viewer"]
+        for name in (
+            "atom_styles", "atom_material", "atom_lighting", "atom_edges",
+            "atom_edge_color", "atom_edge_width", "default_atom_style",
+            "default_custom_radius", "_background_color_value", "material_ambient",
+            "material_diffuse", "material_specular", "material_roughness",
+            "material_metallic", "axes_visible", "grid_visible", "bond_width",
+            "bond_alpha", "bond_tolerance", "bonds_enabled",
+        ):
+            if source_viewer is not None:
+                setattr(viewer, name, deepcopy(getattr(source_viewer, name)))
+        if source_viewer is None:
+            self._configure_viewer(viewer)
+        else:
+            self._connect_extra_viewer(viewer)
+        self.window_manager.add(viewer, frame_index, self.frame_names[frame_index])
+        QApplication.processEvents()
+        viewer.set_data(self.elements, self.coordinates, self.lattices)
+        viewer.set_frame_state(
+            self.atom_frame_styles, self.frame_metrics, self.bond_adjacencies
+        )
+        viewer.set_frame(frame_index)
+        QTimer.singleShot(0, viewer.render)
 
     def _show_frame_context_menu(self, position):
-        """Show Copy and Delete actions for the highlighted frame."""
+        """Show multi-frame Copy and Delete actions for the clicked frame."""
         item = self.frame_list.itemAt(position)
         if item is None:
             return
-        self.frame_list.setCurrentItem(item)
         row = self.frame_list.row(item)
+        selected_rows = [index.row() for index in self.frame_list.selectedIndexes()]
+        if row not in selected_rows:
+            self.frame_list.clearSelection()
+            item.setSelected(True)
+            selected_rows = [row]
         menu = QMenu(self.frame_list)
-        menu.addAction("Copy", lambda: self._duplicate_frame(row))
-        menu.addAction("Delete", lambda: self._delete_frame(row))
+        menu.addAction("Open", lambda: self._open_frame_window(row))
+        menu.addAction("Copy", lambda: self._duplicate_frames(selected_rows, row))
+        menu.addAction("Delete", lambda: self._delete_frames(selected_rows))
         menu.addAction("Rename", lambda: self._rename_frame(row))
         menu.exec(self.frame_list.mapToGlobal(position))
 
@@ -2721,90 +3041,128 @@ class MainWindow(QMainWindow):
             np.ones(3, dtype=np.int64), np.eye(3, dtype=np.int64)
         )
 
-    def _delete_frame(self, frame_index):
-        """Delete one frame and every aligned container without history."""
-        if not 0 <= int(frame_index) < len(self.elements):
+    def _delete_frames(self, frame_indices):
+        """Delete several frames with one aligned-list update and one redraw."""
+        indices = sorted(
+            set(int(index) for index in frame_indices)
+        )
+        indices = [index for index in indices if 0 <= index < len(self.elements)]
+        if not indices:
             return
-        frame_index = int(frame_index)
-        old_bases = self.supercell_bases
-        old_transforms = self.supercell_transforms
+        self.window_manager.close_for_frames(indices)
+        deleted = set(indices)
+        retained = [index for index in range(len(self.elements)) if index not in deleted]
         for target in (
-            self.elements, self.coordinates, self.lattices,
-            self.atom_frame_styles, self.frame_metrics,
+            self.elements,
+            self.coordinates,
+            self.lattices,
+            self.atom_frame_styles,
+            self.frame_metrics,
             self.bond_adjacencies,
             self.frame_names,
         ):
-            target.pop(frame_index)
-        self.bond_frame_indices = [
-            index - 1 if index > frame_index else index
-            for index in self.bond_frame_indices
-            if index != frame_index
-        ]
-        self.viewer.bond_frame_indices = set(self.bond_frame_indices)
-        retained_indices = [
-            index for index in range(len(self.elements) + 1) if index != frame_index
-        ]
-        self.supercell_bases = {
-            new: old_bases[old] for new, old in enumerate(retained_indices)
-        }
-        self.supercell_transforms = {
-            new: old_transforms[old] for new, old in enumerate(retained_indices)
-        }
-        if frame_index < self.current_index:
-            self.current_index -= 1
-        elif frame_index == self.current_index:
-            self.current_index = min(frame_index, max(len(self.elements) - 1, 0))
-        self.viewer.selected_indices = np.empty(0, dtype=int)
-        self.undo_stack.clear()
-        self.redo_stack.clear()
-        self._refresh_after_change()
-        self._sync_history_actions()
-
-    def _close_current_frame(self):
-        """Close the displayed frame through the common deletion path."""
-        self._delete_frame(self.current_index)
-
-    def _duplicate_frame(self, frame_index):
-        """Insert a deep independent copy directly below one selected frame."""
-        if not 0 <= int(frame_index) < len(self.elements):
-            return
-        frame_index = int(frame_index)
-        insert_index = frame_index + 1
+            target[:] = [target[index] for index in retained]
         old_bases = self.supercell_bases
         old_transforms = self.supercell_transforms
-        for target, value in (
-            (self.elements, np.array(self.elements[frame_index], copy=True)),
-            (self.coordinates, np.array(self.coordinates[frame_index], copy=True)),
-            (self.lattices, np.array(self.lattices[frame_index], copy=True)),
-            (self.atom_frame_styles, deepcopy(self.atom_frame_styles[frame_index])),
-            (self.frame_metrics, deepcopy(self.frame_metrics[frame_index])),
-            (
-                self.bond_adjacencies,
-                None
-                if self.bond_adjacencies[frame_index] is None
-                else np.array(self.bond_adjacencies[frame_index], copy=True),
-            ),
-            (self.frame_names, f"{self.frame_names[frame_index]}_copy"),
-        ):
-            target.insert(insert_index, value)
+        self.supercell_bases = {
+            new: old_bases[old] for new, old in enumerate(retained)
+        }
+        self.supercell_transforms = {
+            new: old_transforms[old] for new, old in enumerate(retained)
+        }
         self.bond_frame_indices = [
-            index + 1 if index >= insert_index else index
+            index - sum(deleted_index < index for deleted_index in deleted)
+            for index in self.bond_frame_indices
+            if index not in deleted
+        ]
+        self.viewer.bond_frame_indices = set(self.bond_frame_indices)
+        self.window_manager.remove_frames(indices)
+        old_current = self.current_index
+        if not self.elements:
+            self.current_index = 0
+        elif old_current in deleted:
+            self.current_index = min(old_current, len(self.elements) - 1)
+        else:
+            self.current_index = old_current - sum(
+                deleted_index < old_current for deleted_index in deleted
+            )
+        for record in self.window_manager.records:
+            record["viewer"].selected_indices = np.empty(0, dtype=int)
+        self.undo_stack.clear()
+        self.redo_stack.clear()
+        self._refresh_after_change(frame_index=self.current_index)
+        self._sync_history_actions()
+
+    def _close_all_views(self):
+        """Close every displayed structure window."""
+        self.window_manager.close_all()
+
+    def _show_delete_frames(self):
+        """Prompt for one-based frame ranges and delete them in one operation."""
+        if not self.elements:
+            return
+        dialog = FrameSelectionDialog(parent=self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        try:
+            indices = dialog.values(len(self.elements), self.current_index)
+        except ValueError as error:
+            QMessageBox.warning(self, "Delete Frames", str(error))
+            return
+        self._delete_frames(indices)
+
+    def _duplicate_frames(self, frame_indices, anchor_index):
+        """Copy selected frames in order below the context-menu anchor."""
+        selected = sorted(set(int(index) for index in frame_indices))
+        if not selected or not 0 <= int(anchor_index) < len(self.elements):
+            return
+        anchor_index = int(anchor_index)
+        snapshots = []
+        for index in selected:
+            snapshots.append(
+                {
+                    "elements": np.array(self.elements[index], copy=True),
+                    "coordinates": np.array(self.coordinates[index], copy=True),
+                    "lattice": np.array(self.lattices[index], copy=True),
+                    "styles": deepcopy(self.atom_frame_styles[index]),
+                    "metrics": deepcopy(self.frame_metrics[index]),
+                    "bonds": None if self.bond_adjacencies[index] is None else np.array(self.bond_adjacencies[index], copy=True),
+                    "name": f"{self.frame_names[index]}_copy",
+                    "base": deepcopy(self.supercell_bases[index]),
+                    "transform": deepcopy(self.supercell_transforms[index]),
+                }
+            )
+        old_count = len(self.elements)
+        insert_at = anchor_index + 1
+        for offset, snapshot in enumerate(snapshots):
+            position = insert_at + offset
+            self.elements.insert(position, snapshot["elements"])
+            self.coordinates.insert(position, snapshot["coordinates"])
+            self.lattices.insert(position, snapshot["lattice"])
+            self.atom_frame_styles.insert(position, snapshot["styles"])
+            self.frame_metrics.insert(position, snapshot["metrics"])
+            self.bond_adjacencies.insert(position, snapshot["bonds"])
+            self.frame_names.insert(position, snapshot["name"])
+        self.bond_frame_indices = [
+            index + len(snapshots) if index >= insert_at else index
             for index in self.bond_frame_indices
         ]
         self.viewer.bond_frame_indices = set(self.bond_frame_indices)
-        source_indices = list(range(insert_index)) + [frame_index] + list(
-            range(insert_index, len(self.elements) - 1)
-        )
+        old_bases = self.supercell_bases
+        old_transforms = self.supercell_transforms
+        source_order = list(range(old_count))
+        for offset in range(len(snapshots)):
+            source_order.insert(insert_at + offset, -(offset + 1))
         self.supercell_bases = {
-            new: deepcopy(old_bases[old]) for new, old in enumerate(source_indices)
+            new: (snapshots[-old - 1].get("base") if old < 0 else deepcopy(old_bases[old]))
+            for new, old in enumerate(source_order)
         }
         self.supercell_transforms = {
-            new: deepcopy(old_transforms[old]) for new, old in enumerate(source_indices)
+            new: (snapshots[-old - 1].get("transform") if old < 0 else deepcopy(old_transforms[old]))
+            for new, old in enumerate(source_order)
         }
-        self.current_index = insert_index
-        self.undo_stack.clear()
-        self.redo_stack.clear()
-        self._refresh_after_change(frame_index=insert_index)
+        self.current_index = insert_at + len(snapshots) - 1
+        self._refresh_after_change(frame_index=self.current_index)
         self._sync_history_actions()
 
     def _apply_frame_permutation(self, permutation, update_current=True):
@@ -2830,6 +3188,7 @@ class MainWindow(QMainWindow):
         self.supercell_transforms = {
             new: old_transforms[int(old)] for new, old in enumerate(permutation)
         }
+        self.window_manager.apply_permutation(inverse)
         if update_current and len(permutation):
             self.current_index = int(inverse[min(self.current_index, len(permutation) - 1)])
         self.bond_frame_indices = sorted(
@@ -2880,7 +3239,11 @@ class MainWindow(QMainWindow):
         if not 0 <= index < len(self.coordinates):
             raise ValueError(f"frame index must be between 0 and {max(len(self.coordinates) - 1, 0)}")
         self._pause_playback()
+        self._ensure_data_window()
         self.current_index = index
+        active = self.window_manager.active_record()
+        if active is not None:
+            active["frame_index"] = int(index)
         self.viewer.set_frame(index)
         self._sync_frame_controls()
 
@@ -2983,9 +3346,13 @@ class MainWindow(QMainWindow):
             None. Dynamic geometry is restored once for the displayed frame.
         """
         self.timer.stop()
-        if 0 <= self.viewer.current_index < len(self.coordinates):
+        if self.viewer is not None and 0 <= self.viewer.current_index < len(self.coordinates):
             self.current_index = int(self.viewer.current_index)
-        self.viewer.finish_playback()
+            active = self.window_manager.active_record()
+            if active is not None:
+                active["frame_index"] = self.current_index
+        if self.viewer is not None:
+            self.viewer.finish_playback()
         self._set_play_button_state(False)
         self._sync_frame_controls()
 
@@ -3013,8 +3380,6 @@ class MainWindow(QMainWindow):
         save_action = file_menu.addAction("Save As...")
         save_action.setShortcut("Ctrl+Shift+S")
         save_action.triggered.connect(self._save_dialog)
-        shortcut_action = file_menu.addAction("Create Desktop Shortcut")
-        shortcut_action.triggered.connect(self._create_shortcut)
         export_action = file_menu.addAction("Export Batch...")
         export_action.triggered.connect(self._export_dialog)
         settings_action = QAction("Settings", self)
@@ -3028,6 +3393,9 @@ class MainWindow(QMainWindow):
         show_frames_action = self.frame_dock.toggleViewAction()
         show_frames_action.setText("Show Frames")
         windows_menu.addAction(show_frames_action)
+        delete_action = windows_menu.addAction("Delete...")
+        delete_action.triggered.connect(self._show_delete_frames)
+        windows_menu.addAction("Close All", self._close_all_views)
 
         view_menu = menu_bar.addMenu("View")
         view_menu.addAction("Along A", lambda: self._set_view(0))
@@ -3068,20 +3436,15 @@ class MainWindow(QMainWindow):
         self._ensure_frame_names()
         self._initialize_supercell_state()
         self._initialize_frame_state()
+        self.current_index = 0
+        self._ensure_data_window()
         self.bond_frame_indices = []
         blocker = QSignalBlocker(self.bond_action)
         self.bond_action.setChecked(False)
         del blocker
-        self.viewer.bond_frame_indices = set()
         self.cli.bind_data(self.elements, self.coordinates, self.lattices)
-        self.current_index = 0
-        self.viewer.set_data(elements, coordinates, lattices)
-        self.viewer.set_frame_state(
-            self.atom_frame_styles,
-            self.frame_metrics,
-            self.bond_adjacencies,
-        )
-        self.viewer.draw_frame(reset_camera=True)
+        self.viewer.bond_frame_indices = set()
+        self.window_manager.refresh_all(reset_camera=True)
         blocker = QSignalBlocker(self.zoom_input)
         self.zoom_input.setValue(100)
         del blocker
@@ -3283,45 +3646,24 @@ class MainWindow(QMainWindow):
             self.elements = elements
             self.coordinates = coordinates
             self.lattices = lattices
-            self._ensure_supercell_state()
-            self._ensure_frame_state()
+            self._initialize_supercell_state()
+            self._initialize_frame_state()
             self._ensure_frame_names()
-            self.viewer.elements = elements
-            self.viewer.coordinates = coordinates
-            self.viewer.lattices = lattices
-            self.viewer.selected_indices = np.empty(0, dtype=int)
             self.bond_adjacencies = [None for _ in self.coordinates]
             self.bond_frame_indices = []
             blocker = QSignalBlocker(self.bond_action)
             self.bond_action.setChecked(False)
             del blocker
-            self.viewer.bond_frame_indices = set()
-            self.viewer.set_frame_state(
-                self.atom_frame_styles,
-                self.frame_metrics,
-                self.bond_adjacencies,
-            )
-            self._change_frame(min(previous_count, len(coordinates) - 1))
+            self.current_index = min(previous_count, len(coordinates) - 1)
+            self._refresh_after_change(frame_index=self.current_index, reset_camera=True)
             self._log(f"Appended {len(coordinates) - previous_count} frame(s) from selected files")
         else:
             for frame_elements, frame_coordinates, frame_lattice in zip(
                 elements, coordinates, lattices
             ):
                 self._append_frame(frame_elements, frame_coordinates, frame_lattice)
-            self.viewer.elements = self.elements
-            self.viewer.coordinates = self.coordinates
-            self.viewer.lattices = self.lattices
-            self.viewer.set_frame_state(
-                self.atom_frame_styles,
-                self.frame_metrics,
-                self.bond_adjacencies,
-            )
-            self.viewer.selected_indices = np.empty(0, dtype=int)
-            self.viewer.current_index = min(previous_count, len(self.coordinates) - 1)
-            self.viewer.draw_frame(reset_camera=False)
-            self.current_index = self.viewer.current_index
-            self._sync_frame_controls()
-            self._sync_frame_list()
+            self.current_index = min(previous_count, len(self.coordinates) - 1)
+            self._refresh_after_change(frame_index=self.current_index)
             self._log(f"Appended {len(elements)} frame(s) from selected files")
         self.cli.bind_data(self.elements, self.coordinates, self.lattices)
 
@@ -3423,6 +3765,9 @@ class MainWindow(QMainWindow):
             self.viewer.begin_playback()
         else:
             self.current_index = index
+        active = self.window_manager.active_record()
+        if active is not None:
+            active["frame_index"] = int(index)
         self._sync_frame_controls()
         if self.play_position == len(self.play_indices) - 1:
             if self.playback_loop:
@@ -3477,7 +3822,8 @@ class MainWindow(QMainWindow):
         Return:
             None. The current frame is redrawn without selected atoms.
         """
-        self.viewer.selected_indices = np.empty(0, dtype=int)
+        if self.viewer is not None:
+            self.viewer.selected_indices = np.empty(0, dtype=int)
         self.viewer.refresh_selection_overlay()
         self._sync_atom_actions(self.viewer.selected_indices)
 
@@ -3550,23 +3896,6 @@ class MainWindow(QMainWindow):
             None. In-place NumPy mutations become visible immediately.
         """
         self._refresh_after_change(frame_index=self.current_index)
-
-    def _create_shortcut(self):
-        """Create an optional desktop shortcut and report missing dependencies.
-
-        Args:
-            None.
-
-        Return:
-            None. A warning is shown when pyshortcuts is unavailable.
-        """
-        try:
-            self.cli.create_shortcut()
-        except RuntimeError as error:
-            QMessageBox.information(self, "Desktop shortcut", str(error))
-            self._log(str(error))
-        except (OSError, TypeError, ValueError) as error:
-            self._log(f"Desktop shortcut error: {error}")
 
     def _log(self, message):
         """Append one line to the command output pane.
