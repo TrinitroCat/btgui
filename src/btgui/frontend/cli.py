@@ -81,6 +81,7 @@ class CLI:
         on_clear: Callback clearing atom selection.
         on_view_reset: Callback resetting the camera.
         on_data_changed: Callback atomically applying validated raw lists.
+        on_update: Optional callback invoking the configured external updater.
 
     Notes:
         ``coo``, ``cell``, and ``elements`` always reference detached working
@@ -104,6 +105,7 @@ class CLI:
         on_data_changed: Callable,
         on_executed: Callable | None = None,
         buctoolkit_paths=None,
+        on_update: Callable | None = None,
     ) -> None:
         self._log = log
         self._on_open = on_open
@@ -116,6 +118,7 @@ class CLI:
         self._on_clear = on_clear
         self._on_view_reset = on_view_reset
         self._on_data_changed = on_data_changed
+        self._on_update = on_update
         self._on_executed = on_executed
         self._targets = {"coo": [], "cell": [], "elements": []}
         self._backup = {name: [] for name in self._IN_VAR_SET}
@@ -394,6 +397,7 @@ class CLI:
             "  select INDEX...           select zero-based atoms in the current frame\n"
             "  clear                      clear atom selection\n"
             "  view reset                 reset camera and zoom\n"
+            "  update [SCOPE]             run updater on current/all/selected frames\n"
             "  to_bt [1,3-5]             store selected frames in Python variable bt\n"
             "\nPython console:\n"
             "  coo       List[np.ndarray], Cartesian coordinates shaped (N, 3)\n"
@@ -506,6 +510,13 @@ class CLI:
             return False
         if name == "view" and args == ["reset"]:
             self._on_view_reset()
+            return False
+        if name == "update":
+            if len(args) > 1:
+                raise ValueError("usage: update [SCOPE]")
+            if self._on_update is None:
+                raise ValueError("no external updater is configured")
+            self._on_update(args[0] if args else None)
             return False
         if name == "to_bt":
             if len(args) > 1:

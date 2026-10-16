@@ -5,5 +5,8 @@
   "atom_edges": false,
   "atom_edge_color": "#202020",
   "atom_edge_width": 1.0,
-  "buctoolkit_paths": []
+  "keyboard_translation_step": 0.1,
+  "buctoolkit_paths": [],
+  "updater_path": [],
+  "updater_function": []
 }

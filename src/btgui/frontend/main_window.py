@@ -1,10 +1,16 @@
 """Main window, file actions, animation timer, and command console."""
 
 from collections import deque
+import ast
+from contextlib import redirect_stderr, redirect_stdout
 from copy import deepcopy
+import io
 import json
 import os
 from pathlib import Path
+import sys
+import traceback
+import warnings
 
 import numpy as np
 
@@ -41,6 +47,8 @@ from PySide6.QtWidgets import (
     QStyle,
     QToolBar,
     QToolButton,
+    QTreeWidget,
+    QTreeWidgetItem,
     QWidgetAction,
     QVBoxLayout,
     QWidget,
@@ -51,7 +59,9 @@ from PySide6.QtWidgets import (
 )
 
 from btgui.backend.core import (
+    apply_structure_updater,
     build_bond_adjacency,
+    normalize_bond_adjacency,
     parse_frame_range,
     parse_frame_scope,
     parse_frame_selection,
@@ -61,7 +71,11 @@ from btgui.backend.core import (
 from btgui.backend.core import format_atom_selection, parse_atom_selection
 from btgui.data.appearance import ELEMENT_COLORS, default_color
 from btgui.frontend.cli import CLI
-from btgui.frontend.changes import AppearanceChange, FramePermutationChange, StructureChange
+from btgui.frontend.changes import (
+    AppearanceChange, BondChange, ClearBondsChange, FramePermutationChange,
+    StructureChange,
+)
+from btgui.integrations.updater import load_updater_module
 from btgui.frontend.viewer import StructureViewer
 
 
@@ -73,6 +87,9 @@ DEFAULT_SETTINGS = {
     "atom_edge_color": "#202020",
     "atom_edge_width": 1.0,
     "buctoolkit_paths": [],
+    "keyboard_translation_step": 0.1,
+    "updater_path": [],
+    "updater_function": [],
 }
 
 
@@ -175,6 +192,14 @@ class AppearanceDialog(QDialog):
         self.global_radius_spin.setSingleStep(0.01)
         self.global_radius_spin.setSuffix(" Å")
         self.global_radius_spin.setValue(viewer.default_custom_radius)
+        # One visible control edits two independent values; switching display
+        # modes must not reinterpret an angstrom radius as a dimensionless scale.
+        self._custom_radius = viewer.default_custom_radius
+        self._atom_scale = viewer.default_atom_scale
+        self._radius_mode = "custom"
+        self.global_radius_label = QLabel(self)
+        self.global_style_combo.currentIndexChanged.connect(self._update_radius_control)
+        self._update_radius_control()
         self.background_button = QPushButton(self)
         self._set_color_button(viewer._background_color_value, self.background_button)
         self.background_button.clicked.connect(self._choose_background_color)
@@ -183,7 +208,7 @@ class AppearanceDialog(QDialog):
         form.addRow("Atom color", self.color_button)
         form.addRow("Atom opacity", self.opacity_spin)
         form.addRow("Atom display", self.global_style_combo)
-        form.addRow("Custom radius", self.global_radius_spin)
+        form.addRow(self.global_radius_label, self.global_radius_spin)
         form.addRow("Sphere material", self.material_combo)
         form.addRow("Ambient", self.ambient_spin)
         form.addRow("Diffuse", self.diffuse_spin)
@@ -213,6 +238,28 @@ class AppearanceDialog(QDialog):
         self.list_widget.currentItemChanged.connect(self._change_element)
         if self.elements:
             self.list_widget.setCurrentRow(0)
+
+    def _update_radius_control(self, index=None):
+        """Keep custom radii and display scales independent across mode switches.
+
+        Args:
+            index: Unused combo-box index supplied by Qt.
+
+        Return:
+            None. The label, units and editable value follow the display mode.
+        """
+        if self._radius_mode == "custom":
+            self._custom_radius = self.global_radius_spin.value()
+        else:
+            self._atom_scale = self.global_radius_spin.value()
+        mode = self.global_style_combo.currentData()
+        self._radius_mode = "custom" if mode == "custom" else "scale"
+        self.global_radius_label.setText("Custom radius" if mode == "custom" else "Scale")
+        self.global_radius_spin.setSuffix(" Å" if mode == "custom" else "")
+        self.global_radius_spin.setValue(
+            self._custom_radius if mode == "custom" else self._atom_scale
+        )
+        self.global_radius_spin.setEnabled(mode != "point")
 
     def _load_material_preset(self):
         """Refresh PBR coefficient controls when the material preset changes."""
@@ -301,6 +348,7 @@ class AppearanceDialog(QDialog):
     def accept(self):
         """Collect current controls for application by the main window."""
         self._save_element()
+        self._update_radius_control()
         try:
             indices = parse_atom_selection(self.selector_edit.text(), self.frame_elements)
         except ValueError as error:
@@ -317,7 +365,8 @@ class AppearanceDialog(QDialog):
             "edge_color": self.edge_color_button.property("color") or "#202020",
             "edge_width": self.edge_width_spin.value(),
             "atom_style": self.global_style_combo.currentData(),
-            "custom_radius": self.global_radius_spin.value(),
+            "custom_radius": self._custom_radius,
+            "atom_scale": self._atom_scale,
             "background": self.background_button.property("color") or "#f5f7f7",
             "ambient": self.ambient_spin.value(),
             "diffuse": self.diffuse_spin.value(),
@@ -343,6 +392,7 @@ class AppearanceDialog(QDialog):
         atom_attribute_names = {
             "atom_style": "default_atom_style",
             "custom_radius": "default_custom_radius",
+            "atom_scale": "default_atom_scale",
             "material": "atom_material",
             "lighting": "atom_lighting",
             "edges": "atom_edges",
@@ -554,6 +604,138 @@ class FrameSelectionDialog(QDialog):
         return parse_frame_scope(self.selection.text(), frame_count, current_index)
 
 
+class UpdaterDialog(QDialog):
+    """Present configured updater functions and optional call arguments.
+
+    Args:
+        updaters: Loaded updater records containing path, name, and callback.
+        parent: Optional Qt parent widget.
+
+    Return:
+        A modal updater-management dialog.
+    """
+
+    def __init__(self, updaters, parent=None):
+        """Build the updater tree, argument fields, and operation buttons.
+
+        Args:
+            updaters: Loaded updater records containing path, name, and callback.
+            parent: Optional Qt parent widget.
+
+        Return:
+            None. Controls are initialized with no selected function.
+        """
+        super().__init__(parent)
+        self.setWindowTitle("Update - More")
+        self.resize(760, 420)
+        self.updaters = []
+        self.tree = QTreeWidget(self)
+        self.tree.setHeaderLabel("Updater files and functions")
+        self.tree.currentItemChanged.connect(self._sync_selection)
+        self.args_edit = QLineEdit(self)
+        self.args_edit.setPlaceholderText("e.g. 0.1, 'fast' or [0.1, 'fast']")
+        self.kwargs_edit = QLineEdit(self)
+        self.kwargs_edit.setPlaceholderText("e.g. {'steps': 20, 'relax_cell': True}")
+        self.apply_button = QPushButton("Apply", self)
+        self.help_button = QPushButton("Help", self)
+        self.dry_run_button = QPushButton("Dry Run", self)
+        self.refresh_button = QPushButton("Refresh", self)
+        self.close_button = QPushButton("Close", self)
+        self.close_button.clicked.connect(self.accept)
+
+        right = QWidget(self)
+        right_layout = QVBoxLayout(right)
+        form = QFormLayout()
+        form.addRow("args:", self.args_edit)
+        form.addRow("kwargs:", self.kwargs_edit)
+        right_layout.addLayout(form)
+        right_layout.addWidget(self.apply_button)
+        right_layout.addWidget(self.help_button)
+        right_layout.addWidget(self.dry_run_button)
+        right_layout.addWidget(self.refresh_button)
+        right_layout.addStretch(1)
+        right_layout.addWidget(self.close_button)
+
+        splitter = QSplitter(self)
+        splitter.addWidget(self.tree)
+        splitter.addWidget(right)
+        splitter.setSizes([360, 400])
+        layout = QVBoxLayout(self)
+        layout.addWidget(splitter)
+        self.set_updaters(updaters)
+
+    def set_updaters(self, updaters):
+        """Replace the tree with the currently loaded updater records.
+
+        Args:
+            updaters: Loaded updater records containing path, name, and callback.
+
+        Return:
+            None. Any previous selection is cleared and controls are disabled.
+        """
+        self.updaters = list(updaters)
+        self.tree.clear()
+        file_items = {}
+        # Show successfully loaded files even when none of the requested names
+        # exists there; only child function rows enable invocation controls.
+        for path in getattr(self.parent(), "updater_module_paths", []):
+            parent_item = QTreeWidgetItem([path])
+            self.tree.addTopLevelItem(parent_item)
+            file_items[path] = parent_item
+        for index, updater in enumerate(self.updaters):
+            path = str(updater["path"])
+            parent_item = file_items.get(path)
+            if parent_item is None:
+                parent_item = QTreeWidgetItem([path])
+                self.tree.addTopLevelItem(parent_item)
+                file_items[path] = parent_item
+            function_item = QTreeWidgetItem([updater["name"]])
+            function_item.setData(0, Qt.ItemDataRole.UserRole, index)
+            parent_item.addChild(function_item)
+            parent_item.setExpanded(True)
+        self.tree.setCurrentItem(None)
+        self._sync_selection(None, None)
+
+    def selected_updater(self):
+        """Return the updater record selected in the function tree.
+
+        Args:
+            None.
+
+        Return:
+            The selected updater record, or ``None`` when no function is selected.
+        """
+        item = self.tree.currentItem()
+        if item is None:
+            return None
+        index = item.data(0, Qt.ItemDataRole.UserRole)
+        if not isinstance(index, int) or not 0 <= index < len(self.updaters):
+            return None
+        return self.updaters[index]
+
+    def _sync_selection(self, current, previous):
+        """Enable function operations only for a selected function item.
+
+        Args:
+            current: Newly selected tree item.
+            previous: Previously selected tree item.
+
+        Return:
+            None. Buttons and argument fields reflect selection availability.
+        """
+        del current, previous
+        enabled = self.selected_updater() is not None
+        for widget in (
+            self.args_edit,
+            self.kwargs_edit,
+            self.apply_button,
+            self.help_button,
+            self.dry_run_button,
+            self.refresh_button,
+        ):
+            widget.setEnabled(enabled)
+
+
 class ManagedSubWindow(QMdiSubWindow):
     """Let the window manager own the viewer shutdown sequence."""
 
@@ -738,12 +920,23 @@ class WindowManager:
                 (viewer.selected_indices >= 0)
                 & (viewer.selected_indices < len(self.owner.elements[index]))
             ]
+            graph = self.owner.bond_adjacencies[index]
+            # Graph-only events already clear their selections. This also
+            # protects views reassigned by frame deletion or batch replacement.
+            if graph is None:
+                viewer.selected_bonds.clear()
+            elif viewer.selected_bonds:
+                viewer.selected_bonds = {
+                    pair for pair in viewer.selected_bonds
+                    if max(pair) < len(self.owner.elements[index])
+                    and np.any(np.all(graph == np.asarray(pair)[:, None], axis=0))
+                }
             viewer.draw_frame(reset_camera=reset_camera)
         self.show_hidden()
 
 
 class SettingsDialog(QDialog):
-    """Edit persistent history and default rendering preferences.
+    """Edit persistent history, rendering, and keyboard preferences.
 
     Args:
         settings: Validated application settings.
@@ -789,6 +982,14 @@ class SettingsDialog(QDialog):
         self.edge_color_button.setProperty("color", settings["atom_edge_color"])
         self.edge_color_button.setStyleSheet(f"background-color: {settings['atom_edge_color']};")
         self.edge_color_button.clicked.connect(self._choose_edge_color)
+        self.keyboard_translation_step_spin = QDoubleSpinBox(self)
+        self.keyboard_translation_step_spin.setRange(0.001, 100.0)
+        self.keyboard_translation_step_spin.setDecimals(4)
+        self.keyboard_translation_step_spin.setSingleStep(0.1)
+        self.keyboard_translation_step_spin.setSuffix(" Å")
+        self.keyboard_translation_step_spin.setValue(
+            settings["keyboard_translation_step"]
+        )
 
         form = QFormLayout()
         form.addRow("Undo history steps", self.history_limit_spin)
@@ -797,6 +998,7 @@ class SettingsDialog(QDialog):
         form.addRow(self.edges_check)
         form.addRow("Boundary width", self.edge_width_spin)
         form.addRow("Boundary color", self.edge_color_button)
+        form.addRow("Keyboard translation step", self.keyboard_translation_step_spin)
         buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel,
             self,
@@ -839,6 +1041,7 @@ class SettingsDialog(QDialog):
             "atom_edge_color": self.edge_color_button.property("color") or "#202020",
             "atom_edge_width": self.edge_width_spin.value(),
             "buctoolkit_paths": self.buctoolkit_paths,
+            "keyboard_translation_step": self.keyboard_translation_step_spin.value(),
         }
 
 
@@ -1095,7 +1298,7 @@ class MainWindow(QMainWindow):
         A main window with an empty toolbar and an initially empty viewer.
     """
 
-    def __init__(self, open_handler=None, save_handler=None, parent=None):
+    def __init__(self, open_handler=None, save_handler=None, parent=None, updater=None):
         super().__init__(parent)
         self.setWindowTitle("btgui - Structure Viewer")
         self.resize(1100, 760)
@@ -1110,13 +1313,26 @@ class MainWindow(QMainWindow):
         self.bond_frame_indices = []
         self.open_handler = open_handler
         self.save_handler = save_handler
+        self.updater = None
+        self.updaters = []
         self.current_index = 0
         self.play_indices = []
         self.play_position = 0
         self.playback_loop = False
-        self.settings_path = Path(__file__).resolve().parents[1] / "settings.json"
+        package_settings = Path(__file__).resolve().parents[1] / "settings.json"
+        executable_settings = Path(sys.argv[0]).resolve().with_name("settings.json")
+        configured_settings = os.environ.get("BTGUI_CONFIG_FILE", "").strip()
+        compiled_application = bool(getattr(sys, "frozen", False)) or "__compiled__" in globals()
+        if configured_settings:
+            self.settings_path = Path(configured_settings).expanduser().resolve()
+        elif compiled_application and executable_settings.is_file():
+            self.settings_path = executable_settings
+        else:
+            self.settings_path = package_settings
         self.settings_warning = None
         self.settings = self._load_settings()
+        self.updater_warning = None
+        self._load_configured_updaters()
         self.undo_stack = deque(maxlen=self.settings["history_limit"])
         self.redo_stack = deque()
         self.supercell_bases = {}
@@ -1138,7 +1354,7 @@ class MainWindow(QMainWindow):
             self,
         )
         self.undo_action.setShortcut("Ctrl+Z")
-        self.undo_action.setToolTip("Undo coordinate edit")
+        self.undo_action.setToolTip("Undo edit")
         self.undo_action.triggered.connect(self._undo)
         self.toolbar.addAction(self.undo_action)
         self.redo_action = QAction(
@@ -1147,7 +1363,7 @@ class MainWindow(QMainWindow):
             self,
         )
         self.redo_action.setShortcut("Ctrl+Y")
-        self.redo_action.setToolTip("Redo coordinate edit")
+        self.redo_action.setToolTip("Redo edit")
         self.redo_action.triggered.connect(self._redo)
         self.toolbar.addAction(self.redo_action)
         self.toolbar.addSeparator()
@@ -1170,6 +1386,8 @@ class MainWindow(QMainWindow):
         self.toolbar.addAction(self.replace_atom_action)
 
         self.bond_menu = QMenu(self)
+        self.add_bond_action = self.bond_menu.addAction("Add bond")
+        self.add_bond_action.triggered.connect(self._begin_bond_addition)
         bond_frames_widget = QWidget(self.bond_menu)
         bond_frames_layout = QHBoxLayout(bond_frames_widget)
         bond_frames_layout.setContentsMargins(8, 4, 8, 4)
@@ -1234,6 +1452,15 @@ class MainWindow(QMainWindow):
         self.metric_style_action.triggered.connect(self._show_metric_style)
         self.metrics_button.setMenu(self.metrics_menu)
         self.toolbar.addWidget(self.metrics_button)
+
+        self.update_button = QToolButton(self)
+        self.update_button.setText("Update")
+        self.update_button.setToolTip("Choose or manage a structure updater")
+        self.update_button.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        self.update_menu = QMenu(self.update_button)
+        self.update_button.setMenu(self.update_menu)
+        self._rebuild_update_menu()
+        self.toolbar.addWidget(self.update_button)
 
         self.toolbar.addSeparator()
         self.previous_frame_button = QToolButton(self)
@@ -1366,11 +1593,14 @@ class MainWindow(QMainWindow):
             on_clear=self._clear_selection,
             on_view_reset=self._reset_view,
             on_data_changed=self._on_cli_data_changed,
+            on_update=self._run_default_updater,
             on_executed=self._refresh_after_cli_execution,
             buctoolkit_paths=self.settings["buctoolkit_paths"],
         )
         self.viewer.set_error_handler(self._log)
         self.setAcceptDrops(True)
+        if updater is not None:
+            self.set_updater(updater)
 
         console = QWidget(self)
         console_layout = QVBoxLayout(console)
@@ -1412,6 +1642,8 @@ class MainWindow(QMainWindow):
         self._log("Ready. Supply structure lists directly or connect file I/O handlers.")
         if self.settings_warning is not None:
             self._log(self.settings_warning)
+        if self.updater_warning is not None:
+            self._log(self.updater_warning)
 
     def _load_settings(self):
         """Load and validate persistent settings from the package directory.
@@ -1422,13 +1654,21 @@ class MainWindow(QMainWindow):
         Return:
             A complete settings dictionary; invalid files fall back to defaults.
         """
-        settings = dict(DEFAULT_SETTINGS)
+        settings = deepcopy(DEFAULT_SETTINGS)
+        warning_messages = []
+        self.settings_warning = None
         if not self.settings_path.exists():
             return settings
         try:
             loaded = json.loads(self.settings_path.read_text(encoding="utf-8"))
             if not isinstance(loaded, dict):
                 raise TypeError("settings root must be a JSON object")
+        except (json.JSONDecodeError, OSError, TypeError) as error:
+            self.settings_warning = f"Settings warning: {error}; using defaults."
+            return settings
+
+        settings_directory = self.settings_path.parent
+        try:
             history_limit = int(loaded.get("history_limit", settings["history_limit"]))
             if not 1 <= history_limit <= 1000:
                 raise ValueError("history_limit must be between 1 and 1000")
@@ -1445,6 +1685,14 @@ class MainWindow(QMainWindow):
             edge_width = float(loaded.get("atom_edge_width", settings["atom_edge_width"]))
             if not 0.1 <= edge_width <= 10.0:
                 raise ValueError("atom_edge_width must be between 0.1 and 10.0")
+            translation_step = float(
+                loaded.get(
+                    "keyboard_translation_step",
+                    settings["keyboard_translation_step"],
+                )
+            )
+            if not 0.001 <= translation_step <= 100.0:
+                raise ValueError("keyboard_translation_step must be between 0.001 and 100")
             buctoolkit_paths = loaded.get("buctoolkit_paths", settings["buctoolkit_paths"])
             if isinstance(buctoolkit_paths, str):
                 buctoolkit_paths = buctoolkit_paths.split(os.pathsep)
@@ -1452,7 +1700,6 @@ class MainWindow(QMainWindow):
                 not isinstance(path, str) for path in buctoolkit_paths
             ):
                 raise TypeError("buctoolkit_paths must be a string or a list of strings")
-            settings_directory = self.settings_path.parent
             normalized_paths = []
             for path in buctoolkit_paths:
                 path = path.strip()
@@ -1471,10 +1718,117 @@ class MainWindow(QMainWindow):
                 atom_edge_color=edge_color,
                 atom_edge_width=edge_width,
                 buctoolkit_paths=buctoolkit_paths,
+                keyboard_translation_step=translation_step,
             )
-        except (json.JSONDecodeError, OSError, TypeError, ValueError) as error:
-            self.settings_warning = f"Settings warning: {error}; using defaults."
+        except (TypeError, ValueError) as error:
+            warning_messages.append(f"base settings: {error}; using defaults")
+
+        try:
+            raw_paths = loaded.get("updater_path", [])
+            raw_functions = loaded.get("updater_function", [])
+            if isinstance(raw_paths, str):
+                path_values = [raw_paths] if raw_paths.strip() else []
+            elif isinstance(raw_paths, list) and all(
+                isinstance(path, str) for path in raw_paths
+            ):
+                path_values = raw_paths
+            else:
+                raise TypeError("updater_path must be a string or a list of strings")
+            if isinstance(raw_functions, str):
+                function_values = [raw_functions] if raw_functions.strip() else []
+            elif isinstance(raw_functions, list) and all(
+                isinstance(name, str) for name in raw_functions
+            ):
+                function_values = raw_functions
+            else:
+                raise TypeError("updater_function must be a string or a list of strings")
+            # Section: Module paths and requested names are independent lists.
+            updater_paths = []
+            for path in path_values:
+                path = path.strip()
+                if not path:
+                    continue
+                candidate = Path(path).expanduser()
+                if not candidate.is_absolute():
+                    candidate = settings_directory / candidate
+                updater_paths.append(str(candidate.resolve()))
+            updater_functions = []
+            for function_name in function_values:
+                function_name = function_name.strip()
+                if not function_name:
+                    continue
+                if not function_name.isidentifier():
+                    raise ValueError(
+                        "each updater_function must be a valid Python function name"
+                    )
+                updater_functions.append(function_name)
+            settings.update(
+                updater_path=updater_paths,
+                updater_function=updater_functions,
+            )
+        except (TypeError, ValueError) as error:
+            warning_messages.append(f"updater settings: {error}; no updater loaded")
+        if warning_messages:
+            self.settings_warning = "Settings warning: " + "; ".join(warning_messages) + "."
         return settings
+
+    def _load_configured_updaters(self):
+        """Load configured modules, then find requested functions across them.
+
+        Args:
+            None.
+
+        Return:
+            None. Valid plugins are retained while individual failures are reported.
+        """
+        embedded = [
+            updater for updater in self.updaters if not updater.get("configured", False)
+        ]
+        configured = []
+        load_errors = []
+        modules = []
+        self.updater_module_paths = []
+        # Section: Execute each configured module once before looking up names.
+        for path in dict.fromkeys(self.settings.get("updater_path", [])):
+            try:
+                modules.append(
+                    load_updater_module(path, self.settings_path.parent)
+                )
+                self.updater_module_paths.append(str(Path(modules[-1].__file__).resolve()))
+            except Exception as error:
+                load_errors.append(f"{path}: {error}")
+
+        # Section: Group functions by their defining module, including reexports.
+        for function_name in dict.fromkeys(self.settings.get("updater_function", [])):
+            seen_callbacks = set()
+            for module in modules:
+                callback = getattr(module, function_name, None)
+                if not callable(callback) or id(callback) in seen_callbacks:
+                    continue
+                seen_callbacks.add(id(callback))
+                owner = sys.modules.get(getattr(callback, "__module__", None))
+                source_path = getattr(owner, "__file__", None) or module.__file__
+                configured.append(
+                    {
+                        "path": str(Path(source_path).resolve()),
+                        "name": function_name,
+                        "callback": callback,
+                        "configured": True,
+                    }
+                )
+            if not seen_callbacks:
+                load_errors.append(
+                    f"{function_name}: no callable found in loaded updater modules"
+                )
+        self.updaters = embedded + configured
+        self.updater = self.updaters[0]["callback"] if self.updaters else None
+        self.updater_warning = (
+            "Updater load warning: " + "; ".join(load_errors)
+            if load_errors
+            else None
+        )
+        if hasattr(self, "update_menu"):
+            self._rebuild_update_menu()
 
     def _configure_viewer(self, viewer):
         """Apply shared viewer settings and connect the standard callbacks."""
@@ -1484,12 +1838,19 @@ class MainWindow(QMainWindow):
         viewer.atom_edges = self.settings["atom_edges"]
         viewer.atom_edge_color = self.settings["atom_edge_color"]
         viewer.atom_edge_width = self.settings["atom_edge_width"]
+        viewer.keyboard_translation_step = self.settings["keyboard_translation_step"]
+        if hasattr(self, "perspective_action"):
+            viewer.perspective_enabled = self.perspective_action.isChecked()
+            viewer.camera.SetParallelProjection(not viewer.perspective_enabled)
         viewer.coordinatesEdited.connect(self._record_coordinate_edit)
         viewer.deleteRequested.connect(self._delete_selected_atoms)
         viewer.atomsAdded.connect(self._commit_reference_atoms)
+        viewer.bondAdded.connect(self._add_bond)
+        viewer.bondsDeleted.connect(self._delete_selected_bonds)
         viewer.filesDropped.connect(self._open_dropped_files)
         viewer.measurementModeChanged.connect(self._sync_measurement_actions)
         viewer.selectionChanged.connect(self._on_selection_changed)
+        viewer.frameStepRequested.connect(self._step_frame)
         viewer.set_error_handler(self._log)
 
     def _activate_viewer(self, viewer):
@@ -1499,6 +1860,10 @@ class MainWindow(QMainWindow):
             if record["viewer"] is viewer:
                 self.current_index = record["frame_index"]
                 break
+        if hasattr(self, "perspective_action"):
+            blocker = QSignalBlocker(self.perspective_action)
+            self.perspective_action.setChecked(viewer.perspective_enabled)
+            del blocker
         self._sync_frame_controls()
 
     def _ensure_data_window(self):
@@ -1535,15 +1900,34 @@ class MainWindow(QMainWindow):
             )
         )
         viewer.atomsAdded.connect(
-            lambda frame, symbols, positions, view=viewer: (
+            lambda frame, symbols, positions, reference, view=viewer: (
                 self._activate_viewer(view),
-                self._commit_reference_atoms(frame, symbols, positions),
+                self._commit_reference_atoms(frame, symbols, positions, reference),
             )
         )
+        viewer.bondAdded.connect(
+            lambda frame, left, right, view=viewer: (
+                self._activate_viewer(view), self._add_bond(frame, left, right),
+            )
+        )
+        viewer.bondsDeleted.connect(
+            lambda frame, pairs, view=viewer: (
+                self._activate_viewer(view), self._delete_selected_bonds(frame, pairs),
+            )
+        )
+        viewer.measurementModeChanged.connect(self._sync_measurement_actions)
+        viewer.filesDropped.connect(self._open_dropped_files)
+        viewer.set_error_handler(self._log)
         viewer.selectionChanged.connect(
             lambda indices, view=viewer: (
                 self._activate_viewer(view),
                 self._on_selection_changed(indices),
+            )
+        )
+        viewer.frameStepRequested.connect(
+            lambda step, view=viewer: (
+                self._activate_viewer(view),
+                self._step_frame(step),
             )
         )
 
@@ -1576,7 +1960,7 @@ class MainWindow(QMainWindow):
         dialog = SettingsDialog(self.settings, self)
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
-        self.settings = dialog.values()
+        self.settings.update(dialog.values())
         self.undo_stack = deque(self.undo_stack, maxlen=self.settings["history_limit"])
         self.viewer.set_appearance(
             self.viewer.atom_styles,
@@ -1586,6 +1970,13 @@ class MainWindow(QMainWindow):
             self.settings["atom_edge_color"],
             self.settings["atom_edge_width"],
         )
+        viewers = {record["viewer"] for record in self.window_manager.records}
+        if self.viewer is not None:
+            viewers.add(self.viewer)
+        for viewer in viewers:
+            viewer.keyboard_translation_step = self.settings[
+                "keyboard_translation_step"
+            ]
         self._sync_history_actions()
         self._persist_settings()
 
@@ -1793,6 +2184,7 @@ class MainWindow(QMainWindow):
             "current_index": int(self.current_index),
             "frame_names": list(self.frame_names),
             "frame_name_serial": int(self._frame_name_serial),
+            "bond_frames": list(self.bond_frame_indices),
         }
 
     def _restore_all_supercell_context(self, context):
@@ -1829,6 +2221,8 @@ class MainWindow(QMainWindow):
             self._frame_name_serial = int(
                 context.get("frame_name_serial", len(self.frame_names))
             )
+        if "bond_frames" in context:
+            self.bond_frame_indices = list(context["bond_frames"])
 
     def _appearance_context(self):
         """Copy renderer-wide appearance values for unified history.
@@ -1842,7 +2236,7 @@ class MainWindow(QMainWindow):
         names = (
             "atom_styles", "atom_material", "atom_lighting", "atom_edges",
             "atom_edge_color", "atom_edge_width", "default_atom_style",
-            "default_custom_radius", "_background_color_value", "material_ambient",
+            "default_custom_radius", "default_atom_scale", "_background_color_value", "material_ambient",
             "material_diffuse", "material_specular", "material_roughness",
             "material_metallic", "axes_visible", "grid_visible", "bond_width",
             "bond_alpha",
@@ -1901,39 +2295,104 @@ class MainWindow(QMainWindow):
         )
         self.cli.bind_data(self.elements, self.coordinates, self.lattices)
 
+    def _apply_history_entry(self, change, use_after):
+        """Apply one event or an ordered tuple without intermediate redraws.
+
+        Args:
+            change: History event or tuple in forward execution order.
+            use_after: True for execution/Redo, False for Undo.
+
+        Return:
+            None. Tuple Undo reverses dependency order before applying inverses.
+        """
+        # Section: A tuple is ONE deque entry. For (atoms, bonds), Redo creates
+        # nodes first; Undo removes their bonds first. Deletion uses (bonds, atoms).
+        entries = change if isinstance(change, tuple) else (change,)
+        for entry in entries if use_after else reversed(entries):
+            if isinstance(entry, StructureChange):
+                context = entry.apply(
+                    self.elements, self.coordinates, self.lattices, use_after
+                )
+                self._ensure_frame_state()
+                if entry.frame_indices is not None and context is not None:
+                    self._restore_supercell_context(entry.frame_indices[0], context)
+                elif entry.frame_indices is None and context is not None:
+                    self._restore_all_supercell_context(context)
+            else:
+                entry.apply(self, use_after)
+
+    def _refresh_history_entry(self, change, frame_index=None):
+        """Refresh once after a complete single or compound history operation.
+
+        Args:
+            change: Applied history event or ordered tuple.
+            frame_index: Optional preferred frame to display.
+
+        Return:
+            None. Graph-only changes avoid rebuilding the atom scene.
+        """
+        entries = change if isinstance(change, tuple) else (change,)
+        frames = set()
+        all_frames = False
+        for entry in entries:
+            indices = getattr(entry, "frame_indices", None)
+            if indices is None:
+                all_frames = True
+            else:
+                frames.update(indices)
+        changed_frames = None if all_frames else tuple(sorted(frames))
+        if all(isinstance(entry, (BondChange, ClearBondsChange)) for entry in entries):
+            for record in self.window_manager.records:
+                viewer = record["viewer"]
+                viewer.bond_adjacencies = self.bond_adjacencies
+                viewer.bond_frame_indices = set(self.bond_frame_indices)
+                viewer.selected_bonds.clear()
+                viewer.invalidate_bond_meshes(changed_frames)
+                viewer.refresh_bonds()
+        elif isinstance(change, FramePermutationChange):
+            self.viewer.invalidate_bond_meshes()
+            self._refresh_after_permutation(sync_frame_list=False)
+        elif isinstance(change, AppearanceChange):
+            self._refresh_after_appearance(change)
+        else:
+            # Coordinate/style edits retain selection; only changed node counts
+            # or a compound graph edit invalidate the selected endpoint space.
+            topology_changed = any(
+                isinstance(entry, StructureChange) and (
+                    entry.frame_indices is None
+                    or any(len(before) != len(after) for before, after in zip(
+                        entry.before_elements, entry.after_elements
+                    ))
+                )
+                for entry in entries
+            )
+            for record in self.window_manager.records:
+                if topology_changed:
+                    record["viewer"].selected_indices = np.empty(0, dtype=int)
+                if topology_changed or any(isinstance(entry, BondChange) for entry in entries):
+                    record["viewer"].selected_bonds.clear()
+            if frame_index is None and changed_frames and len(changed_frames) == 1:
+                frame_index = changed_frames[0]
+            self._refresh_after_change(
+                frame_index=frame_index, changed_frame_indices=changed_frames
+            )
+
     def _record_change(self, change, already_applied=False, frame_index=None):
         """Record one unified change and optionally apply its after snapshot.
 
         Args:
-            change: `StructureChange` instance to retain.
+            change: History event or tuple retained as one undo step.
             already_applied: Whether the caller already wrote the after state.
             frame_index: Frame to display after applying the change.
 
         Returns:
             None. Redo history is discarded after a new operation.
         """
-        if not already_applied and isinstance(change, StructureChange):
-            context = change.apply(
-                self.elements, self.coordinates, self.lattices, use_after=True
-            )
-            if change.frame_indices is not None and context is not None:
-                self._restore_supercell_context(change.frame_indices[0], context)
-            elif change.frame_indices is None and context is not None:
-                self._restore_all_supercell_context(context)
-        elif not already_applied:
-            change.apply(self, use_after=True)
+        if not already_applied:
+            self._apply_history_entry(change, use_after=True)
         self.undo_stack.append(change)
         self.redo_stack.clear()
-        if isinstance(change, FramePermutationChange):
-            self.viewer.invalidate_bond_meshes()
-            self._refresh_after_permutation(sync_frame_list=False)
-        elif isinstance(change, AppearanceChange):
-            self._refresh_after_appearance(change)
-        else:
-            self._refresh_after_change(
-                frame_index=frame_index,
-                changed_frame_indices=getattr(change, "frame_indices", None),
-            )
+        self._refresh_history_entry(change, frame_index)
         self._sync_history_actions()
 
     def _refresh_after_appearance(self, change):
@@ -1955,6 +2414,7 @@ class MainWindow(QMainWindow):
             "atom_edge_width",
             "default_atom_style",
             "default_custom_radius",
+            "default_atom_scale",
             "material_ambient",
             "material_diffuse",
             "material_specular",
@@ -1964,24 +2424,31 @@ class MainWindow(QMainWindow):
         if change.before_atom_styles or changed_global & atom_fields:
             for record in self.window_manager.records:
                 viewer = record["viewer"]
-                for name in atom_fields:
+                for name in atom_fields | changed_global:
                     if hasattr(self.viewer, name):
                         setattr(viewer, name, deepcopy(getattr(self.viewer, name)))
+                viewer.set_background(viewer._background_color_value)
             self.window_manager.refresh_all()
             return
 
-        if {"axes_visible", "grid_visible"} & changed_global and self.coordinates:
-            self.viewer._apply_reference_widgets(
-                np.asarray(self.coordinates[self.current_index], dtype=float),
-                np.asarray(self.lattices[self.current_index], dtype=float),
-            )
-        for actor in self.viewer.bond_actors:
-            actor.GetProperty().SetOpacity(self.viewer.bond_alpha)
-        if "bond_width" in changed_global:
-            self.viewer.invalidate_bond_meshes()
-            self.viewer.refresh_bonds()
-        else:
-            self.viewer.render()
+        for record in self.window_manager.records:
+            viewer = record["viewer"]
+            for name in changed_global:
+                setattr(viewer, name, deepcopy(getattr(self.viewer, name)))
+            viewer.set_background(viewer._background_color_value)
+            frame = viewer.current_index
+            if {"axes_visible", "grid_visible"} & changed_global and 0 <= frame < len(self.coordinates):
+                viewer._apply_reference_widgets(
+                    np.asarray(self.coordinates[frame], dtype=float),
+                    np.asarray(self.lattices[frame], dtype=float),
+                )
+            for actor in viewer.bond_actors:
+                actor.GetProperty().SetOpacity(viewer.bond_alpha)
+            if "bond_width" in changed_global:
+                viewer.invalidate_bond_meshes()
+                viewer.refresh_bonds()
+            else:
+                viewer.render()
 
     def _record_coordinate_edit(self, frame_index, before_coordinates, after_coordinates):
         """Record one completed mouse coordinate edit.
@@ -2011,7 +2478,7 @@ class MainWindow(QMainWindow):
         self._record_change(change, already_applied=True, frame_index=frame_index)
 
     def _undo(self, checked=False):
-        """Restore the coordinate snapshot before the latest edit.
+        """Undo the latest structure, graph, appearance or compound edit.
 
         Args:
             checked: Ignored QAction checked state.
@@ -2023,39 +2490,16 @@ class MainWindow(QMainWindow):
             return
         change = self.undo_stack[-1]
         try:
-            if isinstance(change, StructureChange):
-                context = change.apply(
-                    self.elements, self.coordinates, self.lattices, use_after=False
-                )
-                if change.frame_indices is not None and context is not None:
-                    self._restore_supercell_context(change.frame_indices[0], context)
-                elif change.frame_indices is None and context is not None:
-                    self._restore_all_supercell_context(context)
-            else:
-                change.apply(self, use_after=False)
+            self._apply_history_entry(change, use_after=False)
             self.undo_stack.pop()
             self.redo_stack.append(change)
-            if isinstance(change, FramePermutationChange):
-                self._refresh_after_permutation(sync_frame_list=False)
-            elif isinstance(change, AppearanceChange):
-                self._refresh_after_appearance(change)
-            else:
-                frame_indices = getattr(change, "frame_indices", None)
-                frame_index = (
-                    frame_indices[0]
-                    if frame_indices is not None and len(frame_indices) == 1
-                    else self.current_index
-                )
-                self._refresh_after_change(
-                    frame_index=frame_index,
-                    changed_frame_indices=frame_indices,
-                )
+            self._refresh_history_entry(change)
         except (IndexError, RuntimeError, TypeError, ValueError) as error:
             self._log(f"Undo error: {error}")
         self._sync_history_actions()
 
     def _redo(self, checked=False):
-        """Restore the coordinate snapshot after the latest undone edit.
+        """Replay the latest undone edit in its forward dependency order.
 
         Args:
             checked: Ignored QAction checked state.
@@ -2067,33 +2511,10 @@ class MainWindow(QMainWindow):
             return
         change = self.redo_stack[-1]
         try:
-            if isinstance(change, StructureChange):
-                context = change.apply(
-                    self.elements, self.coordinates, self.lattices, use_after=True
-                )
-                if change.frame_indices is not None and context is not None:
-                    self._restore_supercell_context(change.frame_indices[0], context)
-                elif change.frame_indices is None and context is not None:
-                    self._restore_all_supercell_context(context)
-            else:
-                change.apply(self, use_after=True)
+            self._apply_history_entry(change, use_after=True)
             self.redo_stack.pop()
             self.undo_stack.append(change)
-            if isinstance(change, FramePermutationChange):
-                self._refresh_after_permutation(sync_frame_list=False)
-            elif isinstance(change, AppearanceChange):
-                self._refresh_after_appearance(change)
-            else:
-                frame_indices = getattr(change, "frame_indices", None)
-                frame_index = (
-                    frame_indices[0]
-                    if frame_indices is not None and len(frame_indices) == 1
-                    else self.current_index
-                )
-                self._refresh_after_change(
-                    frame_index=frame_index,
-                    changed_frame_indices=frame_indices,
-                )
+            self._refresh_history_entry(change)
         except (IndexError, RuntimeError, TypeError, ValueError) as error:
             self._log(f"Redo error: {error}")
         self._sync_history_actions()
@@ -2125,6 +2546,24 @@ class MainWindow(QMainWindow):
         self.zoom_input.setValue(100)
         del blocker
 
+    def _set_perspective_enabled(self, enabled):
+        """Apply the selected projection mode to every open structure view.
+
+        Args:
+            enabled: Whether perspective projection should be enabled.
+
+        Return:
+            None. Existing and future active views share the selected mode.
+        """
+        viewers = {record["viewer"] for record in self.window_manager.records}
+        if self.viewer is not None:
+            viewers.add(self.viewer)
+        for viewer in viewers:
+            viewer.set_perspective_enabled(enabled)
+        blocker = QSignalBlocker(self.zoom_input)
+        self.zoom_input.setValue(100)
+        del blocker
+
     def _set_measurement_mode(self, mode):
         """Activate one special measurement selector or restore atom selection."""
         if mode == "length":
@@ -2132,6 +2571,7 @@ class MainWindow(QMainWindow):
         elif mode == "angle":
             self.length_measure_action.setChecked(False)
         self.viewer.set_measurement_mode(mode)
+        self.viewer.draw_frame()
 
     def _sync_measurement_actions(self, mode):
         """Reflect the viewer's special measurement mode in toolbar buttons."""
@@ -2171,18 +2611,26 @@ class MainWindow(QMainWindow):
         """
         try:
             indices = self._selected_bond_frames()
+            before = {frame: self.bond_adjacencies[frame] for frame in indices}
+            after = {}
             for frame_index in indices:
-                self.bond_adjacencies[frame_index] = build_bond_adjacency(
+                after[frame_index] = build_bond_adjacency(
                     self.coordinates[frame_index],
                     self.elements[frame_index],
                     self.viewer.bond_tolerance,
                 )
-            self.viewer.invalidate_bond_meshes(indices)
+            change = BondChange.between("Check bonds", before, after)
         except (IndexError, TypeError, ValueError) as error:
             QMessageBox.warning(self, "Bonds", str(error))
             return
-        if self.viewer.bonds_enabled and self.current_index in indices:
-            self.viewer.refresh_bonds()
+        # Install every freshly rebuilt graph, including frames whose edge set
+        # did not change; history stores only the sparse difference from before.
+        for frame in indices:
+            self.bond_adjacencies[frame] = after[frame]
+        if change.frame_indices:
+            self._record_change(change, already_applied=True)
+        else:
+            self._refresh_history_entry(change)
 
     def viewer_set_bonds(self, enabled):
         """Toggle cached bond rendering and lazily fill missing selected frames.
@@ -2198,9 +2646,11 @@ class MainWindow(QMainWindow):
             return
         try:
             indices = self._selected_bond_frames()
+            before, after = {}, {}
             for frame_index in indices:
                 if self.bond_adjacencies[frame_index] is None:
-                    self.bond_adjacencies[frame_index] = build_bond_adjacency(
+                    before[frame_index] = None
+                    after[frame_index] = build_bond_adjacency(
                         self.coordinates[frame_index],
                         self.elements[frame_index],
                         self.viewer.bond_tolerance,
@@ -2212,20 +2662,94 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Bonds", str(error))
             return
         self.viewer.set_bonds(True, indices)
+        # Lazy initialization changes the graph too; record it so older graph
+        # deltas can never be replayed against an unrecorded replacement graph.
+        if after:
+            self._record_change(BondChange.between("Generate bonds", before, after))
 
     def _clear_bonds(self, checked=False):
-        """Release all cached bond adjacency arrays without recalculating.
+        """Clear all graphs while retaining their complete originals in history.
 
         Args:
             checked: Unused QAction checked state.
 
         Return:
-            None. Visible bonds disappear until Show bonds is toggled again.
+            None. Explicit empty graphs remain empty until an explicit rebuild.
         """
-        self.bond_adjacencies[:] = [None for _ in self.coordinates]
-        self.viewer.invalidate_bond_meshes()
-        if self.viewer.bonds_enabled:
-            self.viewer.refresh_bonds()
+        originals = {
+            frame: None if graph is None else np.array(graph, copy=True)
+            for frame, graph in enumerate(self.bond_adjacencies)
+        }
+        if originals:
+            self._record_change(ClearBondsChange("Clear bonds", originals))
+
+    def _begin_bond_addition(self, checked=False):
+        """Start the temporary two-atom picker used for manual bonds.
+
+        Args:
+            checked: Unused QAction state.
+
+        Return:
+            None. Escape cancels without changing any graph.
+        """
+        if self.viewer is None or not self.coordinates:
+            return
+        self.viewer.cancel_atom_addition()
+        self.viewer.set_measurement_mode("bond")
+        self.viewer.draw_frame()
+        self.viewer.setFocus(Qt.FocusReason.OtherFocusReason)
+        self._log("Add bond: select two different atoms; Escape cancels.")
+
+    def _add_bond(self, frame_index, left, right):
+        """Append one canonical manual edge independently of the cutoff.
+
+        Args:
+            frame_index: Frame receiving the bond.
+            left: First zero-based atom index.
+            right: Second zero-based atom index.
+
+        Return:
+            None. Duplicate edges and self edges do not create history entries.
+        """
+        if not 0 <= frame_index < len(self.elements):
+            return
+        if left == right or min(left, right) < 0 or max(left, right) >= len(self.elements[frame_index]):
+            return
+        original = self.bond_adjacencies[frame_index]
+        graph = normalize_bond_adjacency(original)
+        replacement = normalize_bond_adjacency(np.column_stack((graph, sorted((left, right)))))
+        change = BondChange.between("Add bond", {frame_index: original}, {frame_index: replacement})
+        if change.frame_indices:
+            # Make an explicitly added bond immediately visible, including a
+            # previously hidden frame, without computing any other connections.
+            self.bond_frame_indices = sorted(set(self.bond_frame_indices) | {frame_index})
+            blocker = QSignalBlocker(self.bond_action)
+            self.bond_action.setChecked(True)
+            del blocker
+            for record in self.window_manager.records:
+                record["viewer"].bonds_enabled = True
+            self._record_change(change)
+
+    def _delete_selected_bonds(self, frame_index, pairs):
+        """Remove only selected endpoint triples from a frame's COO graph.
+
+        Args:
+            frame_index: Frame containing the selected bonds.
+            pairs: Canonical zero-based endpoint pairs selected by the viewer.
+
+        Return:
+            None. Unselected graph edges remain untouched.
+        """
+        if not 0 <= frame_index < len(self.bond_adjacencies) or not len(pairs):
+            return
+        graph = normalize_bond_adjacency(self.bond_adjacencies[frame_index])
+        pair_dtype = np.dtype([("src", np.int64), ("dst", np.int64)])
+        current = np.ascontiguousarray(graph.T).view(pair_dtype).reshape(-1)
+        selected = np.ascontiguousarray(np.asarray(pairs, dtype=np.int64)).view(pair_dtype).reshape(-1)
+        after = graph[:, ~np.isin(current, selected)]
+        change = BondChange.between("Delete bonds", {frame_index: graph}, {frame_index: after})
+        if change.frame_indices:
+            self._record_change(change)
 
     def viewer_set_tolerance(self, tolerance):
         """Update the cutoff used by the next explicit or lazy bond check."""
@@ -2359,7 +2883,14 @@ class MainWindow(QMainWindow):
             after_context=after_context,
         )
         if topology_changed:
-            self.bond_adjacencies[frame_index] = None
+            # Drop old endpoints before changing node topology. Undo restores
+            # nodes first, then restores the removed edge triples and None state.
+            bonds = BondChange.between(
+                "Reset supercell bonds",
+                {frame_index: self.bond_adjacencies[frame_index]}, {frame_index: None},
+            )
+            if bonds.frame_indices:
+                change = (bonds, change)
         self._record_change(change, frame_index=frame_index)
         blocker = QSignalBlocker(self.zoom_input)
         self.zoom_input.setValue(100)
@@ -2491,7 +3022,7 @@ class MainWindow(QMainWindow):
             return False
         return True
 
-    def _commit_added_atoms(self, frame_index, symbols, coordinates, description):
+    def _commit_added_atoms(self, frame_index, symbols, coordinates, description, reference_index=None):
         """Append atoms to one frame through unified history.
 
         Args:
@@ -2499,6 +3030,7 @@ class MainWindow(QMainWindow):
             symbols: One-dimensional element symbols.
             coordinates: Cartesian positions shaped ``(N, 3)``.
             description: History description.
+            reference_index: Original reference atom for an automatic bond chain.
 
         Returns:
             None. The full scene is rebuilt after one atomic commit.
@@ -2539,21 +3071,34 @@ class MainWindow(QMainWindow):
             before_context=before_context,
             after_context=after_context,
         )
-        self.bond_adjacencies[frame_index] = None
+        if reference_index is not None:
+            if not 0 <= int(reference_index) < len(before_elements):
+                self._log("Add ignored: reference atom is out of range.")
+                return
+            original = self.bond_adjacencies[frame_index]
+            graph = normalize_bond_adjacency(original)
+            new_indices = np.arange(len(before_elements), len(after_elements), dtype=np.int64)
+            # The original reference index survives every preview; subsequent
+            # chain links join consecutive appended atoms, not nearest neighbors.
+            chain = np.vstack((np.r_[int(reference_index), new_indices[:-1]], new_indices))
+            after_graph = normalize_bond_adjacency(np.concatenate((graph, chain), axis=1))
+            bonds = BondChange.between("Reference atom bonds", {frame_index: original}, {frame_index: after_graph})
+            change = (change, bonds)
         self._record_change(change, frame_index=frame_index)
 
-    def _commit_reference_atoms(self, frame_index, symbols, coordinates):
+    def _commit_reference_atoms(self, frame_index, symbols, coordinates, reference_index):
         """Commit a complete reference-placement chain as one change.
 
         Args:
             frame_index: Frame receiving the pending atoms.
             symbols: Pending element symbols.
             coordinates: Pending Cartesian coordinates.
+            reference_index: First existing atom selected before placing the chain.
 
         Returns:
             None. Delegates to the common atom-appending path.
         """
-        self._commit_added_atoms(frame_index, symbols, coordinates, "Add atoms")
+        self._commit_added_atoms(frame_index, symbols, coordinates, "Add atoms", reference_index)
 
     def _delete_selected_atoms(self, frame_index, indices):
         """Delete selected atoms and record one reversible topology change.
@@ -2605,8 +3150,23 @@ class MainWindow(QMainWindow):
             before_context=before_context,
             after_context=after_context,
         )
-        self.bond_adjacencies[frame_index] = None
-        self._record_change(change, frame_index=frame_index)
+        # Section: Keep an old-node-sized simultaneous endpoint mapping. Mapping
+        # alone cannot restore incident edges, so retain their triples as well.
+        original = self.bond_adjacencies[frame_index]
+        graph = normalize_bond_adjacency(original)
+        keep = np.ones(len(before_elements), dtype=bool)
+        keep[indices] = False
+        mapping = np.full(len(before_elements), -1, dtype=np.int64)
+        mapping[keep] = np.arange(np.count_nonzero(keep), dtype=np.int64)
+        removed = graph[:, ~np.all(keep[graph], axis=0)].T
+        triples = np.column_stack((removed, np.ones(len(removed), dtype=np.int64)))
+        bonds = BondChange(
+            "Delete atom bonds", {frame_index: triples},
+            {frame_index: np.empty((0, 3), dtype=np.int64)},
+            {frame_index: original is None}, {frame_index: mapping},
+            after_missing={frame_index: original is None},
+        )
+        self._record_change((bonds, change), frame_index=frame_index)
 
     def _show_appearance(self):
         """Open the atom and bond appearance editor for the current frame."""
@@ -2625,6 +3185,7 @@ class MainWindow(QMainWindow):
         atom_fields = {
             "atom_style": ("default_atom_style", "style"),
             "custom_radius": ("default_custom_radius", "radius"),
+            "atom_scale": ("default_atom_scale", "scale"),
             "material": ("atom_material", "material"),
             "lighting": ("atom_lighting", "lighting"),
             "edges": ("atom_edges", "edges"),
@@ -2787,7 +3348,6 @@ class MainWindow(QMainWindow):
             before_context=before_context,
             after_context=before_context,
         )
-        self.bond_adjacencies[frame_index] = None
         self._record_change(change, frame_index=frame_index)
 
     def _sync_atom_actions(self, indices=None):
@@ -2955,10 +3515,11 @@ class MainWindow(QMainWindow):
         for name in (
             "atom_styles", "atom_material", "atom_lighting", "atom_edges",
             "atom_edge_color", "atom_edge_width", "default_atom_style",
-            "default_custom_radius", "_background_color_value", "material_ambient",
+            "default_custom_radius", "default_atom_scale", "_background_color_value", "material_ambient",
             "material_diffuse", "material_specular", "material_roughness",
             "material_metallic", "axes_visible", "grid_visible", "bond_width",
             "bond_alpha", "bond_tolerance", "bonds_enabled",
+            "keyboard_translation_step", "perspective_enabled",
         ):
             if source_viewer is not None:
                 setattr(viewer, name, deepcopy(getattr(source_viewer, name)))
@@ -2966,12 +3527,18 @@ class MainWindow(QMainWindow):
             self._configure_viewer(viewer)
         else:
             self._connect_extra_viewer(viewer)
+            viewer.camera.SetParallelProjection(not viewer.perspective_enabled)
         self.window_manager.add(viewer, frame_index, self.frame_names[frame_index])
         QApplication.processEvents()
         viewer.set_data(self.elements, self.coordinates, self.lattices)
         viewer.set_frame_state(
             self.atom_frame_styles, self.frame_metrics, self.bond_adjacencies
         )
+        # set_data initializes visibility to off; restore shared bond settings
+        # after attaching the authoritative graph list to the new viewer.
+        if source_viewer is not None:
+            viewer.bonds_enabled = source_viewer.bonds_enabled
+        viewer.bond_frame_indices = set(self.bond_frame_indices)
         viewer.set_frame(frame_index)
         QTimer.singleShot(0, viewer.render)
 
@@ -3075,7 +3642,8 @@ class MainWindow(QMainWindow):
             for index in self.bond_frame_indices
             if index not in deleted
         ]
-        self.viewer.bond_frame_indices = set(self.bond_frame_indices)
+        if self.viewer is not None:
+            self.viewer.bond_frame_indices = set(self.bond_frame_indices)
         self.window_manager.remove_frames(indices)
         old_current = self.current_index
         if not self.elements:
@@ -3088,6 +3656,7 @@ class MainWindow(QMainWindow):
             )
         for record in self.window_manager.records:
             record["viewer"].selected_indices = np.empty(0, dtype=int)
+            record["viewer"].selected_bonds.clear()
         self.undo_stack.clear()
         self.redo_stack.clear()
         self._refresh_after_change(frame_index=self.current_index)
@@ -3112,11 +3681,34 @@ class MainWindow(QMainWindow):
         self._delete_frames(indices)
 
     def _duplicate_frames(self, frame_indices, anchor_index):
-        """Copy selected frames in order below the context-menu anchor."""
+        """Copy frames with a reversible graph/structure index-space boundary.
+
+        Args:
+            frame_indices: Frames to duplicate in increasing index order.
+            anchor_index: Insert the copies immediately after this frame.
+
+        Return:
+            None. Older frame-indexed history remains valid after Undo.
+        """
         selected = sorted(set(int(index) for index in frame_indices))
         if not selected or not 0 <= int(anchor_index) < len(self.elements):
             return
         anchor_index = int(anchor_index)
+        before_elements = list(self.elements)
+        before_coordinates = list(self.coordinates)
+        before_lattices = list(self.lattices)
+        before_context = self._all_supercell_context()
+        # Inserting frames shifts all later frame indices. Clear their graphs
+        # through deltas before changing the frame list, then restore edges in
+        # the new frame space. Undo reverses that boundary before older events.
+        before_graphs = {
+            frame: self.bond_adjacencies[frame]
+            for frame in range(anchor_index + 1, len(self.elements))
+        }
+        remove_bonds = BondChange.between(
+            "Move copied frame bonds", before_graphs,
+            {frame: None for frame in before_graphs},
+        )
         snapshots = []
         for index in selected:
             snapshots.append(
@@ -3162,8 +3754,25 @@ class MainWindow(QMainWindow):
             for new, old in enumerate(source_order)
         }
         self.current_index = insert_at + len(snapshots) - 1
-        self._refresh_after_change(frame_index=self.current_index)
-        self._sync_history_actions()
+        after_graphs = {
+            frame: self.bond_adjacencies[frame]
+            for frame in range(insert_at, len(self.elements))
+        }
+        add_bonds = BondChange.between(
+            "Restore copied frame bonds", {frame: None for frame in after_graphs}, after_graphs,
+        )
+        structure = StructureChange.for_batch(
+            "Copy frames", before_elements, before_coordinates, before_lattices,
+            self.elements, self.coordinates, self.lattices,
+            before_context=before_context, after_context=self._all_supercell_context(),
+        )
+        entries = []
+        if remove_bonds.frame_indices:
+            entries.append(remove_bonds)
+        entries.append(structure)
+        if add_bonds.frame_indices:
+            entries.append(add_bonds)
+        self._record_change(tuple(entries), already_applied=True, frame_index=self.current_index)
 
     def _apply_frame_permutation(self, permutation, update_current=True):
         """Apply new[k] = old[perm[k]] to every frame-aligned list."""
@@ -3402,6 +4011,11 @@ class MainWindow(QMainWindow):
         view_menu.addAction("Along B", lambda: self._set_view(1))
         view_menu.addAction("Along C", lambda: self._set_view(2))
         view_menu.addSeparator()
+        self.perspective_action = view_menu.addAction("Perspective")
+        self.perspective_action.setCheckable(True)
+        self.perspective_action.setChecked(False)
+        self.perspective_action.toggled.connect(self._set_perspective_enabled)
+        view_menu.addSeparator()
         zoom_controls = QWidget(view_menu)
         zoom_layout = QHBoxLayout(zoom_controls)
         zoom_layout.setContentsMargins(8, 4, 8, 4)
@@ -3452,6 +4066,408 @@ class MainWindow(QMainWindow):
         self._sync_frame_list()
         self._sync_history_actions()
         self._log(f"Loaded {len(elements)} frame(s), {sum(map(len, elements))} atoms total.")
+
+    def _rebuild_update_menu(self):
+        """Rebuild the always-available Update drop-down menu.
+
+        Args:
+            None.
+
+        Return:
+            None. Loaded functions are followed by More and Help actions.
+        """
+        if not hasattr(self, "update_menu"):
+            return
+        self.update_menu.clear()
+        for updater in self.updaters:
+            action = self.update_menu.addAction(updater["name"])
+            action.setToolTip(str(updater["path"]))
+            action.triggered.connect(
+                lambda checked=False, record=updater: self._run_updater_dialog(record)
+            )
+        if self.updaters:
+            self.update_menu.addSeparator()
+        more_action = self.update_menu.addAction("More...")
+        more_action.triggered.connect(self._show_updater_dialog)
+        help_action = self.update_menu.addAction("Help")
+        help_action.triggered.connect(self._show_updater_help)
+
+    def set_updater(self, updater):
+        """Install one embedded callable using the updater protocol.
+
+        Args:
+            updater: Callable receiving ``cell``, ``elem``, and ``coo`` lists.
+
+        Return:
+            None. The callable is added to both the menu and compatibility slot.
+        """
+        if not callable(updater):
+            raise TypeError("updater must be callable")
+        name = getattr(updater, "__name__", "update") or "update"
+        self.updaters = [
+            record for record in self.updaters if record.get("configured", False)
+        ]
+        self.updaters.insert(
+            0,
+            {
+                "path": "<embedded>",
+                "name": name,
+                "callback": updater,
+                "configured": False,
+            },
+        )
+        self.updater = updater
+        self._rebuild_update_menu()
+
+    def _show_updater_help(self):
+        """Show configuration and function-signature guidance for plugins.
+
+        Args:
+            None.
+
+        Return:
+            None. A read-only help window is displayed modally.
+        """
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Updater Plugin Help")
+        dialog.resize(720, 520)
+        text = QPlainTextEdit(dialog)
+        text.setReadOnly(True)
+        text.setPlainText(
+            "Configure independent module and function lists in settings.json:\n\n"
+            "{\n"
+            '  "updater_path": ["updaters/relax.py"],\n'
+            '  "updater_function": ["relax_atoms", "relax_cell"]\n'
+            "}\n\n"
+            "Paths may be absolute or relative to settings.json. All modules are loaded "
+            "first, then each function name is looked up across them. Lists need not "
+            "have equal lengths. Functions are grouped by their defining module "
+            "using __module__ metadata; reexports of the same function are deduplicated. "
+            "Distinct functions with the same name in different modules are all listed. "
+            "Legacy single-string values remain supported.\n\n"
+            "Required function protocol:\n\n"
+            "def update(cell, elem, coo, *args, **kwargs):\n"
+            "    # cell: List[np.ndarray], each (3, 3)\n"
+            "    # elem: List[np.ndarray], each (N,)\n"
+            "    # coo:  List[np.ndarray], each (N, 3) Cartesian Å\n"
+            "    return new_cell, new_elem, new_coo\n\n"
+            "Inputs are detached copies. Return three equally sized lists of NumPy "
+            "arrays. Shapes must be valid, values finite, and dtypes compatible with "
+            "the input. Apply appends returned frames; Dry Run executes and validates "
+            "without modifying the frame list. args accepts a Python literal value, "
+            "tuple, or list; kwargs accepts a dictionary literal."
+        )
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close, dialog)
+        buttons.rejected.connect(dialog.reject)
+        layout = QVBoxLayout(dialog)
+        layout.addWidget(text)
+        layout.addWidget(buttons)
+        dialog.exec()
+
+    def _show_updater_dialog(self):
+        """Open the detailed updater tree and operation controls.
+
+        Args:
+            None.
+
+        Return:
+            None. The modal dialog operates on the current plugin collection.
+        """
+        dialog = UpdaterDialog(self.updaters, self)
+        dialog.apply_button.clicked.connect(
+            lambda: self._apply_selected_updater(dialog)
+        )
+        dialog.help_button.clicked.connect(
+            lambda: self._show_selected_updater_help(dialog)
+        )
+        dialog.dry_run_button.clicked.connect(
+            lambda: self._dry_run_selected_updater(dialog)
+        )
+        dialog.refresh_button.clicked.connect(
+            lambda: self._refresh_updater_dialog(dialog)
+        )
+        dialog.exec()
+
+    def _updater_arguments_from_dialog(self, dialog):
+        """Parse literal positional and keyword arguments from the dialog.
+
+        Args:
+            dialog: Active :class:`UpdaterDialog` instance.
+
+        Return:
+            A positional-argument tuple and keyword-argument dictionary.
+        """
+        args_text = dialog.args_edit.text().strip()
+        kwargs_text = dialog.kwargs_edit.text().strip()
+        if args_text:
+            args_value = ast.literal_eval(args_text)
+            if isinstance(args_value, (list, tuple)):
+                args = tuple(args_value)
+            else:
+                args = (args_value,)
+        else:
+            args = ()
+        if kwargs_text:
+            kwargs = ast.literal_eval(kwargs_text)
+            if not isinstance(kwargs, dict) or any(
+                not isinstance(key, str) for key in kwargs
+            ):
+                raise ValueError("kwargs must be a dictionary with string keys")
+        else:
+            kwargs = {}
+        return args, kwargs
+
+    def _apply_selected_updater(self, dialog):
+        """Apply the function selected in the detailed updater dialog.
+
+        Args:
+            dialog: Active :class:`UpdaterDialog` instance.
+
+        Return:
+            None. A frame-scope prompt precedes the normal append operation.
+        """
+        updater = dialog.selected_updater()
+        if updater is None:
+            return
+        try:
+            args, kwargs = self._updater_arguments_from_dialog(dialog)
+        except (SyntaxError, TypeError, ValueError) as error:
+            self._log(f"Updater argument error: {error}")
+            return
+        self._run_updater_dialog(updater, args, kwargs)
+
+    def _dry_run_selected_updater(self, dialog):
+        """Execute and validate a selected updater without appending frames.
+
+        Args:
+            dialog: Active :class:`UpdaterDialog` instance.
+
+        Return:
+            None. Warnings, errors, and captured output are sent to the console.
+        """
+        updater = dialog.selected_updater()
+        if updater is None:
+            return
+        try:
+            args, kwargs = self._updater_arguments_from_dialog(dialog)
+            self._invoke_updater(updater, "", args, kwargs)
+            self._log(f"Dry Run succeeded: {updater['name']} (current frame).")
+        except Exception as error:
+            self._log(f"Dry Run error [{updater['name']}]: {error}")
+            self._log(traceback.format_exc().rstrip())
+
+    def _show_selected_updater_help(self, dialog):
+        """Print Python built-in help for the selected updater function.
+
+        Args:
+            dialog: Active :class:`UpdaterDialog` instance.
+
+        Return:
+            None. The generated help text is appended to the GUI console.
+        """
+        updater = dialog.selected_updater()
+        if updater is None:
+            return
+        stream = io.StringIO()
+        with redirect_stdout(stream):
+            help(updater["callback"])
+        help_text = stream.getvalue().rstrip()
+        self._log(help_text or f"No help is available for {updater['name']}.")
+
+    def _refresh_updater_dialog(self, dialog):
+        """Reload updater configuration and refresh both menus and tree view.
+
+        Args:
+            dialog: Active :class:`UpdaterDialog` instance.
+
+        Return:
+            None. Valid configured plugins replace the previous configured set.
+        """
+        refreshed = self._load_settings()
+        self.settings["updater_path"] = refreshed["updater_path"]
+        self.settings["updater_function"] = refreshed["updater_function"]
+        self._load_configured_updaters()
+        dialog.set_updaters(self.updaters)
+        if self.settings_warning is not None:
+            self._log(self.settings_warning)
+        if self.updater_warning is not None:
+            self._log(self.updater_warning)
+        self._log(f"Updater refresh loaded {len(self.updaters)} function(s).")
+
+    def _run_updater_dialog(self, updater, args=(), kwargs=None):
+        """Ask for a one-based frame scope and run one updater record.
+
+        Args:
+            updater: Loaded updater record containing its callback and name.
+            args: Extra positional arguments appended after structure lists.
+            kwargs: Extra keyword arguments appended after structure lists.
+
+        Return:
+            None. Accepted input is passed to the normal updater operation.
+        """
+        specification, accepted = QInputDialog.getText(
+            self,
+            f"Run Updater - {updater['name']}",
+            "Frames (empty=current, all, or 1,2-5):",
+            text=str(self.current_index + 1),
+        )
+        if accepted:
+            self._run_updater(updater, specification, args, kwargs or {})
+
+    def _run_default_updater(self, specification=None):
+        """Run the first loaded updater for the legacy console command.
+
+        Args:
+            specification: Optional current/all/one-based frame scope.
+
+        Return:
+            None. Errors are written to the GUI console.
+        """
+        if not self.updaters:
+            self._log("Updater error: no structure updater is configured")
+            return
+        self._run_updater(self.updaters[0], specification, (), {})
+
+    def _run_updater(self, updater, specification=None, args=(), kwargs=None):
+        """Invoke one updater record and report failures in the console.
+
+        Args:
+            updater: Loaded updater record containing its callback and name.
+            specification: Optional current/all/one-based frame scope.
+            args: Extra positional arguments for the plugin.
+            kwargs: Extra keyword arguments for the plugin.
+
+        Return:
+            None. Successful results are appended to the frame collection.
+        """
+        try:
+            self.apply_updater(
+                specification,
+                updater=updater["callback"],
+                args=args,
+                kwargs=kwargs,
+                name=updater["name"],
+            )
+        except Exception as error:
+            self._log(f"Updater error [{updater['name']}]: {error}")
+            self._log(traceback.format_exc().rstrip())
+
+    def _invoke_updater(self, updater, specification, args=(), kwargs=None):
+        """Execute one updater against detached selected-frame inputs.
+
+        Args:
+            updater: Loaded updater record containing its callback and name.
+            specification: Current/all/one-based frame scope text.
+            args: Extra positional arguments for the plugin.
+            kwargs: Extra keyword arguments for the plugin.
+
+        Return:
+            Validated ``(new_cell, new_elem, new_coo)`` lists.
+        """
+        if not self.coordinates:
+            raise ValueError("no structure data is loaded")
+        if not 0 <= self.current_index < len(self.coordinates):
+            raise ValueError("the current frame index is invalid")
+        selected = parse_frame_scope(
+            specification or "",
+            len(self.coordinates),
+            self.current_index,
+        )
+        selected_cell = [self.lattices[index] for index in selected]
+        selected_elem = [self.elements[index] for index in selected]
+        selected_coo = [self.coordinates[index] for index in selected]
+        stdout_stream = io.StringIO()
+        stderr_stream = io.StringIO()
+        captured_warnings = []
+        try:
+            with warnings.catch_warnings(record=True) as captured_warnings:
+                warnings.simplefilter("always")
+                with redirect_stdout(stdout_stream), redirect_stderr(stderr_stream):
+                    result = apply_structure_updater(
+                        updater["callback"],
+                        selected_cell,
+                        selected_elem,
+                        selected_coo,
+                        *tuple(args),
+                        **dict(kwargs or {}),
+                    )
+        finally:
+            standard_output = stdout_stream.getvalue().rstrip()
+            standard_error = stderr_stream.getvalue().rstrip()
+            if standard_output:
+                self._log(standard_output)
+            if standard_error:
+                self._log(standard_error)
+            for warning in captured_warnings:
+                self._log(
+                    f"Updater warning [{updater['name']}]: "
+                    f"{warning.category.__name__}: {warning.message}"
+                )
+        return result
+
+    def apply_updater(
+        self,
+        specification=None,
+        updater=None,
+        args=(),
+        kwargs=None,
+        name=None,
+    ):
+        """Apply an external updater to a frame scope and append its results.
+
+        ``specification`` uses the one-based inclusive frame syntax accepted by
+        :func:`parse_frame_scope`; an empty value selects the current frame and
+        ``all`` selects every frame. The callback receives detached lists in
+        ``(cell, elem, coo)`` order and may return any valid frame/atom count.
+        Returned frames are appended after the existing frames.
+
+        Args:
+            specification: Optional current/all/one-based frame scope.
+            updater: Optional callback overriding the default updater.
+            args: Extra positional arguments forwarded after structure lists.
+            kwargs: Extra keyword arguments forwarded to the callback.
+            name: Optional display and history name for the callback.
+
+        Return:
+            Validated ``(new_cell, new_elem, new_coo)`` lists appended to data.
+        """
+        if callable(specification) and updater is None:
+            updater = specification
+            specification = None
+        callback = self.updater if updater is None else updater
+        if callback is None:
+            raise ValueError("no structure updater is configured")
+        updater_name = name or getattr(callback, "__name__", "update") or "update"
+        record = {
+            "path": "<direct>",
+            "name": updater_name,
+            "callback": callback,
+            "configured": False,
+        }
+        new_cell, new_elem, new_coo = self._invoke_updater(
+            record,
+            specification or "",
+            args,
+            kwargs or {},
+        )
+        elements = [np.array(value, copy=True) for value in self.elements]
+        coordinates = [np.array(value, copy=True) for value in self.coordinates]
+        lattices = [np.array(value, copy=True) for value in self.lattices]
+        elements.extend(np.array(value, copy=True) for value in new_elem)
+        coordinates.extend(np.array(value, copy=True) for value in new_coo)
+        lattices.extend(np.array(value, copy=True) for value in new_cell)
+        self._on_cli_data_changed(
+            elements,
+            coordinates,
+            lattices,
+            description=f"Updater: {updater_name}",
+            preserve_existing_context=True,
+        )
+        self._log(f"Updater appended {len(new_coo)} frame(s): {updater_name}.")
+        return new_cell, new_elem, new_coo
+
+    # Explicit alias for embedding code that calls the operation an update.
+    update_data = apply_updater
 
     def register_property_renderer(self, name, renderer):
         """Register a callable that adds one optional PyVista overlay.
@@ -3642,29 +4658,20 @@ class MainWindow(QMainWindow):
         returns_aggregate = bool(getattr(self.open_handler, "returns_aggregate", False))
         if previous_count == 0:
             self.set_data(elements, coordinates, lattices)
-        elif returns_aggregate:
-            self.elements = elements
-            self.coordinates = coordinates
-            self.lattices = lattices
-            self._initialize_supercell_state()
-            self._initialize_frame_state()
-            self._ensure_frame_names()
-            self.bond_adjacencies = [None for _ in self.coordinates]
-            self.bond_frame_indices = []
-            blocker = QSignalBlocker(self.bond_action)
-            self.bond_action.setChecked(False)
-            del blocker
-            self.current_index = min(previous_count, len(coordinates) - 1)
-            self._refresh_after_change(frame_index=self.current_index, reset_camera=True)
-            self._log(f"Appended {len(coordinates) - previous_count} frame(s) from selected files")
         else:
-            for frame_elements, frame_coordinates, frame_lattice in zip(
-                elements, coordinates, lattices
-            ):
-                self._append_frame(frame_elements, frame_coordinates, frame_lattice)
+            # Use the same batch-history boundary as updater appends. Resetting
+            # graphs here would silently invalidate older sparse bond events.
+            if not returns_aggregate:
+                elements = list(self.elements) + list(elements)
+                coordinates = list(self.coordinates) + list(coordinates)
+                lattices = list(self.lattices) + list(lattices)
+            self._on_cli_data_changed(
+                elements, coordinates, lattices,
+                description="Open structures", preserve_existing_context=True,
+            )
             self.current_index = min(previous_count, len(self.coordinates) - 1)
             self._refresh_after_change(frame_index=self.current_index)
-            self._log(f"Appended {len(elements)} frame(s) from selected files")
+            self._log(f"Appended {len(self.coordinates) - previous_count} frame(s) from selected files")
         self.cli.bind_data(self.elements, self.coordinates, self.lattices)
 
     def _save(self, path):
@@ -3809,8 +4816,7 @@ class MainWindow(QMainWindow):
         Return:
             None. The viewer selection is updated in place.
         """
-        self.viewer.selected_indices = np.asarray(indices, dtype=int)
-        self.viewer.refresh_selection_overlay()
+        self.viewer._update_selection(np.asarray(indices, dtype=int), additive=False)
         self._sync_atom_actions(self.viewer.selected_indices)
 
     def _clear_selection(self):
@@ -3823,9 +4829,8 @@ class MainWindow(QMainWindow):
             None. The current frame is redrawn without selected atoms.
         """
         if self.viewer is not None:
-            self.viewer.selected_indices = np.empty(0, dtype=int)
-        self.viewer.refresh_selection_overlay()
-        self._sync_atom_actions(self.viewer.selected_indices)
+            self.viewer._update_selection(np.empty(0, dtype=int), additive=False)
+            self._sync_atom_actions(self.viewer.selected_indices)
 
     def _reset_view(self):
         """Reset the camera and synchronize the zoom control.
@@ -3841,13 +4846,22 @@ class MainWindow(QMainWindow):
         self.zoom_input.setValue(100)
         del blocker
 
-    def _on_cli_data_changed(self, elements, coordinates, lattices):
+    def _on_cli_data_changed(
+        self,
+        elements,
+        coordinates,
+        lattices,
+        description="CLI data edit",
+        preserve_existing_context=False,
+    ):
         """Refresh the GUI after a validated CLI list edit.
 
         Args:
             elements: Validated element arrays.
             coordinates: Validated Cartesian coordinate arrays.
             lattices: Validated lattice arrays.
+            description: History label for the completed operation.
+            preserve_existing_context: Preserve unchanged frame state when appending.
 
         Return:
             None. The current frame is redrawn without replacing list owners.
@@ -3857,6 +4871,18 @@ class MainWindow(QMainWindow):
         before_elements = [np.array(value, copy=True) for value in self.elements]
         before_coordinates = [np.array(value, copy=True) for value in self.coordinates]
         before_lattices = [np.array(value, copy=True) for value in self.lattices]
+        before_graphs = list(self.bond_adjacencies)
+        # Keep edges when node numbering is still valid (coordinate/species
+        # edits or append-only updates). Unknown node-count replacements have
+        # no reliable permutation, so their removed triples must be undoable.
+        reset_graphs = {
+            frame: graph for frame, graph in enumerate(before_graphs)
+            if frame >= len(elements) or len(before_elements[frame]) != len(elements[frame])
+        }
+        bonds = BondChange.between(
+            "Reset updated frame bonds", reset_graphs,
+            {frame: None for frame in reset_graphs},
+        )
         topology_changed = len(before_elements) != len(elements) or any(
             not np.array_equal(previous, current)
             for previous, current in zip(before_elements, elements)
@@ -3865,15 +4891,23 @@ class MainWindow(QMainWindow):
         self.elements = elements
         self.coordinates = coordinates
         self.lattices = lattices
-        self._initialize_supercell_state()
-        if topology_changed:
-            self._initialize_frame_state()
-        else:
+        if preserve_existing_context:
+            self._ensure_supercell_state()
             self._ensure_frame_state()
+        else:
+            self._initialize_supercell_state()
+        if topology_changed and not preserve_existing_context:
+            self._initialize_frame_state()
+        elif not preserve_existing_context:
+            self._ensure_frame_state()
+        self.bond_adjacencies[:] = [
+            before_graphs[frame] if frame < len(before_graphs) and frame not in reset_graphs else None
+            for frame in range(len(elements))
+        ]
         self._ensure_frame_names()
         after_context = self._all_supercell_context()
         change = StructureChange.for_batch(
-            "CLI data edit",
+            description,
             before_elements,
             before_coordinates,
             before_lattices,
@@ -3883,6 +4917,8 @@ class MainWindow(QMainWindow):
             before_context=before_context,
             after_context=after_context,
         )
+        if bonds.frame_indices:
+            change = (bonds, change)
         self._record_change(change, already_applied=True)
         self._restore_all_supercell_context(after_context)
 

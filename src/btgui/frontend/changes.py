@@ -1,4 +1,4 @@
-"""Unified reversible changes for the three raw structure lists."""
+"""Reversible structure, sparse bond, appearance and frame-order changes."""
 
 from __future__ import annotations
 
@@ -7,6 +7,178 @@ from typing import Any
 from copy import deepcopy
 
 import numpy as np
+
+from btgui.backend.core import normalize_bond_adjacency
+
+
+@dataclass
+class BondChange:
+    """Store only changed COO triples and optional atom-index mappings.
+
+    Args:
+        description: History label.
+        removed: Per-frame int64 ``(K, 3)`` triples in the old index space.
+        added: Per-frame int64 ``(K, 3)`` triples in the new index space.
+        before_missing: Whether a frame previously had an uncomputed graph.
+        mappings: Optional old-to-new arrays; deleted atoms map to ``-1``.
+        after_missing: Optional uncomputed state after a graph/topology reset.
+
+    Return:
+        A reversible graph delta, never a pair of full graph snapshots.
+
+    Note:
+        The graph is currently unweighted: ``info == 1`` denotes an edge.
+        Endpoint indices are zero-based; console formatting alone is one-based.
+        ``None`` is uncomputed, whereas empty ``(2, 0)`` is an explicit graph.
+    """
+
+    description: str
+    removed: dict
+    added: dict
+    before_missing: dict
+    mappings: dict | None = None
+    after_missing: dict | None = None
+
+    @property
+    def frame_indices(self):
+        """Return affected frames for consolidated cache invalidation.
+
+        Args:
+            None.
+
+        Return:
+            Sorted frame indices.
+        """
+        return tuple(sorted(self.before_missing))
+
+    @classmethod
+    def between(cls, description, before, after):
+        """Compare canonical edge coordinates using vectorized sorted matching.
+
+        Args:
+            description: History label.
+            before: Mapping from frame to its old COO or ``None``.
+            after: Mapping from frame to its replacement COO or ``None``.
+
+        Return:
+            A delta containing only removed/added ``(i, j, 1)`` triples.
+        """
+        removed, added, missing, after_missing = {}, {}, {}, {}
+        for frame, replacement in after.items():
+            old = normalize_bond_adjacency(before[frame])
+            new = normalize_bond_adjacency(replacement)
+            # Section: Structured pairs compare lexicographically without i*N+j
+            # packing, which would introduce an atom-count/overflow dependency.
+            pair_dtype = np.dtype([("src", np.int64), ("dst", np.int64)])
+            old_pairs = np.ascontiguousarray(old.T).view(pair_dtype).reshape(-1)
+            new_pairs = np.ascontiguousarray(new.T).view(pair_dtype).reshape(-1)
+            old_only = ~np.isin(old_pairs, new_pairs, assume_unique=True)
+            new_only = ~np.isin(new_pairs, old_pairs, assume_unique=True)
+            if (
+                not old_only.any() and not new_only.any()
+                and (before[frame] is None) == (replacement is None)
+            ):
+                continue
+            removed[frame] = np.column_stack((
+                old[:, old_only].T, np.ones(old_only.sum(), dtype=np.int64),
+            ))
+            added[frame] = np.column_stack((
+                new[:, new_only].T, np.ones(new_only.sum(), dtype=np.int64),
+            ))
+            missing[frame] = before[frame] is None
+            after_missing[frame] = replacement is None
+        return cls(description, removed, added, missing, after_missing=after_missing)
+
+    def apply(self, window, use_after):
+        """Apply a delta or its inverse without touching unrelated graph edges.
+
+        Args:
+            window: Owner of frame-aligned ``bond_adjacencies``.
+            use_after: True for Redo, False for Undo.
+
+        Return:
+            None. Every replaced graph remains canonical.
+        """
+        for frame in self.frame_indices:
+            graph = normalize_bond_adjacency(window.bond_adjacencies[frame])
+            drop = self.removed[frame] if use_after else self.added[frame]
+            insert = self.added[frame] if use_after else self.removed[frame]
+            # Section: Remove triples in the current index space BEFORE mapping.
+            if len(drop):
+                pair_dtype = np.dtype([("src", np.int64), ("dst", np.int64)])
+                current_pairs = np.ascontiguousarray(graph.T).view(pair_dtype).reshape(-1)
+                drop_pairs = np.ascontiguousarray(drop[:, :2]).view(pair_dtype).reshape(-1)
+                graph = graph[:, ~np.isin(current_pairs, drop_pairs, assume_unique=True)]
+            if self.mappings is not None and frame in self.mappings:
+                mapping = self.mappings[frame]
+                if use_after:
+                    graph = mapping[graph]
+                    graph = graph[:, np.all(graph >= 0, axis=0)]
+                else:
+                    # Invert the old->new map explicitly so both endpoints use
+                    # the same inverse even if retained nodes were reordered.
+                    retained = np.flatnonzero(mapping >= 0)
+                    inverse = np.empty(len(retained), dtype=np.int64)
+                    inverse[mapping[retained]] = retained
+                    graph = inverse[graph]
+            if len(insert):
+                graph = np.concatenate((graph, insert[:, :2].T), axis=1)
+            # Missing/explicit-empty is metadata, not an edge delta. Retain it
+            # separately so Undo of lazy generation or a topology reset is exact.
+            if use_after:
+                missing = self.after_missing is not None and self.after_missing.get(frame, False)
+            else:
+                missing = self.before_missing[frame]
+            window.bond_adjacencies[frame] = (
+                None if missing
+                else normalize_bond_adjacency(graph)
+            )
+
+
+@dataclass
+class ClearBondsChange:
+    """Retain complete original graphs specifically for explicit Clear bonds.
+
+    Args:
+        description: History label.
+        originals: Detached per-frame COO snapshots, including ``None``.
+
+    Return:
+        A clear/restore event; other bond edits use sparse deltas.
+    """
+
+    description: str
+    originals: dict
+
+    @property
+    def frame_indices(self):
+        """Return frames whose graphs were explicitly cleared.
+
+        Args:
+            None.
+
+        Return:
+            Sorted affected frame indices.
+        """
+        return tuple(sorted(self.originals))
+
+    def apply(self, window, use_after):
+        """Clear graphs on Redo and restore their exact snapshots on Undo.
+
+        Args:
+            window: Owner of the graph list.
+            use_after: Whether to clear rather than restore.
+
+        Return:
+            None. Empty graphs prevent Show bonds from regenerating connections.
+        """
+        for frame, original in self.originals.items():
+            if use_after:
+                window.bond_adjacencies[frame] = np.empty((2, 0), dtype=np.int64)
+            else:
+                window.bond_adjacencies[frame] = (
+                    None if original is None else np.array(original, copy=True)
+                )
 
 
 def _copy_arrays(values: list[np.ndarray]) -> list[np.ndarray]:

@@ -7,9 +7,9 @@ from PySide6.QtCore import Qt, Signal, QRect
 from PySide6.QtGui import QMouseEvent
 from PySide6.QtWidgets import QRubberBand
 from vtkmodules.vtkCommonTransforms import vtkTransform
-from vtkmodules.vtkRenderingCore import vtkLight
+from vtkmodules.vtkRenderingCore import vtkCellPicker, vtkLight
 
-from btgui.backend.core import angle_between, distance_between
+from btgui.backend.core import angle_between, distance_between, translate_selected
 from btgui.data.appearance import covalent_radius, default_color, vdw_radius
 
 
@@ -25,10 +25,13 @@ class StructureViewer(QtInteractor):
 
     coordinatesEdited = Signal(int, object, object)
     deleteRequested = Signal(int, object)
-    atomsAdded = Signal(int, object, object)
+    atomsAdded = Signal(int, object, object, object)
+    bondAdded = Signal(int, int, int)
+    bondsDeleted = Signal(int, object)
     filesDropped = Signal(object)
     measurementModeChanged = Signal(object)
     selectionChanged = Signal(object)
+    frameStepRequested = Signal(int)
 
     def __init__(self, parent=None):
         super().__init__(parent=parent)
@@ -37,6 +40,8 @@ class StructureViewer(QtInteractor):
         self.lattices = []
         self.current_index = 0
         self.selected_indices = np.empty(0, dtype=int)
+        self.selected_bonds = set()
+        self.bond_selection_actors = []
         self.property_renderers = {}
         self.atom_styles = {}
         self.atom_frame_styles = []
@@ -46,11 +51,14 @@ class StructureViewer(QtInteractor):
         self.bond_mesh_cache = {}
         self.bond_actor_cache = {}
         self.default_atom_style = "covalent"
-        self.default_custom_radius = 0.76
+        self.default_custom_radius = 1.0
+        self.default_atom_scale = 0.6
+        self.keyboard_translation_step = 0.1
+        self.perspective_enabled = False
         self._background_color_value = "#f5f7f7"
         self.bonds_enabled = False
         self.bond_tolerance = 1.2
-        self.bond_width = 0.08
+        self.bond_width = 0.2
         self.bond_alpha = 1.0
         self.axes_visible = False
         self.grid_visible = False
@@ -94,6 +102,7 @@ class StructureViewer(QtInteractor):
         self._playback_base_elements = None
         self.zoom_percent = 100
         self._zoom_base_distance = None
+        self._zoom_base_parallel_scale = None
         self.length_measurements = {}
         self.angle_measurements = {}
         self.measurement_mode = None
@@ -110,8 +119,10 @@ class StructureViewer(QtInteractor):
         self.add_fixed_actors = []
         self._add_preview_position = None
         self.add_reference_symbol = None
+        self.add_reference_index = None
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self.set_background(self._background_color_value)
+        self.camera.SetParallelProjection(True)
         self._configure_lights()
         self.enable_anti_aliasing("msaa")
 
@@ -128,12 +139,12 @@ class StructureViewer(QtInteractor):
         if lights is not None and lights.GetNumberOfItems() > 0:
             self.renderer.RemoveAllLights()
         key_light = vtkLight()
-        key_light.SetLightTypeToSceneLight()
+        key_light.SetLightTypeToCameraLight()
         key_light.SetPosition(1.0, -1.0, 1.5)
         key_light.SetFocalPoint(0.0, 0.0, 0.0)
         key_light.SetIntensity(1.0)
         fill_light = vtkLight()
-        fill_light.SetLightTypeToSceneLight()
+        fill_light.SetLightTypeToCameraLight()
         fill_light.SetPosition(-1.0, 0.5, 0.5)
         fill_light.SetFocalPoint(0.0, 0.0, 0.0)
         fill_light.SetIntensity(0.35)
@@ -158,6 +169,7 @@ class StructureViewer(QtInteractor):
         self.lattices = lattices
         self.current_index = 0
         self.selected_indices = np.empty(0, dtype=int)
+        self.selected_bonds.clear()
         self.bond_adjacencies = []
         self.bond_frame_indices = set()
         self.bond_mesh_cache = {}
@@ -203,6 +215,10 @@ class StructureViewer(QtInteractor):
             raise IndexError("frame index is out of range")
         self.current_index = index
         self.selected_indices = np.empty(0, dtype=int)
+        self.selected_bonds.clear()
+        self.set_measurement_mode(None)
+        if self.add_mode:
+            self.cancel_atom_addition()
         if 0 <= index < len(self.frame_metrics):
             self.length_measurements = self.frame_metrics[index]["length"]
             self.angle_measurements = self.frame_metrics[index]["angle"]
@@ -226,6 +242,7 @@ class StructureViewer(QtInteractor):
         self.selected_actors = []
         self.selection_shell_actors = []
         self.bond_actors = []
+        self.bond_selection_actors = []
         self.atom_meshes = []
         self.lattice_actors = []
         self.lattice_mesh = None
@@ -349,6 +366,7 @@ class StructureViewer(QtInteractor):
                 elements,
                 self.bond_adjacencies[self.current_index],
             )
+        self.refresh_bond_selection(render=False)
         self._draw_measurements(positions)
         for renderer in self.property_renderers.values():
             renderer(self, self.current_index, positions)
@@ -378,6 +396,7 @@ class StructureViewer(QtInteractor):
             "parallel_scale": float(self.camera.parallel_scale),
             "view_angle": float(self.camera.view_angle),
             "clipping_range": tuple(float(value) for value in self.camera.clipping_range),
+            "parallel_projection": bool(self.camera.GetParallelProjection()),
         }
 
     def _restore_camera_state(self, state):
@@ -395,12 +414,15 @@ class StructureViewer(QtInteractor):
         self.camera.parallel_scale = state["parallel_scale"]
         self.camera.view_angle = state["view_angle"]
         self.camera.clipping_range = state["clipping_range"]
+        self.camera.SetParallelProjection(state["parallel_projection"])
+        self.perspective_enabled = not state["parallel_projection"]
 
     def _style_for(self, symbol, atom_index=None):
         """Return one element style merged with defaults.
 
         Args:
             symbol: Chemical element symbol.
+            atom_index: Optional zero-based atom whose sparse style overrides apply.
 
         Return:
             A dictionary containing display type, color, opacity, and radius.
@@ -417,6 +439,7 @@ class StructureViewer(QtInteractor):
             "color": style.get("color", default_color(symbol)),
             "alpha": style.get("alpha", 1.0),
             "radius": style.get("radius", self.default_custom_radius),
+            "scale": style.get("scale", self.default_atom_scale),
             "material": style.get("material", self.atom_material),
             "lighting": style.get("lighting", self.atom_lighting),
             "edges": style.get("edges", self.atom_edges),
@@ -471,6 +494,7 @@ class StructureViewer(QtInteractor):
 
         Args:
             symbol: Chemical element symbol.
+            atom_index: Optional zero-based atom whose sparse style overrides apply.
 
         Return:
             Radius used by the VTK sphere geometry.
@@ -479,9 +503,10 @@ class StructureViewer(QtInteractor):
         if style["style"] == "point":
             return 0.12
         if style["style"] == "covalent":
-            return covalent_radius(symbol)
+            # Display-only scaling must never alter physical bond cutoffs.
+            return covalent_radius(symbol) * float(style["scale"])
         if style["style"] == "vdw":
-            return vdw_radius(symbol)
+            return vdw_radius(symbol) * float(style["scale"])
         return max(0.01, float(style["radius"]))
 
     def _draw_bonds(self, positions, elements, adjacency):
@@ -547,6 +572,9 @@ class StructureViewer(QtInteractor):
                     dtype=np.uint8,
                 )
                 lines.cell_data["bond_colors"] = colors
+                # Tube filtering propagates each input line's endpoints to its
+                # output cells. Pick by coordinates, never by transient cell IDs.
+                lines.cell_data["bond_endpoints"] = np.column_stack((left, right))
                 tubes = lines.tube(
                     radius=self.bond_width,
                     n_sides=8,
@@ -573,7 +601,7 @@ class StructureViewer(QtInteractor):
                     opacity=self.bond_alpha,
                     smooth_shading=True,
                     show_scalar_bar=False,
-                    pickable=False,
+                    pickable=True,
                     render=False,
                 )
                 actors.append(actor)
@@ -613,8 +641,89 @@ class StructureViewer(QtInteractor):
                 np.asarray(self.elements[self.current_index], dtype=str),
                 self.bond_adjacencies[self.current_index],
             )
+        self.refresh_bond_selection(render=False)
         if render:
             self.render()
+
+    def refresh_bond_selection(self, render=True):
+        """Replace the non-pickable highlight for selected bond coordinates.
+
+        Args:
+            render: Whether to render after updating the overlay.
+
+        Return:
+            None. The batched base bond mesh is retained.
+        """
+        for actor in self.bond_selection_actors:
+            self.renderer.RemoveActor(actor)
+        self.bond_selection_actors = []
+        if self.selected_bonds and self.bond_actors:
+            pairs = np.asarray(sorted(self.selected_bonds), dtype=np.int64)
+            positions = np.asarray(self.coordinates[self.current_index])
+            points = positions[pairs].reshape(-1, 3)
+            cells = np.column_stack((
+                np.full(len(pairs), 2, dtype=np.int64),
+                np.arange(len(points), dtype=np.int64).reshape(-1, 2),
+            ))
+            lines = pv.PolyData(points, lines=cells.ravel())
+            overlay = lines.tube(radius=self.bond_width * 1.12, n_sides=8, capping=False)
+            self.bond_selection_actors.append(self.add_mesh(
+                overlay, color="#18a999", lighting=False, opacity=0.65,
+                pickable=False, render=False,
+            ))
+        if render:
+            self.render()
+
+    def _pick_bond(self, point):
+        """Resolve one visible tube cell to a canonical COO endpoint pair.
+
+        Args:
+            point: Two-dimensional VTK display coordinates.
+
+        Return:
+            A zero-based ``(src, dst)`` tuple, or None for a missed bond.
+        """
+        picker = vtkCellPicker()
+        picker.SetTolerance(0.005)
+        picker.PickFromListOn()
+        for actor in self.bond_actors:
+            picker.AddPickList(actor)
+        if not picker.Pick(float(point[0]), float(point[1]), 0.0, self.renderer):
+            return None
+        cell_id = picker.GetCellId()
+        dataset = picker.GetDataSet()
+        endpoints = None if dataset is None else dataset.GetCellData().GetArray("bond_endpoints")
+        if cell_id < 0 or endpoints is None:
+            return None
+        return tuple(sorted(int(value) for value in endpoints.GetTuple(cell_id)))
+
+    def _update_bond_selection(self, pair, additive):
+        """Select/toggle one bond and report newly selected endpoints.
+
+        Args:
+            pair: Canonical zero-based endpoint tuple from the cell picker.
+            additive: Whether Ctrl toggles this pair within the current set.
+
+        Return:
+            None. Console indices alone are converted to one-based numbering.
+        """
+        if additive and pair in self.selected_bonds:
+            self.selected_bonds.remove(pair)
+        else:
+            newly_selected = pair not in self.selected_bonds
+            if not additive:
+                self.selected_bonds.clear()
+            self.selected_bonds.add(pair)
+            if newly_selected:
+                i, j = pair
+                elem1, elem2 = self.elements[self.current_index][[i, j]]
+                distance = distance_between(self.coordinates[self.current_index], i, j)
+                # Fixed columns: one-based endpoints, symbols, Cartesian length
+                # in angstroms. Graph storage always retains zero-based indices.
+                self._log_add_status(
+                    f"{i + 1:<6d}-{j + 1:>6d}  {elem1:<3s}-{elem2:>3s}  {distance:<8.4f} Å"
+                )
+        self.refresh_bond_selection()
 
     def _add_selection_shells(self, positions, elements, indices):
         """Add ordinary-selection wireframes without rebuilding base geometry.
@@ -773,7 +882,12 @@ class StructureViewer(QtInteractor):
         """
         if len(self.lattices) == 0:
             return
-        vector = np.asarray(self.lattices[self.current_index][direction], dtype=float)
+        # A lattice row obtained through np.asarray is a writable view. Its
+        # in-place normalization used to shrink the authoritative cell itself.
+        # Detach it before computing the camera direction.
+        vector = np.array(
+            self.lattices[self.current_index][direction], dtype=float, copy=True
+        )
         norm = float(np.linalg.norm(vector))
         if norm == 0:
             return
@@ -799,6 +913,22 @@ class StructureViewer(QtInteractor):
         self.reset_camera_clipping_range()
         self.render()
 
+    def set_perspective_enabled(self, enabled):
+        """Enable perspective projection or switch to an orthographic view.
+
+        Args:
+            enabled: Whether near objects should appear larger than distant ones.
+
+        Return:
+            None. The active camera projection is updated immediately.
+        """
+        self.perspective_enabled = bool(enabled)
+        self.camera.SetParallelProjection(not self.perspective_enabled)
+        self._capture_zoom_reference()
+        self.zoom_percent = 100
+        self.reset_camera_clipping_range()
+        self.render()
+
     def reset_view(self):
         """Restore an isometric fitted view of the current scene.
 
@@ -817,10 +947,18 @@ class StructureViewer(QtInteractor):
         self.render()
 
     def _capture_zoom_reference(self):
-        """Capture the current camera distance as the 100 percent zoom reference."""
+        """Capture perspective and orthographic scales at 100 percent zoom.
+
+        Args:
+            None.
+
+        Return:
+            None. Later zoom changes use the active camera projection's scale.
+        """
         position = np.asarray(self.camera.position, dtype=float)
         focal_point = np.asarray(self.camera.focal_point, dtype=float)
         self._zoom_base_distance = float(np.linalg.norm(position - focal_point))
+        self._zoom_base_parallel_scale = float(self.camera.parallel_scale)
 
     def set_zoom_percent(self, percent):
         """Set camera zoom relative to the current 100 percent reference.
@@ -834,6 +972,12 @@ class StructureViewer(QtInteractor):
         if self._zoom_base_distance is None:
             self._capture_zoom_reference()
         self.zoom_percent = int(np.clip(float(percent), 10.0, 1000.0))
+        # Orthographic magnification depends on parallel_scale, not distance.
+        if self.camera.GetParallelProjection():
+            self.camera.parallel_scale = self._zoom_base_parallel_scale * 100.0 / self.zoom_percent
+            self.reset_camera_clipping_range()
+            self.render()
+            return
         focal_point = np.asarray(self.camera.focal_point, dtype=float)
         position = np.asarray(self.camera.position, dtype=float)
         direction = position - focal_point
@@ -880,6 +1024,8 @@ class StructureViewer(QtInteractor):
             None. The current scene is redrawn.
         """
         self.bonds_enabled = bool(enabled)
+        if not self.bonds_enabled:
+            self.selected_bonds.clear()
         if frame_indices is not None:
             self.bond_frame_indices = {int(index) for index in frame_indices}
         self.refresh_bonds()
@@ -954,6 +1100,7 @@ class StructureViewer(QtInteractor):
         metallic=None,
         axes=None,
         grid=None,
+        atom_scale=None,
     ):
         """Apply element and global appearance settings in one redraw.
 
@@ -974,6 +1121,7 @@ class StructureViewer(QtInteractor):
             metallic: PBR metallic coefficient.
             axes: Whether orientation axes are visible.
             grid: Whether the coordinate grid is visible.
+            atom_scale: Dimensionless display scale for covalent/vdW spheres.
 
         Return:
             None. All appearance settings are validated and rendered together.
@@ -996,6 +1144,8 @@ class StructureViewer(QtInteractor):
             self.default_atom_style = atom_style
         if custom_radius is not None:
             self.default_custom_radius = max(0.01, float(custom_radius))
+        if atom_scale is not None:
+            self.default_atom_scale = max(0.01, float(atom_scale))
         if background is not None:
             self._background_color_value = self._normalize_color(background)
             self.set_background(self._background_color_value)
@@ -1019,15 +1169,21 @@ class StructureViewer(QtInteractor):
         """Enter or leave the two-atom or three-atom measurement selector.
 
         Args:
-            mode: ``"length"``, ``"angle"``, or ``None``.
+            mode: ``"length"``, ``"angle"``, ``"bond"``, or ``None``.
 
         Return:
             None. A new mode clears any incomplete temporary selection.
         """
-        if mode not in {None, "length", "angle"}:
+        if mode not in {None, "length", "angle", "bond"}:
             raise ValueError(f"unsupported measurement mode: {mode}")
         self.measurement_mode = mode
         self.measurement_selection = []
+        if mode is not None:
+            if self.add_mode:
+                self.cancel_atom_addition()
+            self.selected_indices = np.empty(0, dtype=int)
+            self.selected_bonds.clear()
+            self.selectionChanged.emit(self.selected_indices.copy())
         self.measurementModeChanged.emit(mode)
 
     def set_background_color(self, color):
@@ -1187,6 +1343,11 @@ class StructureViewer(QtInteractor):
             self.elements[self.current_index], dtype=str
         ).copy()
         self.selected_indices = np.empty(0, dtype=int)
+        self.selected_bonds.clear()
+        self.refresh_bond_selection(render=False)
+        self.set_measurement_mode(None)
+        if self.add_mode:
+            self.cancel_atom_addition()
         self.selectionChanged.emit(self.selected_indices.copy())
         for actor in self.measurement_actors + self.selection_shell_actors:
             actor.SetVisibility(False)
@@ -1479,13 +1640,15 @@ class StructureViewer(QtInteractor):
             None. No retained structure arrays are changed.
         """
         self.cancel_atom_addition()
+        self.set_measurement_mode(None)
+        self._update_selection(np.empty(0, dtype=int), additive=False)
         self.add_mode = True
         self.add_symbol = str(symbol)
         self.setFocus(Qt.FocusReason.OtherFocusReason)
         self._log_add_status("Add mode: click a reference atom, then place atoms; Enter commits, Escape cancels.")
 
     def _log_add_status(self, message):
-        """Send a temporary atom-addition message to the configured error sink.
+        """Send an interaction message or selected-bond row to the GUI console.
 
         Args:
             message: Human-readable interaction status.
@@ -1526,6 +1689,7 @@ class StructureViewer(QtInteractor):
         self.add_symbol = None
         self.add_reference_position = None
         self.add_reference_symbol = None
+        self.add_reference_index = None
         self.add_pending_elements = []
         self.add_pending_positions = []
         self._add_preview_position = None
@@ -1546,6 +1710,7 @@ class StructureViewer(QtInteractor):
         frame_index = int(self.current_index)
         symbols = np.asarray(self.add_pending_elements, dtype="<U3")
         positions = np.asarray(self.add_pending_positions, dtype=float)
+        reference_index = self.add_reference_index
         self._remove_add_actors()
         self.add_mode = False
         self.add_symbol = None
@@ -1554,7 +1719,8 @@ class StructureViewer(QtInteractor):
         self.add_pending_elements = []
         self.add_pending_positions = []
         self._add_preview_position = None
-        self.atomsAdded.emit(frame_index, symbols, positions)
+        self.add_reference_index = None
+        self.atomsAdded.emit(frame_index, symbols, positions, reference_index)
 
     def _add_preview_actor(self, position, fixed=False):
         """Create one temporary sphere actor for an atom preview.
@@ -1628,6 +1794,7 @@ class StructureViewer(QtInteractor):
             picked = self._pick_atom(point)
             if len(picked) == 0:
                 return
+            self.add_reference_index = int(picked[0])
             self.add_reference_position = np.array(
                 self.coordinates[self.current_index][int(picked[0])], copy=True
             )
@@ -1651,7 +1818,7 @@ class StructureViewer(QtInteractor):
         self._update_add_preview(point)
 
     def keyPressEvent(self, event):
-        """Handle deletion and Enter/Escape controls for temporary modes.
+        """Handle structure editing, frame navigation, and temporary modes.
 
         Args:
             event: Qt keyboard event.
@@ -1659,6 +1826,55 @@ class StructureViewer(QtInteractor):
         Returns:
             None. The event is consumed for supported structure operations.
         """
+        arrow_keys = {
+            Qt.Key.Key_Left: -1,
+            Qt.Key.Key_Right: 1,
+            Qt.Key.Key_Down: -2,
+            Qt.Key.Key_Up: 2,
+        }
+        if (
+            event.key() in arrow_keys
+            and bool(event.modifiers() & Qt.KeyboardModifier.ShiftModifier)
+            and not self.add_mode
+            and not self.playback_active
+        ):
+            if not (0 <= self.current_index < len(self.coordinates)):
+                event.accept()
+                return
+            coordinates = self.coordinates[self.current_index]
+            valid_selection = (
+                len(self.selected_indices) > 0
+                and bool(np.all(self.selected_indices >= 0))
+                and bool(np.all(self.selected_indices < len(coordinates)))
+            )
+            if not valid_selection:
+                event.accept()
+                return
+            right, up, _ = self._camera_basis()
+            direction = right if abs(arrow_keys[event.key()]) == 1 else up
+            direction = direction * np.sign(arrow_keys[event.key()])
+            before_coordinates = np.array(coordinates, copy=True)
+            translate_selected(
+                coordinates,
+                self.selected_indices,
+                direction * float(self.keyboard_translation_step),
+            )
+            self.coordinatesEdited.emit(
+                int(self.current_index),
+                before_coordinates,
+                np.array(coordinates, copy=True),
+            )
+            event.accept()
+            return
+        if (
+            event.key() in (Qt.Key.Key_Up, Qt.Key.Key_Down)
+            and event.modifiers() == Qt.KeyboardModifier.NoModifier
+            and not self.add_mode
+            and not self.playback_active
+        ):
+            self.frameStepRequested.emit(-1 if event.key() == Qt.Key.Key_Up else 1)
+            event.accept()
+            return
         if event.key() == Qt.Key.Key_Escape and self.add_mode:
             self.cancel_atom_addition()
             event.accept()
@@ -1673,7 +1889,9 @@ class StructureViewer(QtInteractor):
             event.accept()
             return
         if event.key() == Qt.Key.Key_Delete and not self.add_mode:
-            if len(self.selected_indices) > 0:
+            if self.selected_bonds:
+                self.bondsDeleted.emit(int(self.current_index), sorted(self.selected_bonds))
+            elif len(self.selected_indices) > 0:
                 self.deleteRequested.emit(int(self.current_index), self.selected_indices.copy())
             event.accept()
             return
@@ -1810,6 +2028,10 @@ class StructureViewer(QtInteractor):
             super().mouseMoveEvent(event)
             return
         if np.linalg.norm(current - self.press_position) > 4:
+            if not self.dragged and self.drag_mode == "select" and self.measurement_mode is None:
+                # A box gesture starts a fresh atom selection, even with Ctrl.
+                self.selected_bonds.clear()
+                self._update_selection(np.empty(0, dtype=int), additive=False)
             self.dragged = True
         has_atom_drag_state = (
             self.drag_start_mouse is not None
@@ -1907,9 +2129,13 @@ class StructureViewer(QtInteractor):
                             atom_index = int(picked[0])
                             if atom_index not in self.measurement_selection:
                                 self.measurement_selection.append(atom_index)
-                            expected_count = 2 if self.measurement_mode == "length" else 3
+                            expected_count = 3 if self.measurement_mode == "angle" else 2
                             if len(self.measurement_selection) == expected_count:
-                                if self.measurement_mode == "length":
+                                if self.measurement_mode == "bond":
+                                    left, right = self.measurement_selection
+                                    self.set_measurement_mode(None)
+                                    self.bondAdded.emit(int(self.current_index), left, right)
+                                elif self.measurement_mode == "length":
                                     key = frozenset(self.measurement_selection)
                                     if len(key) == 2:
                                         if key in self.length_measurements:
@@ -1954,9 +2180,25 @@ class StructureViewer(QtInteractor):
                         & (screen[:, 1] >= min(self.press_position[1], finish[1]))
                         & (screen[:, 1] <= max(self.press_position[1], finish[1]))
                     )
-                    self._update_selection(np.flatnonzero(inside), additive)
+                    self._update_selection(np.flatnonzero(inside), additive=False)
                 else:
-                    self._update_selection(self._pick_atom(finish), additive)
+                    picked_atom = self._pick_atom(finish)
+                    picked_bond = self._pick_bond(finish)
+                    # Section: The first selection locks its kind. Clicking the
+                    # other kind is ignored; only actual blank space unlocks it.
+                    if self.selected_bonds:
+                        if len(picked_atom):
+                            pass
+                        elif picked_bond is not None:
+                            self._update_bond_selection(picked_bond, additive)
+                        elif not len(picked_atom):
+                            self._update_selection(np.empty(0, dtype=int), additive=False)
+                    elif len(picked_atom):
+                        self._update_selection(picked_atom, additive)
+                    elif not len(self.selected_indices) and picked_bond is not None:
+                        self._update_bond_selection(picked_bond, additive)
+                    elif picked_bond is None:
+                        self._update_selection(np.empty(0, dtype=int), additive=False)
             elif self.drag_mode == "rotate_view":
                 camera_event = self._camera_mouse_event(
                     event,
@@ -2054,6 +2296,8 @@ class StructureViewer(QtInteractor):
         Return:
             None. Selection state is changed without wrapping structure data.
         """
+        self.selected_bonds.clear()
+        self.refresh_bond_selection(render=False)
         if additive:
             selected = set(self.selected_indices.tolist())
             for index in picked.tolist():

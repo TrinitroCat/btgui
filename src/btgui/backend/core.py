@@ -1,8 +1,16 @@
 """Small array-oriented operations used by the graphical interface."""
 
+from collections.abc import Callable
+
 import numpy as np
 
 from btgui.data.appearance import ELEMENT_COLORS, covalent_radius
+
+
+StructureUpdater = Callable[
+    ...,
+    tuple[list[np.ndarray], list[np.ndarray], list[np.ndarray]],
+]
 
 
 def distance_between(coordinates: np.ndarray, first: int, second: int) -> float:
@@ -105,6 +113,29 @@ def parse_frame_scope(
     return parse_frame_selection(text, frame_count)
 
 
+def normalize_bond_adjacency(adjacency):
+    """Canonicalize an unweighted undirected COO graph.
+
+    Args:
+        adjacency: Integer ``(2, E)`` endpoint array, or ``None`` for no graph.
+
+    Return:
+        An independent int64 array with ``src < dst``, no duplicate edges,
+        and lexicographically sorted columns. Self edges are discarded.
+    """
+    if adjacency is None:
+        return np.empty((2, 0), dtype=np.int64)
+    edges = np.asarray(adjacency, dtype=np.int64)
+    if edges.ndim != 2 or edges.shape[0] != 2:
+        raise ValueError("bond COO must have shape (2, E)")
+    if np.any(edges < 0):
+        raise ValueError("bond endpoints must be nonnegative")
+    # Section: One undirected edge has exactly one stored orientation.
+    edges = np.sort(edges, axis=0)
+    edges = edges[:, edges[0] != edges[1]]
+    return np.unique(edges.T, axis=0).T.copy()
+
+
 def build_bond_adjacency(
     coordinates: np.ndarray,
     elements: np.ndarray | list,
@@ -133,21 +164,20 @@ def build_bond_adjacency(
     if not np.isfinite(tolerance) or tolerance < 0.0:
         raise ValueError("bond tolerance must be a finite nonnegative number")
     radii = np.asarray([covalent_radius(symbol) for symbol in symbols], dtype=float)
-    left_parts = []
-    right_parts = []
-    for left in range(max(len(positions) - 1, 0)):
-        vectors = positions[left + 1:] - positions[left]
-        distances_squared = np.einsum("ij,ij->i", vectors, vectors)
-        cutoffs = (radii[left] + radii[left + 1:]) * tolerance
-        matches = np.flatnonzero(
-            (distances_squared > 0.0) & (distances_squared <= cutoffs * cutoffs)
-        )
-        if len(matches):
-            left_parts.append(np.full(len(matches), left, dtype=np.int64))
-            right_parts.append((matches + left + 1).astype(np.int64, copy=False))
-    if not left_parts:
-        return np.empty((2, 0), dtype=np.int64)
-    return np.vstack((np.concatenate(left_parts), np.concatenate(right_parts)))
+    # Section: Recompute the complete pair-distance matrix on every check.
+    # Accumulating Cartesian components avoids an additional (N, N, 3) array
+    # and avoids cancellation of short distances at large absolute positions.
+    count = len(positions)
+    distances_squared = np.zeros((count, count), dtype=float)
+    for axis in range(3):
+        component = positions[:, axis, None] - positions[None, :, axis]
+        np.square(component, out=component)
+        distances_squared += component
+    cutoffs_squared = (radii[:, None] + radii[None, :]) * tolerance
+    np.square(cutoffs_squared, out=cutoffs_squared)
+    matches = (distances_squared > 0.0) & (distances_squared <= cutoffs_squared)
+    # np.nonzero traverses rows first: the upper triangle is already ij-sorted.
+    return np.asarray(np.nonzero(np.triu(matches, k=1)), dtype=np.int64)
 
 
 def wrap_coordinates(coordinates: np.ndarray, lattice: np.ndarray) -> np.ndarray:
@@ -207,6 +237,73 @@ def validate_data(
             raise ValueError(f"lattices[{frame}] must have shape (3, 3)")
         if not np.isfinite(frame_coordinates).all() or not np.isfinite(lattice).all():
             raise ValueError(f"frame {frame} contains non-finite coordinates or lattice values")
+
+
+def apply_structure_updater(
+    updater: StructureUpdater,
+    cell: list[np.ndarray],
+    elem: list[np.ndarray],
+    coo: list[np.ndarray],
+    *args,
+    **kwargs,
+) -> tuple[list[np.ndarray], list[np.ndarray], list[np.ndarray]]:
+    """Run a standard structure updater and validate its returned lists.
+
+    The updater protocol is ``f(cell, elem, coo) -> (new_cell, new_elem,
+    new_coo)``. Inputs are detached before the callback is invoked, so a
+    failed or partially mutating updater cannot corrupt the GUI's data. The
+    returned lists must contain NumPy arrays with the same dtypes as their
+    corresponding inputs and the normal btgui frame shapes.
+
+    Args:
+        updater: Plugin callback implementing the structure updater protocol.
+        cell: Selected lattice matrices.
+        elem: Selected element arrays.
+        coo: Selected Cartesian coordinate arrays.
+        *args: Extra positional arguments forwarded after the structure lists.
+        **kwargs: Extra keyword arguments forwarded to the plugin.
+
+    Return:
+        Validated ``(new_cell, new_elem, new_coo)`` lists.
+    """
+    if not callable(updater):
+        raise TypeError("updater must be callable")
+    for name, values in (("cell", cell), ("elem", elem), ("coo", coo)):
+        if not isinstance(values, list) or any(not isinstance(value, np.ndarray) for value in values):
+            raise TypeError(f"{name} must be a List[np.ndarray]")
+    validate_data(elem, coo, cell)
+    source = {
+        "cell": [np.array(value, copy=True) for value in cell],
+        "elem": [np.array(value, copy=True) for value in elem],
+        "coo": [np.array(value, copy=True) for value in coo],
+    }
+    result = updater(source["cell"], source["elem"], source["coo"], *args, **kwargs)
+    if not isinstance(result, tuple) or len(result) != 3:
+        raise TypeError("updater must return a (new_cell, new_elem, new_coo) tuple")
+    new_cell, new_elem, new_coo = result
+    for name, values in (("cell", new_cell), ("elem", new_elem), ("coo", new_coo)):
+        if not isinstance(values, list):
+            raise TypeError(f"updater {name} must be a List[np.ndarray]")
+    validate_data(new_elem, new_coo, new_cell)
+    for name, returned in (("cell", new_cell), ("elem", new_elem), ("coo", new_coo)):
+        if any(not isinstance(value, np.ndarray) for value in returned):
+            raise TypeError(f"updater {name} must contain only np.ndarray objects")
+        expected_dtypes = [
+            source[name][index].dtype
+            for index in range(min(len(returned), len(source[name])))
+        ]
+        if not expected_dtypes and source[name]:
+            expected_dtypes = [source[name][0].dtype] * len(returned)
+        if returned and not expected_dtypes:
+            raise ValueError(f"updater cannot add {name} frames when the input is empty")
+        for index, value in enumerate(returned):
+            expected_dtype = expected_dtypes[index] if index < len(expected_dtypes) else expected_dtypes[0]
+            if value.dtype != expected_dtype:
+                raise TypeError(
+                    f"updater must preserve dtype for {name}[{index}] "
+                    f"({expected_dtype} expected)"
+                )
+    return new_cell, new_elem, new_coo
 
 
 def translate_selected(
