@@ -1,6 +1,9 @@
 # btgui
+btgui: BUCToolkit Graphical User Interface.
 
 An interactive PySide6 and PyVista viewer for molecular and crystal structures.
+It can be viewed as a graphic frontend of [BUCToolkit](https://github.com/TrinitroCat/BUCToolkit), 
+but also an independent software that must not require the BUCToolkit package. BUCToolkit or any other calculator/structure updater are applied by registering as plugins. (See [this section](#custom-structure-updaters))
 
 ## Input API
 
@@ -13,51 +16,6 @@ lattices[i]     # shape (3, 3), lattice vectors as rows
 ```
 
 The lists are retained directly and coordinate editing changes `coordinates[i]` in place. Use `MainWindow.set_data(elements, coordinates, lattices)` when embedding the viewer. The standalone GUI includes serial NumPy/Python readers and writers, so normal structure I/O has no BUCToolkit, PyTorch, or joblib dependency. An application can still supply `open_handler(path)` and `save_handler(path, elements, coordinates, lattices)` callbacks to connect another I/O implementation.
-
-External structure updaters use one stable protocol. Configure independent path
-and function-name lists in `settings.json`; paths may be absolute or relative
-to that configuration file. The lists need not have equal lengths: one module
-can provide multiple functions. Legacy single-string values remain supported:
-
-```python
-def update(cell, elem, coo, *args, **kwargs):
-    # return (new_cell, new_elem, new_coo), all List[np.ndarray]
-    return cell, elem, coo
-```
-
-```json
-{
-  "updater_path": ["updaters/my_optimizer.py"],
-  "updater_function": ["relax_atoms", "relax_cell"]
-}
-```
-
-btgui loads all configured modules first (each path once), then looks up each
-requested function name across those modules. Functions are grouped by their
-defining module using their `__module__` metadata. Reexports of the same function
-are deduplicated; distinct functions with the same name in different modules
-are all listed. The toolbar
-`Update` button is always available as a menu containing every successfully
-loaded function, `More...`, and `Help`. Selecting a function opens the existing
-one-based frame-scope prompt, including `all`. `More...` groups functions under
-their source files and provides Apply, built-in Python Help, Dry Run, Refresh,
-and literal `args`/`kwargs` inputs. Dry Run executes and validates the selected
-function without changing frames; plugin output, warnings, and tracebacks are
-written to the GUI console. Refresh rereads `settings.json`. The console also
-accepts `update` or `update 1,2-5` and uses the first loaded function.
-
-The callback receives cloned arrays in `(cell, elem, coo)` order, so in-place
-changes inside the updater cannot alter existing frames. Its result may contain
-any number of frames or atoms; each returned frame must still have matching
-elements and coordinates, valid cell shape, finite values, and compatible NumPy
-dtypes. All returned frames are appended to the existing data and the operation
-is undoable. Embedding applications may still call `window.set_updater(fn)` or
-`window.apply_updater(fn)` directly.
-
-For a Nuitka standalone build (including onefile), place an editable
-`settings.json` beside the executable; it takes precedence over the packaged
-defaults. `BTGUI_CONFIG_FILE` can be used to point to another configuration
-file.
 
 BUCToolkit remains an optional runtime backend only for the CLI `to_bt()` conversion. Add one or more site-package directories (or a directory containing the `BUCToolkit` package) to `buctoolkit_paths` in `src/btgui/settings.json`; these paths are tried first. `BTGUI_BUCTOOLKIT_PATH` or `BTGUI_BUCTOOLKIT_PATHS` may be used for machine-specific startup configuration, followed by the current Python environment. If no installation can be loaded, structure viewing and file I/O remain available and `to_bt()` reports that the optional backend is absent.
 
@@ -213,3 +171,50 @@ available at runtime, `to_bt()` returns a copied `BatchStructures` object;
 ### Supercell transformations
 
 The **Supercell** toolbar action transforms the current frame only. The three axis multipliers are combined with the editable integer matrix as `M @ diag(a, b, c)`; the transformed arrays replace that frame, so **Save As** writes the resulting current structure. Multipliers must be positive and the integer matrix must be non-singular.
+
+## Custom structure updaters
+
+External structure updaters use one stable protocol. Configure independent path
+and function-name lists in `settings.json`; paths may be absolute or relative
+to that configuration file. The lists need not have equal lengths: one module
+can provide multiple functions. Legacy single-string values remain supported:
+
+```python
+def update(cell, elem, coo, *args, **kwargs):
+    # return (new_cell, new_elem, new_coo), all List[np.ndarray]
+    return cell, elem, coo
+```
+
+```json
+{
+  "updater_path": ["updaters/my_optimizer.py"],
+  "updater_function": ["relax_atoms", "relax_cell"]
+}
+```
+
+btgui loads all configured modules first (each path once), then looks up each
+requested function name across those modules. Functions are grouped by their
+defining module using their `__module__` metadata. Reexports of the same function
+are deduplicated; distinct functions with the same name in different modules
+are all listed. The toolbar
+`Update` button is always available as a menu containing every successfully
+loaded function, `More...`, and `Help`. Selecting a function opens the existing
+one-based frame-scope prompt, including `all`. `More...` groups functions under
+their source files and provides Apply, built-in Python Help, Dry Run, Refresh,
+and literal `args`/`kwargs` inputs. Dry Run executes and validates the selected
+function without changing frames; plugin output, warnings, and tracebacks are
+written to the GUI console. Refresh rereads `settings.json`. The console also
+accepts `update` or `update 1,2-5` and uses the first loaded function.
+
+The callback receives cloned arrays in `(cell, elem, coo)` order, so in-place
+changes inside the updater cannot alter existing frames. Its result may contain
+any number of frames or atoms; each returned frame must still have matching
+elements and coordinates, valid cell shape, finite values, and compatible NumPy
+dtypes. All returned frames are appended to the existing data and the operation
+is undoable. Embedding applications may still call `window.set_updater(fn)` or
+`window.apply_updater(fn)` directly.
+
+For a Nuitka standalone build (including onefile), place an editable
+`settings.json` beside the executable; it takes precedence over the packaged
+defaults. `BTGUI_CONFIG_FILE` can be used to point to another configuration
+file.
