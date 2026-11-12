@@ -121,12 +121,16 @@ opens a frame sidebar for navigation, multi-selection, duplication, deletion, re
 undoable drag reordering. Single-clicking a frame switches the focused viewer;
 double-clicking or choosing Open creates a new shared-data viewer window. Frame
 names remain attached to their data while reordering, and copies use an `_copy`
-suffix. File > New adds an empty or populated frame. Appearance contains an atom
-selector plus per-element settings. An empty selector applies color, opacity,
-display radius, material, lighting, PBR, and atom-boundary settings to all atoms;
-element symbols and one-based atom numbers/ranges limit those settings to matching
-atoms in the current frame. Background, axes, grid, and bond settings remain
-scene-wide.
+suffix. File > New adds an empty or populated frame. Appearance contains atom and
+frame selectors plus per-element settings. An empty atom selector applies color,
+opacity, display radius, material, lighting, PBR, and atom-boundary settings to
+all atoms; element symbols and one-based atom numbers/ranges limit those settings
+to matching atoms in the listed frames. The frame selector defaults to the
+current frame, and also accepts `all` or inclusive ranges such as `1,2-5`; invalid
+or out-of-range input is rejected with a warning and changes nothing. Renderer-wide
+defaults and scene settings ignore the frame selector, and a listed frame that
+lacks a selected index keeps its own atoms. Background, axes, grid, and bond
+settings remain scene-wide.
 
 Enter `help` in the bottom command line for available commands. Property overlays can be added with `MainWindow.register_property_renderer(name, callback)`; the callback receives `(plotter, frame_index, positions)`.
 

@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Added a frame selector to Appearance so selected-atom overrides can target the
+  current frame, `all`, or inclusive ranges; invalid or out-of-range input is
+  rejected before any edit, and a listed frame without that atom index keeps its
+  own atoms.
 - Added built-in serial POSCAR, CIF, XYZ, EXTXYZ, and complete OUTCAR I/O using
   the GUI's raw lists, removing BUCToolkit, PyTorch, and joblib from normal file
   operations while retaining optional BUCToolkit conversion through `to_bt()`.

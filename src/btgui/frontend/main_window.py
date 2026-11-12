@@ -96,11 +96,25 @@ DEFAULT_SETTINGS = {
 class AppearanceDialog(QDialog):
     """Edit per-element atom styles and global bond appearance."""
 
-    def __init__(self, viewer, elements, selected_indices=None, parent=None):
+    def __init__(
+        self,
+        viewer,
+        elements,
+        selected_indices=None,
+        parent=None,
+        current_frame=None,
+        frame_count=None,
+    ):
         super().__init__(parent)
         self.viewer = viewer
+        self.frame_count = (
+            len(viewer.coordinates) if frame_count is None else int(frame_count)
+        )
+        self.current_frame = (
+            int(viewer.current_index) if current_frame is None else int(current_frame)
+        )
         self.setWindowTitle("Appearance")
-        self.resize(520, 430)
+        self.resize(560, 470)
         self.styles = {key: dict(value) for key, value in viewer.atom_styles.items()}
         self.elements = list(dict.fromkeys(np.asarray(elements, dtype=str).tolist()))
         self.frame_elements = np.asarray(elements, dtype=str)
@@ -120,6 +134,11 @@ class AppearanceDialog(QDialog):
                 self.frame_elements,
             )
         )
+        self.frames_edit = QLineEdit(self)
+        self.frames_edit.setText(str(self.current_frame + 1))
+        self.frames_edit.setPlaceholderText("empty=current, all, 1,2-5")
+        self.selector_edit.textChanged.connect(self._update_frame_control)
+        self._update_frame_control()
         self.list_widget = QListWidget(self)
         self.list_widget.addItems(self.elements)
         self.opacity_spin = QDoubleSpinBox(self)
@@ -205,6 +224,7 @@ class AppearanceDialog(QDialog):
         self.background_button.clicked.connect(self._choose_background_color)
         form = QFormLayout()
         form.addRow("Atoms", self.selector_edit)
+        form.addRow("Frames", self.frames_edit)
         form.addRow("Atom color", self.color_button)
         form.addRow("Atom opacity", self.opacity_spin)
         form.addRow("Atom display", self.global_style_combo)
@@ -260,6 +280,26 @@ class AppearanceDialog(QDialog):
             self._custom_radius if mode == "custom" else self._atom_scale
         )
         self.global_radius_spin.setEnabled(mode != "point")
+
+    def _update_frame_control(self):
+        """Scope frame selection to explicit atom selections only.
+
+        Args:
+            None.
+
+        Return:
+            None. The field stays visible but is disabled for all atoms, whose
+            renderer-wide defaults are not stored per frame.
+        """
+        scoped = bool(self.selector_edit.text().strip())
+        self.frames_edit.setEnabled(scoped)
+        self.frames_edit.setToolTip(
+            "Frames that receive these atom overrides. Empty means the current "
+            "frame, all means every frame, and 1,2-5 uses inclusive one-based "
+            "ranges."
+            if scoped
+            else "All-atoms and scene settings are renderer-wide; this field is ignored."
+        )
 
     def _load_material_preset(self):
         """Refresh PBR coefficient controls when the material preset changes."""
@@ -355,9 +395,23 @@ class AppearanceDialog(QDialog):
             self.selector_edit.clear()
             QMessageBox.warning(self, "Invalid atom selector", str(error))
             return
+        # Section: Renderer-wide defaults are not frame-scoped, so the frame
+        # field matters only when a concrete atom selection is being styled.
+        global_atoms = not bool(self.selector_edit.text().strip())
+        if global_atoms:
+            frames = [self.current_frame]
+        else:
+            try:
+                frames = parse_frame_scope(
+                    self.frames_edit.text(), self.frame_count, self.current_frame
+                )
+            except ValueError as error:
+                QMessageBox.warning(self, "Invalid frame selector", str(error))
+                return
         self.accepted_values = {
             "indices": indices,
-            "global_atoms": not bool(self.selector_edit.text().strip()),
+            "frames": frames,
+            "global_atoms": global_atoms,
             "styles": deepcopy(self.styles),
             "material": self.material_combo.currentData(),
             "lighting": self.lighting_check.isChecked(),
@@ -3242,6 +3296,8 @@ class MainWindow(QMainWindow):
             self.elements[frame_index],
             self.viewer.selected_indices,
             self,
+            current_frame=frame_index,
+            frame_count=len(self.elements),
         )
         if dialog.exec() != QDialog.DialogCode.Accepted or dialog.accepted_values is None:
             return
@@ -3315,19 +3371,27 @@ class MainWindow(QMainWindow):
                             before_atom_styles[key] = deepcopy(old_style)
                             after_atom_styles[key] = new_style
         else:
-            # Section: a non-empty selector writes only changed fields to its atoms.
-            for atom_index in values["indices"]:
-                symbol = str(self.elements[frame_index][atom_index])
-                old_style = self.atom_frame_styles[frame_index][atom_index]
-                new_style = dict(old_style)
-                new_style.update(changed_style_keys)
-                if symbol in changed_symbols:
-                    new_style["color"] = values["styles"][symbol]["color"]
-                    new_style["alpha"] = float(values["styles"][symbol]["alpha"])
-                if new_style != old_style:
-                    key = (frame_index, atom_index)
-                    before_atom_styles[key] = deepcopy(old_style)
-                    after_atom_styles[key] = new_style
+            # Section: a non-empty selector writes only changed fields to its
+            # atoms in every listed frame. A frame without that index keeps its
+            # own atoms, and element colors follow each frame's own symbol.
+            for target_frame in values["frames"]:
+                if target_frame >= len(self.atom_frame_styles):
+                    continue
+                target_elements = self.elements[target_frame]
+                for atom_index in values["indices"]:
+                    if not 0 <= atom_index < len(target_elements):
+                        continue
+                    symbol = str(target_elements[atom_index])
+                    old_style = self.atom_frame_styles[target_frame][atom_index]
+                    new_style = dict(old_style)
+                    new_style.update(changed_style_keys)
+                    if symbol in changed_symbols and symbol in values["styles"]:
+                        new_style["color"] = values["styles"][symbol]["color"]
+                        new_style["alpha"] = float(values["styles"][symbol]["alpha"])
+                    if new_style != old_style:
+                        key = (target_frame, atom_index)
+                        before_atom_styles[key] = deepcopy(old_style)
+                        after_atom_styles[key] = new_style
 
         if not before_global and not before_atom_styles:
             return
