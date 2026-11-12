@@ -181,6 +181,84 @@ class ClearBondsChange:
                 )
 
 
+@dataclass
+class InplaceUpdaterChange:
+    """Swap a sparse four-field snapshot for one multi-frame updater step.
+
+    Args:
+        description: History label.
+        frame_indices: Frames represented by each aligned snapshot slot.
+        snapshot: ``(cell, elem, coo, bond_graph)``. Each field is either None
+            (unchanged for every frame) or a list aligned with frame_indices,
+            with None slots for unchanged frames. Arrays are detached copies.
+        graph_changed: Mask distinguishing unchanged graph slots from a saved
+            uncomputed graph (both would otherwise be None).
+        topology_frames: Frames whose atom count changed.
+        contexts: Saved supercell bases/transforms and, only for topology
+            changes, saved per-atom styles and measurements.
+
+    Return:
+        A reversible event holding only one saved side, exchanged on Undo/Redo.
+
+    Note:
+        A bare tuple denotes compound history elsewhere. This wrapper keeps
+        the four-field data format distinct from compound event execution.
+    """
+
+    description: str
+    frame_indices: tuple[int, ...]
+    snapshot: tuple
+    graph_changed: tuple[bool, ...]
+    topology_frames: tuple[int, ...]
+    contexts: dict
+
+    def apply(self, window, use_after: bool) -> None:
+        """Exchange saved/current fields; redo never calls the plugin again.
+
+        Args:
+            window: Main window owning frame-aligned structure and graph lists.
+            use_after: History protocol flag; both directions perform a swap.
+
+        Return:
+            None. Only changed arrays and graph states are replaced.
+        """
+        del use_after
+        targets = (
+            window.lattices, window.elements, window.coordinates, window.bond_adjacencies,
+        )
+        for slot, frame in enumerate(self.frame_indices):
+            for field, (target, saved) in enumerate(zip(targets, self.snapshot)):
+                if saved is None or (saved[slot] is None and not (
+                    field == 3 and self.graph_changed[slot]
+                )):
+                    continue
+                # Section: Save only the field being overwritten. Keep GUI list
+                # identities and compatible array allocations, but detach the
+                # inverse snapshot from mutable CLI/viewer references.
+                current, value = target[frame], saved[slot]
+                saved[slot] = None if current is None else np.array(current, copy=True)
+                if value is None:
+                    target[frame] = None
+                elif (
+                    current is not None and current.shape == value.shape
+                    and current.dtype == value.dtype
+                ):
+                    np.copyto(current, value)
+                else:
+                    target[frame] = np.array(value, copy=True)
+        for frame, saved in self.contexts.items():
+            # These objects were detached from live state at commit. Swap their
+            # ownership rather than cloning all base arrays for every undo.
+            for key, target in (
+                ("base", window.supercell_bases),
+                ("transform", window.supercell_transforms),
+                ("styles", window.atom_frame_styles),
+                ("metrics", window.frame_metrics),
+            ):
+                if key in saved:
+                    target[frame], saved[key] = saved[key], target[frame]
+
+
 def _copy_arrays(values: list[np.ndarray]) -> list[np.ndarray]:
     """Copy every array in one frame-ordered list.
 
@@ -361,9 +439,19 @@ class StructureChange:
         source_coordinates = self.after_coordinates if use_after else self.before_coordinates
         source_lattices = self.after_lattices if use_after else self.before_lattices
         if self.frame_indices is None:
-            _restore_arrays(elements, source_elements)
-            _restore_arrays(coordinates, source_coordinates)
-            _restore_arrays(lattices, source_lattices)
+            # Section: Batch snapshots cover the frame prefix that existed when
+            # recorded. Later updater appends are deliberately not undoable:
+            # carry their suffix by reference instead of restoring/deleting it
+            # or retaining it in this old history entry.
+            extent = len(self.before_elements if use_after else self.after_elements)
+            for target, source in (
+                (elements, source_elements), (coordinates, source_coordinates),
+                (lattices, source_lattices),
+            ):
+                prefix = target[:extent]
+                suffix = target[extent:]
+                _restore_arrays(prefix, source)
+                target[:] = prefix + suffix
         else:
             for source_index, frame_index in enumerate(self.frame_indices):
                 if not 0 <= frame_index < len(coordinates):
@@ -450,6 +538,10 @@ class FramePermutationChange:
             None. Array contents are not copied.
         """
         indices = self.permutation if use_after else self.inverse
+        current = window.current_index
+        # Non-history updater appends remain outside this recorded permutation.
+        indices = indices + tuple(range(len(indices), len(window.elements)))
         window._apply_frame_permutation(indices, update_current=False)
         window._apply_frame_list_permutation(indices)
-        window.current_index = self.after_current if use_after else self.before_current
+        if current < len(self.permutation):
+            window.current_index = self.after_current if use_after else self.before_current

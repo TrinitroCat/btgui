@@ -97,8 +97,13 @@ complete pair-distance matrix and fully rebuilds each selected frame's COO graph
 this may restore manually deleted bonds. Show bonds initializes only uncomputed
 graphs and otherwise displays existing connections. Clear bonds explicitly empties
 all graphs and keeps full originals in history. Add/Delete/Check use edge deltas
-in the shared Undo/Redo history. Atom and bond selections are mutually exclusive;
-Delete removes the selected kind. Bond selection prints one-based endpoints,
+in the shared Undo/Redo history. Atom and bond clicks pick the nearest rendered
+sphere/tube surface, with roughly one physical pixel of edge tolerance, so bond
+hit regions follow the displayed width under zoom and either projection.
+Ordinary clicks switch between atom and bond selections, releasing the previous
+kind. Ctrl toggles within the current kind and ignores hits on the other kind.
+Blank clicks clear both kinds; box selection clears the previous selection and
+selects atoms only. Delete removes the selected kind. Bond selection prints one-based endpoints,
 element symbols and Cartesian length in Å. Resize is available
 from the Supercell menu. PBC wrap applies fractional-coordinate wrapping to the
 selected frames and is undoable. The View menu contains lattice-axis views and
@@ -200,19 +205,39 @@ are all listed. The toolbar
 `Update` button is always available as a menu containing every successfully
 loaded function, `More...`, and `Help`. Selecting a function opens the existing
 one-based frame-scope prompt, including `all`. `More...` groups functions under
-their source files and provides Apply, built-in Python Help, Dry Run, Refresh,
-and literal `args`/`kwargs` inputs. Dry Run executes and validates the selected
-function without changing frames; plugin output, warnings, and tracebacks are
+their source files and provides Apply with an `Apply to:` frame selector and
+an `in-place` checkbox, built-in Python Help, Dry Run, Refresh, and literal
+`args`/`kwargs` inputs. The selector defaults to the focused viewer's one-based
+frame number; empty means current, `all` selects all frames, and `1,2-5` uses
+the standard inclusive range syntax. Indices are sorted and deduplicated.
+Dry Run executes and validates the selected function for this same scope and
+mode without changing frames; plugin output, warnings, and tracebacks are
 written to the GUI console. Refresh rereads `settings.json`. The console also
 accepts `update` or `update 1,2-5` and uses the first loaded function.
 
 The callback receives cloned arrays in `(cell, elem, coo)` order, so in-place
-changes inside the updater cannot alter existing frames. Its result may contain
-any number of frames or atoms; each returned frame must still have matching
-elements and coordinates, valid cell shape, finite values, and compatible NumPy
-dtypes. All returned frames are appended to the existing data and the operation
-is undoable. Embedding applications may still call `window.set_updater(fn)` or
-`window.apply_updater(fn)` directly.
+changes inside the updater cannot alter existing frames. Each selected frame
+is passed separately as three singleton lists. In append mode its result may
+contain any number of frames or atoms; results are appended in source-frame,
+then output-frame order, with no Undo/Redo entry or copy of the existing batch.
+Earlier operations remain undoable without removing these appended frames.
+Each returned frame must have matching elements and coordinates, valid cell
+shape, finite values, and compatible NumPy dtypes. All selected calls must pass
+validation before any data is committed; an error identifies its source frame.
+
+Checking `in-place` requires exactly one output frame per input and replaces the
+selected frames with one multi-frame undo step. History stores only changed
+original arrays in `(cell, elem, coo, bond_graph)` order; unchanged fields are
+`None`, and mixed fields use aligned lists with `None` for unchanged frames.
+Undo and Redo exchange saved/current state without calling the plugin again.
+The bond graph is preserved when atom count is unchanged. When the count changes,
+an existing graph (including an explicitly empty one) is rebuilt from the full
+distance matrix, and its original is saved in the graph field. An uncomputed
+graph remains uncomputed. Topology changes reset per-atom styles and metrics;
+Undo restores them and the previous supercell base/transform.
+Embedding applications may call `window.set_updater(fn)` or
+`window.apply_updater(fn)` directly, or use
+`window.apply_updater('1,2-5', in_place=True)` for in-place updates.
 
 For a Nuitka standalone build (including onefile), place an editable
 `settings.json` beside the executable; it takes precedence over the packaged

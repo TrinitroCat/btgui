@@ -73,7 +73,7 @@ from btgui.data.appearance import ELEMENT_COLORS, default_color
 from btgui.frontend.cli import CLI
 from btgui.frontend.changes import (
     AppearanceChange, BondChange, ClearBondsChange, FramePermutationChange,
-    StructureChange,
+    InplaceUpdaterChange, StructureChange,
 )
 from btgui.integrations.updater import load_updater_module
 from btgui.frontend.viewer import StructureViewer
@@ -641,6 +641,10 @@ class UpdaterDialog(QDialog):
         self.dry_run_button = QPushButton("Dry Run", self)
         self.refresh_button = QPushButton("Refresh", self)
         self.close_button = QPushButton("Close", self)
+        self.scope_edit = QLineEdit(self)
+        owner = self.parent()
+        self.scope_edit.setText(str(getattr(owner, "current_index", 0) + 1))
+        self.in_place_check = QCheckBox("in-place", self)
         self.close_button.clicked.connect(self.accept)
 
         right = QWidget(self)
@@ -649,7 +653,13 @@ class UpdaterDialog(QDialog):
         form.addRow("args:", self.args_edit)
         form.addRow("kwargs:", self.kwargs_edit)
         right_layout.addLayout(form)
-        right_layout.addWidget(self.apply_button)
+        apply_row = QHBoxLayout()
+        apply_row.addWidget(self.apply_button)
+        apply_row.addWidget(QLabel("Apply to:", self))
+        self.scope_edit.setPlaceholderText("empty=current, all, 1,2-5")
+        apply_row.addWidget(self.scope_edit, 1)
+        apply_row.addWidget(self.in_place_check)
+        right_layout.addLayout(apply_row)
         right_layout.addWidget(self.help_button)
         right_layout.addWidget(self.dry_run_button)
         right_layout.addWidget(self.refresh_button)
@@ -728,6 +738,8 @@ class UpdaterDialog(QDialog):
         for widget in (
             self.args_edit,
             self.kwargs_edit,
+            self.scope_edit,
+            self.in_place_check,
             self.apply_button,
             self.help_button,
             self.dry_run_button,
@@ -2310,14 +2322,61 @@ class MainWindow(QMainWindow):
         entries = change if isinstance(change, tuple) else (change,)
         for entry in entries if use_after else reversed(entries):
             if isinstance(entry, StructureChange):
+                # Section: An old batch snapshot owns only its recorded prefix.
+                # Preserve later non-history updater appends and their aligned
+                # metadata by reference; no appended arrays enter the queues.
+                suffix = None
+                if entry.frame_indices is None:
+                    extent = len(entry.before_elements if use_after else entry.after_elements)
+                    if len(self.coordinates) > extent:
+                        suffix = {
+                            name: getattr(self, name)[extent:]
+                            for name in ("atom_frame_styles", "frame_metrics", "bond_adjacencies", "frame_names")
+                        }
+                        suffix["bases"] = {frame - extent: value for frame, value in self.supercell_bases.items() if frame >= extent}
+                        suffix["transforms"] = {frame - extent: value for frame, value in self.supercell_transforms.items() if frame >= extent}
+                        suffix["bond_frames"] = [frame - extent for frame in self.bond_frame_indices if frame >= extent]
+                        suffix["current"] = self.current_index - extent if self.current_index >= extent else None
+                        suffix["serial"] = self._frame_name_serial
+                        for name in ("atom_frame_styles", "frame_metrics", "bond_adjacencies", "frame_names"):
+                            del getattr(self, name)[extent:]
                 context = entry.apply(
                     self.elements, self.coordinates, self.lattices, use_after
                 )
-                self._ensure_frame_state()
                 if entry.frame_indices is not None and context is not None:
+                    self._ensure_frame_state()
                     self._restore_supercell_context(entry.frame_indices[0], context)
                 elif entry.frame_indices is None and context is not None:
                     self._restore_all_supercell_context(context)
+                if suffix is not None:
+                    prefix_count = len(entry.after_elements if use_after else entry.before_elements)
+                    # Pad only restored-prefix metadata before attaching the
+                    # suffix, avoiding per-atom allocation for appended frames.
+                    for frame in range(len(self.atom_frame_styles), prefix_count):
+                        self.atom_frame_styles.append([dict() for _ in self.elements[frame]])
+                    while len(self.frame_metrics) < prefix_count:
+                        self.frame_metrics.append({"length": {}, "angle": {}})
+                    while len(self.bond_adjacencies) < prefix_count:
+                        self.bond_adjacencies.append(None)
+                    while len(self.frame_names) < prefix_count:
+                        self._frame_name_serial += 1
+                        self.frame_names.append(f"Frame {self._frame_name_serial}")
+                    for name in ("atom_frame_styles", "frame_metrics", "bond_adjacencies", "frame_names"):
+                        getattr(self, name)[prefix_count:] = suffix[name]
+                    for target, saved in ((self.supercell_bases, suffix["bases"]), (self.supercell_transforms, suffix["transforms"])):
+                        for frame in list(target):
+                            if frame >= prefix_count:
+                                del target[frame]
+                        target.update({prefix_count + offset: value for offset, value in saved.items()})
+                    self.bond_frame_indices = [frame for frame in self.bond_frame_indices if frame < prefix_count]
+                    self.bond_frame_indices.extend(prefix_count + offset for offset in suffix["bond_frames"])
+                    self._frame_name_serial = max(self._frame_name_serial, suffix["serial"])
+                    if suffix["current"] is not None:
+                        self.current_index = prefix_count + suffix["current"]
+                    for record in self.window_manager.records:
+                        if record["frame_index"] >= extent:
+                            record["frame_index"] += prefix_count - extent
+                self._ensure_frame_state()
             else:
                 entry.apply(self, use_after)
 
@@ -2358,18 +2417,23 @@ class MainWindow(QMainWindow):
             # Coordinate/style edits retain selection; only changed node counts
             # or a compound graph edit invalidate the selected endpoint space.
             topology_changed = any(
-                isinstance(entry, StructureChange) and (
+                (isinstance(entry, StructureChange) and (
                     entry.frame_indices is None
                     or any(len(before) != len(after) for before, after in zip(
                         entry.before_elements, entry.after_elements
                     ))
-                )
+                )) or (isinstance(entry, InplaceUpdaterChange) and bool(entry.topology_frames))
                 for entry in entries
             )
             for record in self.window_manager.records:
-                if topology_changed:
+                # In-place multi-frame edits only invalidate selections in views
+                # whose atom-count/index space actually changed.
+                frame_topology_changed = topology_changed
+                if isinstance(change, InplaceUpdaterChange):
+                    frame_topology_changed = record["frame_index"] in change.topology_frames
+                if frame_topology_changed:
                     record["viewer"].selected_indices = np.empty(0, dtype=int)
-                if topology_changed or any(isinstance(entry, BondChange) for entry in entries):
+                if frame_topology_changed or any(isinstance(entry, BondChange) for entry in entries):
                     record["viewer"].selected_bonds.clear()
             if frame_index is None and changed_frames and len(changed_frames) == 1:
                 frame_index = changed_frames[0]
@@ -4153,8 +4217,17 @@ class MainWindow(QMainWindow):
             "    return new_cell, new_elem, new_coo\n\n"
             "Inputs are detached copies. Return three equally sized lists of NumPy "
             "arrays. Shapes must be valid, values finite, and dtypes compatible with "
-            "the input. Apply appends returned frames; Dry Run executes and validates "
-            "without modifying the frame list. args accepts a Python literal value, "
+            "the input. Each selected source frame is passed separately as three "
+            "singleton lists. Apply to uses one-based ranges (1,2-5), all, or empty "
+            "for the focused frame; its default is that frame's one-based number. "
+            "Indices are sorted and deduplicated. Apply appends results in this "
+            "order without an Undo/Redo entry. Check in-place to replace selected "
+            "frames (exactly one output per input), with one sparse undo step. "
+            "Same atom count preserves bonds; changed atom count rebuilds an "
+            "existing graph from the complete distance matrix. Uncomputed graphs "
+            "remain uncomputed. All calls are validated before committing data. "
+            "Dry Run uses the same scope and cardinality rules without changing "
+            "data. args accepts a Python literal value, "
             "tuple, or list; kwargs accepts a dictionary literal."
         )
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close, dialog)
@@ -4173,6 +4246,7 @@ class MainWindow(QMainWindow):
         Return:
             None. The modal dialog operates on the current plugin collection.
         """
+        self._pause_playback()
         dialog = UpdaterDialog(self.updaters, self)
         dialog.apply_button.clicked.connect(
             lambda: self._apply_selected_updater(dialog)
@@ -4224,7 +4298,7 @@ class MainWindow(QMainWindow):
             dialog: Active :class:`UpdaterDialog` instance.
 
         Return:
-            None. A frame-scope prompt precedes the normal append operation.
+            None. The inline scope and in-place controls determine the operation.
         """
         updater = dialog.selected_updater()
         if updater is None:
@@ -4234,7 +4308,10 @@ class MainWindow(QMainWindow):
         except (SyntaxError, TypeError, ValueError) as error:
             self._log(f"Updater argument error: {error}")
             return
-        self._run_updater_dialog(updater, args, kwargs)
+        self._run_updater(
+            updater, dialog.scope_edit.text(), args, kwargs,
+            in_place=dialog.in_place_check.isChecked(),
+        )
 
     def _dry_run_selected_updater(self, dialog):
         """Execute and validate a selected updater without appending frames.
@@ -4250,11 +4327,54 @@ class MainWindow(QMainWindow):
             return
         try:
             args, kwargs = self._updater_arguments_from_dialog(dialog)
-            self._invoke_updater(updater, "", args, kwargs)
-            self._log(f"Dry Run succeeded: {updater['name']} (current frame).")
+            selected, outputs = self._evaluate_updater(
+                updater, dialog.scope_edit.text(), args, kwargs,
+                in_place=dialog.in_place_check.isChecked(),
+            )
+            returned = sum(len(result[0]) for result in outputs)
+            self._log(
+                f"Dry Run succeeded: {updater['name']} "
+                f"({len(selected)} source frame(s), {returned} output frame(s))."
+            )
         except Exception as error:
             self._log(f"Dry Run error [{updater['name']}]: {error}")
             self._log(traceback.format_exc().rstrip())
+
+    def _evaluate_updater(self, updater, specification, args=(), kwargs=None, in_place=False):
+        """Run an updater once per selected frame and detach each result.
+
+        Args:
+            updater: Loaded updater record.
+            specification: Standard one-based frame selector text.
+            args: Extra positional plugin arguments.
+            kwargs: Extra keyword plugin arguments.
+            in_place: Require exactly one returned frame per input frame.
+
+        Return:
+            ``(selected_indices, outputs)`` where each output is a detached
+            ``(cell_list, elem_list, coo_list)`` from one source frame. The
+            standard selector sorts and deduplicates indices before execution.
+        """
+        if not self.coordinates:
+            raise ValueError("no structure data is loaded")
+        selected = parse_frame_scope(
+            specification or "", len(self.coordinates), self.current_index
+        )
+        outputs = []
+        for frame in selected:
+            try:
+                result = self._invoke_updater(updater, str(frame + 1), args, kwargs)
+                if in_place and len(result[0]) != 1:
+                    raise ValueError("in-place update must return exactly one frame")
+                # Detach immediately: a module may reuse the same output buffer
+                # on its next call. Do not mutate GUI state until ALL calls pass.
+                outputs.append(tuple(
+                    [np.array(value, copy=True) for value in values]
+                    for values in result
+                ))
+            except Exception as error:
+                raise RuntimeError(f"source frame {frame + 1}: {error}") from error
+        return selected, outputs
 
     def _show_selected_updater_help(self, dialog):
         """Print Python built-in help for the selected updater function.
@@ -4305,6 +4425,7 @@ class MainWindow(QMainWindow):
         Return:
             None. Accepted input is passed to the normal updater operation.
         """
+        self._pause_playback()
         specification, accepted = QInputDialog.getText(
             self,
             f"Run Updater - {updater['name']}",
@@ -4328,7 +4449,7 @@ class MainWindow(QMainWindow):
             return
         self._run_updater(self.updaters[0], specification, (), {})
 
-    def _run_updater(self, updater, specification=None, args=(), kwargs=None):
+    def _run_updater(self, updater, specification=None, args=(), kwargs=None, in_place=False):
         """Invoke one updater record and report failures in the console.
 
         Args:
@@ -4336,9 +4457,10 @@ class MainWindow(QMainWindow):
             specification: Optional current/all/one-based frame scope.
             args: Extra positional arguments for the plugin.
             kwargs: Extra keyword arguments for the plugin.
+            in_place: Update selected frames instead of appending results.
 
         Return:
-            None. Successful results are appended to the frame collection.
+            None. Successful results are committed in the requested mode.
         """
         try:
             self.apply_updater(
@@ -4347,6 +4469,7 @@ class MainWindow(QMainWindow):
                 args=args,
                 kwargs=kwargs,
                 name=updater["name"],
+                in_place=in_place,
             )
         except Exception as error:
             self._log(f"Updater error [{updater['name']}]: {error}")
@@ -4412,14 +4535,15 @@ class MainWindow(QMainWindow):
         args=(),
         kwargs=None,
         name=None,
+        in_place=False,
     ):
-        """Apply an external updater to a frame scope and append its results.
+        """Run an updater per selected frame, then append or update in place.
 
         ``specification`` uses the one-based inclusive frame syntax accepted by
         :func:`parse_frame_scope`; an empty value selects the current frame and
         ``all`` selects every frame. The callback receives detached lists in
-        ``(cell, elem, coo)`` order and may return any valid frame/atom count.
-        Returned frames are appended after the existing frames.
+        ``(cell, elem, coo)`` order, with one frame in each input list. Append
+        mode accepts any output count; in-place mode requires one per input.
 
         Args:
             specification: Optional current/all/one-based frame scope.
@@ -4427,9 +4551,10 @@ class MainWindow(QMainWindow):
             args: Extra positional arguments forwarded after structure lists.
             kwargs: Extra keyword arguments forwarded to the callback.
             name: Optional display and history name for the callback.
+            in_place: Replace selected frames with one sparse undo event.
 
         Return:
-            Validated ``(new_cell, new_elem, new_coo)`` lists appended to data.
+            Validated output lists, flattened in source-frame/output-frame order.
         """
         if callable(specification) and updater is None:
             updater = specification
@@ -4437,6 +4562,8 @@ class MainWindow(QMainWindow):
         callback = self.updater if updater is None else updater
         if callback is None:
             raise ValueError("no structure updater is configured")
+        if self.timer.isActive():
+            self._pause_playback()
         updater_name = name or getattr(callback, "__name__", "update") or "update"
         record = {
             "path": "<direct>",
@@ -4444,26 +4571,123 @@ class MainWindow(QMainWindow):
             "callback": callback,
             "configured": False,
         }
-        new_cell, new_elem, new_coo = self._invoke_updater(
-            record,
-            specification or "",
-            args,
-            kwargs or {},
+        selected, outputs = self._evaluate_updater(
+            record, specification or "", args, kwargs, in_place=in_place,
         )
-        elements = [np.array(value, copy=True) for value in self.elements]
-        coordinates = [np.array(value, copy=True) for value in self.coordinates]
-        lattices = [np.array(value, copy=True) for value in self.lattices]
-        elements.extend(np.array(value, copy=True) for value in new_elem)
-        coordinates.extend(np.array(value, copy=True) for value in new_coo)
-        lattices.extend(np.array(value, copy=True) for value in new_cell)
-        self._on_cli_data_changed(
-            elements,
-            coordinates,
-            lattices,
-            description=f"Updater: {updater_name}",
-            preserve_existing_context=True,
-        )
-        self._log(f"Updater appended {len(new_coo)} frame(s): {updater_name}.")
+        new_cell = [value for result in outputs for value in result[0]]
+        new_elem = [value for result in outputs for value in result[1]]
+        new_coo = [value for result in outputs for value in result[2]]
+        if in_place:
+            # Section: Stage sparse fields and topology-dependent graphs before
+            # committing anything. One callback failure/rebuild failure leaves
+            # all selected frames and both history queues untouched.
+            self._ensure_frame_state()
+            self._ensure_supercell_state()
+            snapshots = [[], [], [], []]
+            replacements = [[], [], [], []]
+            graph_changed, topology_frames, contexts = [], [], {}
+            new_contexts = {}
+            changed_frames = []
+            for slot, frame in enumerate(selected):
+                old_values = (
+                    self.lattices[frame], self.elements[frame], self.coordinates[frame]
+                )
+                new_values = (new_cell[slot], new_elem[slot], new_coo[slot])
+                frame_changed = False
+                for field, (old, new) in enumerate(zip(old_values, new_values)):
+                    changed = (
+                        old.shape != new.shape or old.dtype != new.dtype
+                        or not np.array_equal(old, new)
+                    )
+                    snapshots[field].append(np.array(old, copy=True) if changed else None)
+                    replacements[field].append(new if changed else None)
+                    frame_changed = frame_changed or changed
+                topology_changed = len(old_values[1]) != len(new_values[1])
+                rebuild = topology_changed and self.bond_adjacencies[frame] is not None
+                graph_changed.append(rebuild)
+                snapshots[3].append(
+                    np.array(self.bond_adjacencies[frame], copy=True) if rebuild else None
+                )
+                try:
+                    replacements[3].append(
+                        build_bond_adjacency(
+                            new_coo[slot], new_elem[slot],
+                            getattr(self.viewer, "bond_tolerance", 1.2),
+                        ) if rebuild else None
+                    )
+                except Exception as error:
+                    raise RuntimeError(f"source frame {frame + 1}, bond rebuild: {error}") from error
+                if frame_changed:
+                    changed_frames.append(frame)
+                    # Saved context objects are moved out of live state on
+                    # commit. No unchanged structure arrays are copied into
+                    # history, including for a cell-only updater.
+                    contexts[frame] = {
+                        "base": self.supercell_bases[frame],
+                        "transform": self.supercell_transforms[frame],
+                    }
+                    # Rebase the updated frame before future supercell edits.
+                    # Base arrays are read-only in this workflow (base edits
+                    # replace the dictionary). Reuse identical components so
+                    # a cell-only update does not duplicate unchanged atoms.
+                    old_base = self.supercell_bases[frame]
+                    new_base = {}
+                    for key, value in zip(("lattice", "elements", "coordinates"), new_values):
+                        previous = old_base[key]
+                        identical = (
+                            previous.shape == value.shape and previous.dtype == value.dtype
+                            and np.array_equal(previous, value)
+                        )
+                        new_base[key] = previous if identical else np.array(value, copy=True)
+                    new_contexts[frame] = {
+                        "base": new_base,
+                        "transform": (np.ones(3, dtype=np.int64), np.eye(3, dtype=np.int64)),
+                    }
+                if topology_changed:
+                    topology_frames.append(frame)
+                    contexts[frame]["styles"] = self.atom_frame_styles[frame]
+                    contexts[frame]["metrics"] = self.frame_metrics[frame]
+                    new_contexts[frame]["styles"] = [dict() for _ in new_elem[slot]]
+                    new_contexts[frame]["metrics"] = {"length": {}, "angle": {}}
+            if changed_frames:
+                # Four-field format: wholly unchanged fields collapse to None;
+                # mixed fields keep aligned None slots, never dummy array copies.
+                snapshot = tuple(
+                    values if any(value is not None for value in values) else None
+                    for values in snapshots
+                )
+                change = InplaceUpdaterChange(
+                    f"Updater in-place: {updater_name}", tuple(selected), snapshot,
+                    tuple(graph_changed), tuple(topology_frames), contexts,
+                )
+                for slot, frame in enumerate(selected):
+                    for field, target in enumerate((
+                        self.lattices, self.elements, self.coordinates, self.bond_adjacencies,
+                    )):
+                        if replacements[field][slot] is not None:
+                            target[frame] = replacements[field][slot]
+                    if frame in new_contexts:
+                        context = new_contexts[frame]
+                        self.supercell_bases[frame] = context["base"]
+                        self.supercell_transforms[frame] = context["transform"]
+                        if "styles" in context:
+                            self.atom_frame_styles[frame] = context["styles"]
+                            self.frame_metrics[frame] = context["metrics"]
+                self._record_change(change, already_applied=True)
+            self._log(f"Updater changed {len(changed_frames)} frame(s) in-place: {updater_name}.")
+        else:
+            # Section: Appended updater frames intentionally have NO history
+            # entry. Copy only new data; never snapshot the existing batch.
+            first_new = len(self.coordinates)
+            for cell, elem, coo in zip(new_cell, new_elem, new_coo):
+                self._append_frame(elem, coo, cell)
+            if new_coo:
+                self.redo_stack.clear()
+                self._refresh_after_change(
+                    changed_frame_indices=tuple(range(first_new, len(self.coordinates)))
+                )
+                self._sync_history_actions()
+            self._log(f"Updater appended {len(new_coo)} frame(s): {updater_name}.")
         return new_cell, new_elem, new_coo
 
     # Explicit alias for embedding code that calls the operation an update.

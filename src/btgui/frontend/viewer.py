@@ -93,6 +93,7 @@ class StructureViewer(QtInteractor):
         self.selected_actors = []
         self.selection_shell_actors = []
         self.bond_actors = []
+        self.atom_actors = []
         self.atom_meshes = []
         self.lattice_actors = []
         self.lattice_mesh = None
@@ -242,6 +243,7 @@ class StructureViewer(QtInteractor):
         self.selected_actors = []
         self.selection_shell_actors = []
         self.bond_actors = []
+        self.atom_actors = []
         self.bond_selection_actors = []
         self.atom_meshes = []
         self.lattice_actors = []
@@ -294,6 +296,13 @@ class StructureViewer(QtInteractor):
                 scale=False,
                 geom=source,
             )
+            # Glyph3D emits one contiguous source-vertex block per input point,
+            # the same ordering used by update_frame_preview's displacements.
+            # Attach IDs after glyphing so scalar color/scale modes cannot
+            # reinterpret them. No per-atom actors or enlarged hit circles.
+            glyphs.point_data["atom_index"] = np.repeat(
+                np.asarray(indices, dtype=np.int64), source.n_points
+            )
             actor = self.add_mesh(
                 glyphs,
                 color=color,
@@ -324,6 +333,7 @@ class StructureViewer(QtInteractor):
             actor_property.SetSpecular(specular)
             actor_property.SetSpecularPower(max(1.0, 128.0 * (1.0 - roughness)))
             self.atom_meshes.append((glyphs, np.asarray(indices, dtype=int), glyphs.points.copy()))
+            self.atom_actors.append(actor)
             if is_selected:
                 self.selected_actors.append(actor)
 
@@ -674,28 +684,40 @@ class StructureViewer(QtInteractor):
         if render:
             self.render()
 
-    def _pick_bond(self, point):
-        """Resolve one visible tube cell to a canonical COO endpoint pair.
+    def _pick_structure(self, point):
+        """Pick the nearest rendered atom sphere or bond tube surface.
 
         Args:
             point: Two-dimensional VTK display coordinates.
 
         Return:
-            A zero-based ``(src, dst)`` tuple, or None for a missed bond.
+            ``(atom_index, bond_pair)`` with at most one non-None value.
+            All indices are zero-based; blank space returns ``(None, None)``.
         """
         picker = vtkCellPicker()
-        picker.SetTolerance(0.005)
+        # Section: Pick actual geometry in one depth-aware pass. Tolerance is
+        # a fraction of the render-window diagonal: one physical pixel beyond
+        # the visible surface, independent of zoom or perspective. Whitelisting
+        # excludes selection shells, lattice lines and metric overlays.
+        width, height = self.ren_win.GetSize()
+        picker.SetTolerance(1.0 / max(1.0, float(np.hypot(width, height))))
         picker.PickFromListOn()
-        for actor in self.bond_actors:
+        for actor in self.atom_actors + self.bond_actors:
             picker.AddPickList(actor)
         if not picker.Pick(float(point[0]), float(point[1]), 0.0, self.renderer):
-            return None
+            return None, None
         cell_id = picker.GetCellId()
         dataset = picker.GetDataSet()
-        endpoints = None if dataset is None else dataset.GetCellData().GetArray("bond_endpoints")
-        if cell_id < 0 or endpoints is None:
-            return None
-        return tuple(sorted(int(value) for value in endpoints.GetTuple(cell_id)))
+        if cell_id < 0 or dataset is None:
+            return None, None
+        atom_indices = dataset.GetPointData().GetArray("atom_index")
+        if atom_indices is not None:
+            point_id = dataset.GetCell(cell_id).GetPointId(0)
+            return int(atom_indices.GetTuple1(point_id)), None
+        endpoints = dataset.GetCellData().GetArray("bond_endpoints")
+        if endpoints is not None:
+            return None, tuple(sorted(int(value) for value in endpoints.GetTuple(cell_id)))
+        return None, None
 
     def _update_bond_selection(self, pair, additive):
         """Select/toggle one bond and report newly selected endpoints.
@@ -707,6 +729,10 @@ class StructureViewer(QtInteractor):
         Return:
             None. Console indices alone are converted to one-based numbering.
         """
+        if len(self.selected_indices):
+            self.selected_indices = np.empty(0, dtype=int)
+            self.refresh_selection_overlay()
+            self.selectionChanged.emit(self.selected_indices.copy())
         if additive and pair in self.selected_bonds:
             self.selected_bonds.remove(pair)
         else:
@@ -2182,22 +2208,17 @@ class StructureViewer(QtInteractor):
                     )
                     self._update_selection(np.flatnonzero(inside), additive=False)
                 else:
-                    picked_atom = self._pick_atom(finish)
-                    picked_bond = self._pick_bond(finish)
-                    # Section: The first selection locks its kind. Clicking the
-                    # other kind is ignored; only actual blank space unlocks it.
-                    if self.selected_bonds:
-                        if len(picked_atom):
-                            pass
-                        elif picked_bond is not None:
+                    picked_atom, picked_bond = self._pick_structure(finish)
+                    # Section: Only Ctrl multiselect locks the current kind.
+                    # An ordinary hit switches kind, while blank space always
+                    # clears both kinds, even with Ctrl held down.
+                    if picked_atom is not None:
+                        if not additive or not self.selected_bonds:
+                            self._update_selection(np.asarray([picked_atom]), additive)
+                    elif picked_bond is not None:
+                        if not additive or not len(self.selected_indices):
                             self._update_bond_selection(picked_bond, additive)
-                        elif not len(picked_atom):
-                            self._update_selection(np.empty(0, dtype=int), additive=False)
-                    elif len(picked_atom):
-                        self._update_selection(picked_atom, additive)
-                    elif not len(self.selected_indices) and picked_bond is not None:
-                        self._update_bond_selection(picked_bond, additive)
-                    elif picked_bond is None:
+                    else:
                         self._update_selection(np.empty(0, dtype=int), additive=False)
             elif self.drag_mode == "rotate_view":
                 camera_event = self._camera_mouse_event(
