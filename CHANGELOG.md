@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Added the built-in `clean` updater and its preset graph, bond-order, and force
+  field modules; the toolbar Clean action relaxes the focused frame in place,
+  honors an atom selection, and reuses the frame's existing bond graph. scipy is
+  now a core dependency.
 - Added a frame selector to Appearance so selected-atom overrides can target the
   current frame, `all`, or inclusive ranges; invalid or out-of-range input is
   rejected before any edit, and a listed frame without that atom index keeps its

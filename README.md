@@ -243,6 +243,26 @@ Embedding applications may call `window.set_updater(fn)` or
 `window.apply_updater(fn)` directly, or use
 `window.apply_updater('1,2-5', in_place=True)` for in-place updates.
 
+### Built-in clean updater
+
+btgui ships a `clean` updater built on `btgui.backend.updater_presets`. It is a
+small valence force field: harmonic bonds whose target lengths come from
+covalent radii and an inferred bond order, cosine-harmonic bond angles whose
+targets follow the coordination geometry (sp, sp2, sp3, trigonal bipyramidal,
+octahedral, pentagonal bipyramidal, cubic), and a weak Lennard-Jones term for
+non-bonded contacts. Bond orders come from the main-group unpaired-electron
+count minus the graph degree, taking `min(order_i, order_j)` per pair. This is a
+coarse model intended for cleanup, not a valence calculation; periodic images
+are not considered.
+
+The updater is registered like any other updater and follows the standard frame
+scope and append semantics. The toolbar **Clean** action runs it in place on the
+focused frame: with a non-empty atom selection only the selected atoms move, and
+the frame's existing bond graph is reused when present. scipy is a core
+dependency and supplies the L-BFGS-B optimizer. Embedding applications can pass
+`fixed`, `bonds`, `maxiter`, `bond_k`, `angle_k`, `lj_epsilon`, `lj_sigma_scale`
+and `lj_cutoff` through `apply_updater`.
+
 For a Nuitka standalone build (including onefile), place an editable
 `settings.json` beside the executable; it takes precedence over the packaged
 defaults. `BTGUI_CONFIG_FILE` can be used to point to another configuration

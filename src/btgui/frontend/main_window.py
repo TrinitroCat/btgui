@@ -69,6 +69,7 @@ from btgui.backend.core import (
     wrap_coordinates,
 )
 from btgui.backend.core import format_atom_selection, parse_atom_selection
+from btgui.backend.updater_presets.clean_structure import clean as clean_structure
 from btgui.data.appearance import ELEMENT_COLORS, default_color
 from btgui.frontend.cli import CLI
 from btgui.frontend.changes import (
@@ -91,6 +92,19 @@ DEFAULT_SETTINGS = {
     "updater_path": [],
     "updater_function": [],
 }
+
+
+def _preset_updater_records():
+    """Return the updater records shipped with btgui."""
+    return [
+        {
+            "path": "<preset>",
+            "name": "clean",
+            "callback": clean_structure,
+            "configured": False,
+            "preset": True,
+        }
+    ]
 
 
 class AppearanceDialog(QDialog):
@@ -1450,6 +1464,12 @@ class MainWindow(QMainWindow):
         self.replace_atom_action.setEnabled(False)
         self.replace_atom_action.triggered.connect(self._show_replace_atom)
         self.toolbar.addAction(self.replace_atom_action)
+        self.clean_action = QAction("Clean", self)
+        self.clean_action.setToolTip(
+            "Relax the focused frame with the preset force field"
+        )
+        self.clean_action.triggered.connect(self._clean_current_frame)
+        self.toolbar.addAction(self.clean_action)
 
         self.bond_menu = QMenu(self)
         self.add_bond_action = self.bond_menu.addAction("Add bond")
@@ -1848,7 +1868,8 @@ class MainWindow(QMainWindow):
             None. Valid plugins are retained while individual failures are reported.
         """
         embedded = [
-            updater for updater in self.updaters if not updater.get("configured", False)
+            updater for updater in self.updaters
+            if not updater.get("configured", False) and not updater.get("preset", False)
         ]
         configured = []
         load_errors = []
@@ -1886,7 +1907,7 @@ class MainWindow(QMainWindow):
                 load_errors.append(
                     f"{function_name}: no callable found in loaded updater modules"
                 )
-        self.updaters = embedded + configured
+        self.updaters = embedded + configured + _preset_updater_records()
         self.updater = self.updaters[0]["callback"] if self.updaters else None
         self.updater_warning = (
             "Updater load warning: " + "; ".join(load_errors)
@@ -3478,6 +3499,51 @@ class MainWindow(QMainWindow):
         )
         self._record_change(change, frame_index=frame_index)
 
+    def _clean_current_frame(self):
+        """Relax the focused frame in place with the preset clean updater.
+
+        Args:
+            None.
+
+        Return:
+            None. Selected atoms stay mobile and unselected atoms are frozen;
+            the current frame's existing bond graph is reused when available.
+        """
+        if not self.coordinates or self.viewer is None:
+            return
+        self._pause_playback()
+        frame_index = int(self.current_index)
+        if not 0 <= frame_index < len(self.coordinates):
+            return
+        selected = np.asarray(self.viewer.selected_indices, dtype=int)
+        selected = selected[
+            (selected >= 0) & (selected < len(self.coordinates[frame_index]))
+        ]
+        fixed = np.zeros_like(self.coordinates[frame_index])
+        if len(selected):
+            fixed[selected] = 1.0
+        else:
+            fixed[:] = 1.0
+        record = next(
+            (
+                updater for updater in self.updaters
+                if updater.get("preset") and updater.get("name") == "clean"
+            ),
+            None,
+        )
+        if record is None:
+            self._log("Clean error: the preset updater is unavailable")
+            return
+        bonds = None
+        if frame_index < len(self.bond_adjacencies):
+            bonds = self.bond_adjacencies[frame_index]
+        self._run_updater(
+            record,
+            str(frame_index + 1),
+            kwargs={"fixed": fixed, "bonds": bonds},
+            in_place=True,
+        )
+
     def _sync_atom_actions(self, indices=None):
         """Enable replacement only when the current frame has a valid selection."""
         if not hasattr(self, "replace_atom_action"):
@@ -4244,6 +4310,7 @@ class MainWindow(QMainWindow):
                 "configured": False,
             },
         )
+        self.updaters.extend(_preset_updater_records())
         self.updater = updater
         self._rebuild_update_menu()
 
