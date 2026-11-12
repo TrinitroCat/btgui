@@ -1,0 +1,21 @@
+# Python build and cache artifacts
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+
+# Local internal notes (kept on disk, never published)
+PLAN.md
+
+# IDE and editor state
+.idea/
+
+# Nuitka build workspace
+.nuitka-build/
+
+# OS metadata
+Thumbs.db
+desktop.ini
+.DS_Store
