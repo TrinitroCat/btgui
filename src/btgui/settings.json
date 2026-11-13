@@ -7,6 +7,12 @@
   "atom_edge_width": 1.0,
   "keyboard_translation_step": 0.1,
   "file_cache_limit_mb": 1024,
+  "file_manager_show_size": false,
+  "file_manager_show_type": false,
+  "file_manager_show_modified": false,
+  "file_manager_folders_first": true,
+  "file_manager_sort_column": 0,
+  "file_manager_sort_order": "asc",
   "buctoolkit_paths": [],
   "updater_path": [],
   "updater_function": []

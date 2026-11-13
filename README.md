@@ -96,7 +96,10 @@ first frame and leaves older windows open.
 The left dock stacks the file manager above the Frames list. The tree follows
 the focused file's directory, supports normal selection and expansion, and its
 context menu provides Open, New Folder, Rename, Delete, Copy Path, and Refresh.
-Renaming or deleting a file that is currently open is blocked.
+By default it shows only the file-name tree with folders sorted before files.
+Settings > File Manager chooses optional Size/Type/Modified columns, folder
+ordering, and the sort column/order. Renaming or deleting a file that is
+currently open is blocked.
 
 Closed files stay cached until the total estimated memory exceeds the configured
 limit. Only files with no display windows are released; if all referenced files
@@ -129,7 +132,9 @@ cycles its order through 1-2-3-1. Hold Ctrl to keep Add bond active for repeated
 bond or atom-pair clicks; Escape cancels. Check bonds computes the
 complete pair-distance matrix and fully rebuilds each selected frame's COO graph;
 this resets that frame's bond orders to single bonds. Show bonds initializes only
-uncomputed graphs and otherwise displays existing connections. Clear bonds
+uncomputed graphs and otherwise displays existing connections. Visibility is a
+per-frame flag: checking Show bonds marks the selected frame scope, and the
+action follows the current frame (and file) as focus changes. Clear bonds
 explicitly empties all graphs and keeps full originals in history. Each frame
 stores a parallel `int8` bond-order array; an order-n bond is drawn as n parallel
 cylinders of radius `bond width / n`, keeping the total diameter unchanged.

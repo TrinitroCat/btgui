@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Show bonds is now a per-frame visibility flag. Its checked state follows the
+  current frame and file, and checking/unchecking only changes the selected
+  frame scope instead of leaving a global renderer switch enabled.
+- The Files tree now defaults to the file-name tree with folders sorted first;
+  Settings > File Manager configures optional Size/Type/Modified columns,
+  folder ordering, and sort column/order.
 - Reworked structure data into per-file workspaces with independent frames,
   playback, Undo/Redo and CLI scope. Windows are unique per `(file, frame)`;
   opening a file creates a new window, while reopening it only focuses its

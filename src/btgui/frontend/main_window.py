@@ -15,7 +15,10 @@ import warnings
 import numpy as np
 
 from ..backend.lattice_transform import transform_structure
-from PySide6.QtCore import QSignalBlocker, QTimer, Qt, Signal, QDir, QFile, QModelIndex
+from PySide6.QtCore import (
+    QSignalBlocker, QTimer, Qt, Signal, QDir, QFile, QModelIndex,
+    QSortFilterProxyModel,
+)
 from PySide6.QtGui import QAction, QColor, QDoubleValidator, QIntValidator
 from PySide6.QtWidgets import (
     QComboBox,
@@ -95,6 +98,12 @@ DEFAULT_SETTINGS = {
     "buctoolkit_paths": [],
     "keyboard_translation_step": 0.1,
     "file_cache_limit_mb": 1024,
+    "file_manager_show_size": False,
+    "file_manager_show_type": False,
+    "file_manager_show_modified": False,
+    "file_manager_folders_first": True,
+    "file_manager_sort_column": 0,
+    "file_manager_sort_order": "asc",
     "updater_path": [],
     "updater_function": [],
 }
@@ -662,6 +671,32 @@ class FrameListWidget(QListWidget):
         self.permutationChanged.emit(permutation)
 
 
+class FileSortProxyModel(QSortFilterProxyModel):
+    """Sort directories and files with a configurable folder-first rule."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._folders_first = True
+
+    def set_folders_first(self, enabled):
+        """Set whether directories sort before files and refresh the view."""
+        enabled = bool(enabled)
+        if enabled != self._folders_first:
+            self._folders_first = enabled
+            self.invalidate()
+
+    def lessThan(self, left, right):
+        """Compare two source indexes using the folder-first preference."""
+        model = left.model()
+        if model is None:
+            return super().lessThan(left, right)
+        left_dir = bool(model.isDir(left))
+        right_dir = bool(model.isDir(right))
+        if self._folders_first and left_dir != right_dir:
+            return left_dir
+        return super().lessThan(left, right)
+
+
 class FrameSelectionDialog(QDialog):
     """Collect a frame scope using the shared current/all/range syntax."""
 
@@ -1067,6 +1102,7 @@ class WindowManager:
             viewer.draw_frame(reset_camera=reset_camera)
         self.show_hidden()
         self.apply_file_colors()
+        self.owner._sync_bond_action()
 
     def apply_file_colors(self):
         """Tint each subwindow border by its file, or make all borders white."""
@@ -1102,7 +1138,6 @@ class SettingsDialog(QDialog):
 
         Args:
             settings: Validated application settings.
-        self.owner._sync_bond_action()
             parent: Optional Qt parent widget.
 
         Return:
@@ -1201,6 +1236,65 @@ class SettingsDialog(QDialog):
             "buctoolkit_paths": self.buctoolkit_paths,
             "keyboard_translation_step": self.keyboard_translation_step_spin.value(),
             "file_cache_limit_mb": self.cache_limit_spin.value(),
+        }
+
+
+class FileManagerDialog(QDialog):
+    """Configure visible file-tree metadata and sorting."""
+
+    def __init__(self, settings, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("File Manager")
+        self.resize(360, 220)
+        self.size_check = QCheckBox("Show size", self)
+        self.size_check.setChecked(settings["file_manager_show_size"])
+        self.type_check = QCheckBox("Show type", self)
+        self.type_check.setChecked(settings["file_manager_show_type"])
+        self.modified_check = QCheckBox("Show modified date", self)
+        self.modified_check.setChecked(settings["file_manager_show_modified"])
+        self.folders_check = QCheckBox("Folders before files", self)
+        self.folders_check.setChecked(settings["file_manager_folders_first"])
+        self.sort_combo = QComboBox(self)
+        for label, value in (
+            ("Name", 0), ("Size", 1), ("Type", 2), ("Modified", 3)
+        ):
+            self.sort_combo.addItem(label, value)
+        self.sort_combo.setCurrentIndex(
+            max(0, self.sort_combo.findData(settings["file_manager_sort_column"]))
+        )
+        self.order_combo = QComboBox(self)
+        self.order_combo.addItem("Ascending", "asc")
+        self.order_combo.addItem("Descending", "desc")
+        self.order_combo.setCurrentIndex(
+            0 if settings["file_manager_sort_order"] == "asc" else 1
+        )
+        form = QFormLayout()
+        form.addRow("Metadata", self.size_check)
+        form.addRow("", self.type_check)
+        form.addRow("", self.modified_check)
+        form.addRow(self.folders_check)
+        form.addRow("Sort by", self.sort_combo)
+        form.addRow("Order", self.order_combo)
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok
+            | QDialogButtonBox.StandardButton.Cancel,
+            self,
+        )
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout = QVBoxLayout(self)
+        layout.addLayout(form)
+        layout.addWidget(buttons)
+
+    def values(self):
+        """Return file-manager settings represented by the dialog."""
+        return {
+            "file_manager_show_size": self.size_check.isChecked(),
+            "file_manager_show_type": self.type_check.isChecked(),
+            "file_manager_show_modified": self.modified_check.isChecked(),
+            "file_manager_folders_first": self.folders_check.isChecked(),
+            "file_manager_sort_column": int(self.sort_combo.currentData()),
+            "file_manager_sort_order": self.order_combo.currentData(),
         }
 
 
@@ -1838,8 +1932,10 @@ class MainWindow(QMainWindow):
             QDir.Filter.AllDirs | QDir.Filter.Files | QDir.Filter.NoDotAndDotDot
         )
         self.file_model.setReadOnly(False)
+        self.file_proxy = FileSortProxyModel(self)
+        self.file_proxy.setSourceModel(self.file_model)
         self.file_tree = QTreeView(self.file_dock)
-        self.file_tree.setModel(self.file_model)
+        self.file_tree.setModel(self.file_proxy)
         self.file_tree.setHeaderHidden(True)
         self.file_tree.setSortingEnabled(True)
         self.file_tree.setEditTriggers(
@@ -1866,6 +1962,7 @@ class MainWindow(QMainWindow):
         self.splitDockWidget(self.file_dock, self.frame_dock, Qt.Orientation.Vertical)
         self.file_dock.show()
         self.frame_dock.show()
+        self._apply_file_manager_settings()
         self._sync_file_manager()
         self._create_menus()
         self._sync_frame_controls()
@@ -1929,6 +2026,27 @@ class MainWindow(QMainWindow):
             )
             if not 64 <= cache_limit_mb <= 65536:
                 raise ValueError("file_cache_limit_mb must be between 64 and 65536")
+            file_manager_flags = {}
+            for name in (
+                "file_manager_show_size",
+                "file_manager_show_type",
+                "file_manager_show_modified",
+                "file_manager_folders_first",
+            ):
+                value = loaded.get(name, settings[name])
+                if not isinstance(value, bool):
+                    raise TypeError(f"{name} must be a Boolean value")
+                file_manager_flags[name] = value
+            sort_column = int(
+                loaded.get("file_manager_sort_column", settings["file_manager_sort_column"])
+            )
+            if sort_column not in {0, 1, 2, 3}:
+                raise ValueError("file_manager_sort_column must be 0..3")
+            sort_order = str(
+                loaded.get("file_manager_sort_order", settings["file_manager_sort_order"])
+            )
+            if sort_order not in {"asc", "desc"}:
+                raise ValueError("file_manager_sort_order must be asc or desc")
             buctoolkit_paths = loaded.get("buctoolkit_paths", settings["buctoolkit_paths"])
             if isinstance(buctoolkit_paths, str):
                 buctoolkit_paths = buctoolkit_paths.split(os.pathsep)
@@ -1956,6 +2074,9 @@ class MainWindow(QMainWindow):
                 buctoolkit_paths=buctoolkit_paths,
                 keyboard_translation_step=translation_step,
                 file_cache_limit_mb=cache_limit_mb,
+                file_manager_sort_column=sort_column,
+                file_manager_sort_order=sort_order,
+                **file_manager_flags,
             )
         except (TypeError, ValueError) as error:
             warning_messages.append(f"base settings: {error}; using defaults")
@@ -2119,6 +2240,7 @@ class MainWindow(QMainWindow):
         self._sync_history_actions()
         self._sync_file_manager()
         self._sync_cli_scope()
+        self._sync_bond_action()
 
     def _sync_cli_scope(self, force=False):
         """Reset CLI variables and output when the focused file changes."""
@@ -2150,6 +2272,7 @@ class MainWindow(QMainWindow):
         self._sync_history_actions()
         self._sync_file_manager()
         self._sync_cli_scope()
+        self._sync_bond_action()
 
     def _ensure_data_window(self):
         """Create the first structure window when data exists but none is open."""
@@ -2240,7 +2363,6 @@ class MainWindow(QMainWindow):
         except OSError as error:
             self._log(f"Settings save error: {error}")
 
-        self._sync_bond_action()
     def _show_settings(self):
         """Open settings and apply accepted history and rendering defaults.
 
@@ -2272,7 +2394,6 @@ class MainWindow(QMainWindow):
                 "keyboard_translation_step"
             ]
         self._sync_history_actions()
-        self._sync_bond_action()
         self._trim_file_cache()
         self._persist_settings()
 
@@ -2954,15 +3075,16 @@ class MainWindow(QMainWindow):
         self.angle_measure_action.blockSignals(False)
 
     def _selected_bond_frames(self):
-        """Parse and retain the shared frame scope from the Bonds menu.
+        """Parse the frame scope used by Check/Show bonds.
 
         Args:
             None.
 
         Return:
-            Zero-based frames used by both checking and displaying bonds.
+            Zero-based frames selected by the Bonds menu without changing the
+            per-frame visibility flags.
         """
-        indices = parse_frame_scope(
+        return parse_frame_scope(
             self.bond_frames_edit.text(),
             len(self.coordinates),
             self.current_index,
@@ -3009,7 +3131,7 @@ class MainWindow(QMainWindow):
             self._refresh_history_entry(change)
 
     def viewer_set_bonds(self, enabled):
-        """Toggle cached bond rendering and lazily fill missing selected frames.
+        """Toggle per-frame cached bond rendering for the Bonds frame scope.
 
         Args:
             enabled: Requested Show bonds check state.
@@ -3021,18 +3143,19 @@ class MainWindow(QMainWindow):
             indices = self._selected_bond_frames()
             before, after = {}, {}
             before_orders, after_orders = {}, {}
-            for frame_index in indices:
-                if self.bond_adjacencies[frame_index] is None:
-                    before[frame_index] = None
-                    before_orders[frame_index] = None
-                    after[frame_index] = build_bond_adjacency(
-                        self.coordinates[frame_index],
-                        self.elements[frame_index],
-                        self.viewer.bond_tolerance,
-                    )
-                    after_orders[frame_index] = np.ones(
-                        len(after[frame_index][0]), dtype=np.int8
-                    )
+            if enabled:
+                for frame_index in indices:
+                    if self.bond_adjacencies[frame_index] is None:
+                        before[frame_index] = None
+                        before_orders[frame_index] = None
+                        after[frame_index] = build_bond_adjacency(
+                            self.coordinates[frame_index],
+                            self.elements[frame_index],
+                            self.viewer.bond_tolerance,
+                        )
+                        after_orders[frame_index] = np.ones(
+                            len(after[frame_index][0]), dtype=np.int8
+                        )
         except (IndexError, TypeError, ValueError) as error:
             self._sync_bond_action()
             QMessageBox.warning(self, "Bonds", str(error))
@@ -3058,6 +3181,25 @@ class MainWindow(QMainWindow):
                     "Generate bonds", before, after, before_orders, after_orders
                 )
             )
+        self._sync_bond_action()
+
+    def _sync_bond_action(self):
+        """Reflect the current frame's bond-visibility flag in the menu action."""
+        if not hasattr(self, "bond_action"):
+            return
+        graph = (
+            self.bond_adjacencies[self.current_index]
+            if 0 <= self.current_index < len(self.bond_adjacencies)
+            else None
+        )
+        checked = (
+            self.current_index in self.bond_frame_indices
+            and graph is not None
+            and len(graph[0]) > 0
+        )
+        blocker = QSignalBlocker(self.bond_action)
+        self.bond_action.setChecked(checked)
+        del blocker
 
     def _clear_bonds(self, checked=False):
         """Clear all graphs while retaining their complete originals in history.
@@ -3153,6 +3295,7 @@ class MainWindow(QMainWindow):
             for record in self.window_manager.records_for_file(self.active_key):
                 record["viewer"].bond_frame_indices = set(self.bond_frame_indices)
             self._record_change(change)
+            self._sync_bond_action()
 
     def _delete_selected_bonds(self, frame_index, pairs):
         """Remove only selected endpoint triples from a frame's COO graph.
@@ -3180,25 +3323,6 @@ class MainWindow(QMainWindow):
         after = graph[:, ~np.isin(current, selected)]
         after_orders = np.asarray(
             [order_map[tuple(sorted((int(a), int(b))))] for a, b in after.T],
-        self._sync_bond_action()
-
-    def _sync_bond_action(self):
-        """Reflect the current frame's bond-visibility flag in the menu action."""
-        if not hasattr(self, "bond_action"):
-            return
-        graph = (
-            self.bond_adjacencies[self.current_index]
-            if 0 <= self.current_index < len(self.bond_adjacencies)
-            else None
-        )
-        checked = (
-            self.current_index in self.bond_frame_indices
-            and graph is not None
-            and len(graph[0]) > 0
-        )
-        blocker = QSignalBlocker(self.bond_action)
-        self.bond_action.setChecked(checked)
-        del blocker
             dtype=np.int8,
         )
         change = BondChange.between(
@@ -3295,7 +3419,6 @@ class MainWindow(QMainWindow):
         multipliers, matrix = self.supercell_transforms[frame_index]
         dialog = SupercellDialog(multipliers, matrix, self)
         if dialog.exec() != QDialog.DialogCode.Accepted:
-            self._sync_bond_action()
             return
         if dialog.resize_requested:
             self._resize_supercell()
@@ -4122,6 +4245,37 @@ class MainWindow(QMainWindow):
         self.window_manager.refresh_all()
         self._sync_frame_controls()
 
+    def _apply_file_manager_settings(self):
+        """Apply metadata columns, folder ordering and sort preferences."""
+        columns = {
+            1: self.settings["file_manager_show_size"],
+            2: self.settings["file_manager_show_type"],
+            3: self.settings["file_manager_show_modified"],
+        }
+        for column, visible in columns.items():
+            self.file_tree.setColumnHidden(column, not visible)
+        self.file_tree.setHeaderHidden(not any(columns.values()))
+        self.file_proxy.set_folders_first(
+            self.settings["file_manager_folders_first"]
+        )
+        order = (
+            Qt.SortOrder.AscendingOrder
+            if self.settings["file_manager_sort_order"] == "asc"
+            else Qt.SortOrder.DescendingOrder
+        )
+        self.file_tree.sortByColumn(
+            int(self.settings["file_manager_sort_column"]), order
+        )
+
+    def _show_file_manager_settings(self):
+        """Open the file-manager metadata and sorting dialog."""
+        dialog = FileManagerDialog(self.settings, self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        self.settings.update(dialog.values())
+        self._apply_file_manager_settings()
+        self._persist_settings()
+
     def _sync_file_manager(self, force=False):
         """Point the file tree at the active file's directory."""
         path = self.active_key
@@ -4131,10 +4285,12 @@ class MainWindow(QMainWindow):
             self.file_tree.show()
             if force or directory != self._file_manager_dir:
                 self.file_model.setRootPath(str(directory))
-                self.file_tree.setRootIndex(self.file_model.index(str(directory)))
+                root_index = self.file_model.index(str(directory))
+                self.file_tree.setRootIndex(self.file_proxy.mapFromSource(root_index))
                 self._file_manager_dir = directory
             if path is not None:
-                index = self.file_model.index(str(path))
+                source_index = self.file_model.index(str(path))
+                index = self.file_proxy.mapFromSource(source_index)
                 if index.isValid():
                     self.file_tree.setCurrentIndex(index)
                     self.file_tree.scrollTo(index)
@@ -4147,9 +4303,12 @@ class MainWindow(QMainWindow):
 
     def _file_tree_double_clicked(self, index):
         """Open a double-clicked structure file, leaving directories to Qt."""
-        if not index.isValid() or self.file_model.isDir(index):
+        if not index.isValid():
             return
-        path = Path(self.file_model.filePath(index))
+        source_index = self.file_proxy.mapToSource(index)
+        if self.file_model.isDir(source_index):
+            return
+        path = Path(self.file_model.filePath(source_index))
         try:
             self._open_file(path)
         except (ImportError, OSError, RuntimeError, TypeError, ValueError) as error:
@@ -4199,7 +4358,8 @@ class MainWindow(QMainWindow):
         index = self.file_tree.indexAt(position)
         if not index.isValid():
             index = self.file_tree.rootIndex()
-        path = Path(self.file_model.filePath(index))
+        source_index = self.file_proxy.mapToSource(index)
+        path = Path(self.file_model.filePath(source_index))
         menu = QMenu(self.file_tree)
         if path.is_file():
             menu.addAction("Open", lambda: self._file_tree_double_clicked(index))
@@ -4229,7 +4389,8 @@ class MainWindow(QMainWindow):
 
     def _rename_file(self, index):
         """Start the model's inline rename when the path is not in use."""
-        path = Path(self.file_model.filePath(index))
+        source_index = self.file_proxy.mapToSource(index)
+        path = Path(self.file_model.filePath(source_index))
         if self._path_has_open_state(path):
             QMessageBox.warning(
                 self, "Rename", "Close the file before renaming it."
@@ -4838,6 +4999,7 @@ class MainWindow(QMainWindow):
             self._set_record_header(active)
         self.viewer.set_frame(index)
         self._sync_frame_controls()
+        self._sync_bond_action()
 
     def _on_frame_input(self):
         """Apply the frame text field when it contains a valid integer index."""
@@ -4991,6 +5153,8 @@ class MainWindow(QMainWindow):
         settings_menu = menu_bar.addMenu("Settings")
         settings_action = settings_menu.addAction("Preferences...")
         settings_action.triggered.connect(self._show_settings)
+        file_manager_action = settings_menu.addAction("File Manager...")
+        file_manager_action.triggered.connect(self._show_file_manager_settings)
         clear_cache_action = settings_menu.addAction("Clear File Cache")
         clear_cache_action.triggered.connect(self._clear_file_cache)
         appearance_action = QAction("Appearance", self)
@@ -4999,7 +5163,6 @@ class MainWindow(QMainWindow):
 
         windows_menu = menu_bar.addMenu("Windows")
         show_files_action = self.file_dock.toggleViewAction()
-        self._sync_bond_action()
         show_files_action.setText("Show Files")
         windows_menu.addAction(show_files_action)
         show_frames_action = self.frame_dock.toggleViewAction()
@@ -5960,6 +6123,7 @@ class MainWindow(QMainWindow):
             active["frame_index"] = int(index)
             self._set_record_header(active)
         self._sync_frame_controls()
+        self._sync_bond_action()
         if self.play_position == len(self.play_indices) - 1:
             if self.playback_loop:
                 self.play_position = 0
@@ -6123,7 +6287,6 @@ class MainWindow(QMainWindow):
 
         Returns:
             None. In-place NumPy mutations become visible immediately.
-        self._sync_bond_action()
         """
         self._refresh_after_change(frame_index=self.current_index)
 
