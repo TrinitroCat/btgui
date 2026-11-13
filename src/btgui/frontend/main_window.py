@@ -15,7 +15,7 @@ import warnings
 import numpy as np
 
 from ..backend.lattice_transform import transform_structure
-from PySide6.QtCore import QSignalBlocker, QTimer, Qt, Signal
+from PySide6.QtCore import QSignalBlocker, QTimer, Qt, Signal, QDir, QFile, QModelIndex
 from PySide6.QtGui import QAction, QColor, QDoubleValidator, QIntValidator
 from PySide6.QtWidgets import (
     QComboBox,
@@ -26,6 +26,7 @@ from PySide6.QtWidgets import (
     QDialogButtonBox,
     QDockWidget,
     QFileDialog,
+    QFileSystemModel,
     QDoubleSpinBox,
     QFormLayout,
     QFrame,
@@ -47,6 +48,7 @@ from PySide6.QtWidgets import (
     QStyle,
     QToolBar,
     QToolButton,
+    QTreeView,
     QTreeWidget,
     QTreeWidgetItem,
     QWidgetAction,
@@ -1803,8 +1805,42 @@ class MainWindow(QMainWindow):
         self.frame_list.customContextMenuRequested.connect(self._show_frame_context_menu)
         self.frame_list.permutationChanged.connect(self._reorder_frames)
         self.frame_dock.setWidget(self.frame_list)
+        self.file_dock = QDockWidget("Files", self)
+        self.file_dock.setObjectName("filesDock")
+        self.file_model = QFileSystemModel(self)
+        self.file_model.setFilter(
+            QDir.Filter.AllDirs | QDir.Filter.Files | QDir.Filter.NoDotAndDotDot
+        )
+        self.file_model.setReadOnly(False)
+        self.file_tree = QTreeView(self.file_dock)
+        self.file_tree.setModel(self.file_model)
+        self.file_tree.setHeaderHidden(True)
+        self.file_tree.setSortingEnabled(True)
+        self.file_tree.setEditTriggers(
+            QAbstractItemView.EditTrigger.EditKeyPressed
+            | QAbstractItemView.EditTrigger.SelectedClicked
+        )
+        self.file_tree.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.file_tree.doubleClicked.connect(self._file_tree_double_clicked)
+        self.file_tree.customContextMenuRequested.connect(self._show_file_context_menu)
+        self.file_placeholder = QLabel(
+            "Open a structure file to browse its directory.", self.file_dock
+        )
+        self.file_placeholder.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        file_container = QWidget(self.file_dock)
+        file_layout = QVBoxLayout(file_container)
+        file_layout.setContentsMargins(0, 0, 0, 0)
+        file_layout.addWidget(self.file_placeholder)
+        file_layout.addWidget(self.file_tree, 1)
+        self.file_dock.setWidget(file_container)
+        self._file_manager_dir = None
+        self._file_manager_path = None
+        self.addDockWidget(Qt.DockWidgetArea.LeftDockWidgetArea, self.file_dock)
         self.addDockWidget(Qt.DockWidgetArea.LeftDockWidgetArea, self.frame_dock)
+        self.splitDockWidget(self.file_dock, self.frame_dock, Qt.Orientation.Vertical)
+        self.file_dock.show()
         self.frame_dock.show()
+        self._sync_file_manager()
         self._create_menus()
         self._sync_frame_controls()
         self._sync_history_actions()
@@ -2052,6 +2088,7 @@ class MainWindow(QMainWindow):
         self._sync_frame_controls()
         self._sync_frame_list()
         self._sync_history_actions()
+        self._sync_file_manager()
 
     def _activate_empty_state(self):
         """Replace the active state with an empty untitled state."""
@@ -2065,6 +2102,7 @@ class MainWindow(QMainWindow):
         self._sync_frame_list()
         self._sync_frame_controls()
         self._sync_history_actions()
+        self._sync_file_manager()
 
     def _ensure_data_window(self):
         """Create the first structure window when data exists but none is open."""
@@ -4002,6 +4040,121 @@ class MainWindow(QMainWindow):
         self.window_manager.refresh_all()
         self._sync_frame_controls()
 
+    def _sync_file_manager(self, force=False):
+        """Point the file tree at the active file's directory."""
+        path = self.active_key
+        directory = path.parent if path is not None else None
+        if directory is not None and directory.is_dir():
+            self.file_placeholder.hide()
+            self.file_tree.show()
+            if force or directory != self._file_manager_dir:
+                self.file_model.setRootPath(str(directory))
+                self.file_tree.setRootIndex(self.file_model.index(str(directory)))
+                self._file_manager_dir = directory
+            if path is not None:
+                index = self.file_model.index(str(path))
+                if index.isValid():
+                    self.file_tree.setCurrentIndex(index)
+                    self.file_tree.scrollTo(index)
+            self._file_manager_path = path
+            return
+        self.file_tree.hide()
+        self.file_placeholder.show()
+        self._file_manager_dir = None
+        self._file_manager_path = None
+
+    def _file_tree_double_clicked(self, index):
+        """Open a double-clicked structure file, leaving directories to Qt."""
+        if not index.isValid() or self.file_model.isDir(index):
+            return
+        path = Path(self.file_model.filePath(index))
+        try:
+            self._open_file(path)
+        except (ImportError, OSError, RuntimeError, TypeError, ValueError) as error:
+            self._log(f"Open error: {error}")
+            QMessageBox.warning(self, "Open structure", self._open_error_message(error))
+
+    def _path_has_open_state(self, path):
+        """Return whether a file, or a directory containing files, is in use."""
+        path = Path(path)
+        for key, state in self.files.items():
+            if key is None or state.closed:
+                continue
+            try:
+                key.relative_to(path)
+                return True
+            except ValueError:
+                continue
+        return False
+
+    def _show_file_context_menu(self, position):
+        """Offer the standard file operations for the selected tree item."""
+        index = self.file_tree.indexAt(position)
+        if not index.isValid():
+            index = self.file_tree.rootIndex()
+        path = Path(self.file_model.filePath(index))
+        menu = QMenu(self.file_tree)
+        if path.is_file():
+            menu.addAction("Open", lambda: self._file_tree_double_clicked(index))
+            menu.addSeparator()
+        menu.addAction(
+            "New Folder...",
+            lambda: self._new_folder(path if path.is_dir() else path.parent),
+        )
+        menu.addAction("Rename", lambda: self._rename_file(index))
+        menu.addAction("Delete", lambda: self._delete_file(path))
+        menu.addAction("Copy Path", lambda: self._copy_path(path))
+        menu.addSeparator()
+        menu.addAction("Refresh", lambda: self._sync_file_manager(force=True))
+        menu.exec(self.file_tree.viewport().mapToGlobal(position))
+
+    def _new_folder(self, directory):
+        """Create one child folder in the selected directory."""
+        directory = Path(directory)
+        name, accepted = QInputDialog.getText(self, "New Folder", "Name")
+        name = name.strip()
+        if not accepted or not name or name in {".", ".."} or Path(name).name != name:
+            return
+        if not QDir(str(directory)).mkdir(name):
+            QMessageBox.warning(self, "New Folder", f"Could not create {name}.")
+            return
+        self._sync_file_manager(force=True)
+
+    def _rename_file(self, index):
+        """Start the model's inline rename when the path is not in use."""
+        path = Path(self.file_model.filePath(index))
+        if self._path_has_open_state(path):
+            QMessageBox.warning(
+                self, "Rename", "Close the file before renaming it."
+            )
+            return
+        self.file_tree.edit(index)
+
+    def _delete_file(self, path):
+        """Move an unused file or directory to the system trash."""
+        path = Path(path)
+        if self._path_has_open_state(path):
+            QMessageBox.warning(
+                self, "Delete", "Close the file before deleting it."
+            )
+            return
+        answer = QMessageBox.question(
+            self,
+            "Delete",
+            f"Move {path.name} to the trash?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        if not QFile.moveToTrash(str(path)):
+            QMessageBox.warning(self, "Delete", f"Could not delete {path.name}.")
+        self._sync_file_manager(force=True)
+
+    def _copy_path(self, path):
+        """Copy one absolute path to the clipboard."""
+        QApplication.clipboard().setText(str(Path(path)))
+        self._log(f"Copied path: {path}")
+
     def _queue_frame_item_click(self, item):
         """Delay a single-click switch long enough to detect a double-click."""
         self._pending_frame_row = self.frame_list.row(item)
@@ -4680,6 +4833,9 @@ class MainWindow(QMainWindow):
         menu_bar.addAction(appearance_action)
 
         windows_menu = menu_bar.addMenu("Windows")
+        show_files_action = self.file_dock.toggleViewAction()
+        show_files_action.setText("Show Files")
+        windows_menu.addAction(show_files_action)
         show_frames_action = self.frame_dock.toggleViewAction()
         show_frames_action.setText("Show Frames")
         windows_menu.addAction(show_frames_action)
@@ -4746,6 +4902,7 @@ class MainWindow(QMainWindow):
         self._sync_frame_controls()
         self._sync_frame_list()
         self._sync_history_actions()
+        self._sync_file_manager()
         self._log(f"Loaded {len(elements)} frame(s), {sum(map(len, elements))} atoms total.")
 
     def _rebuild_update_menu(self):
