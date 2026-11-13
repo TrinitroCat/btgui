@@ -558,11 +558,12 @@ class StructureViewer(QtInteractor):
         style = self._style_for(symbol, atom_index)
         if style["style"] == "point":
             return 0.12
+        floor = self.bond_width * 1.15
         if style["style"] == "covalent":
             # Display-only scaling must never alter physical bond cutoffs.
-            return covalent_radius(symbol) * float(style["scale"])
+            return max(covalent_radius(symbol) * float(style["scale"]), floor)
         if style["style"] == "vdw":
-            return vdw_radius(symbol) * float(style["scale"])
+            return max(vdw_radius(symbol) * float(style["scale"]), floor)
         return max(0.01, float(style["radius"]))
 
     def _offset_tube_points(self, positions, left, right, order, colors):
