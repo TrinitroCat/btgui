@@ -211,6 +211,10 @@ class AppearanceDialog(QDialog):
         self.axes_check.setChecked(viewer.axes_visible)
         self.grid_check = QCheckBox("Grid", self)
         self.grid_check.setChecked(viewer.grid_visible)
+        self.distinguish_check = QCheckBox(
+            "distinguish files by frame colours", self
+        )
+        self.distinguish_check.setChecked(viewer.distinguish_files)
         self.edge_width_spin = QDoubleSpinBox(self)
         self.edge_width_spin.setRange(0.1, 10.0)
         self.edge_width_spin.setSingleStep(0.1)
@@ -268,6 +272,7 @@ class AppearanceDialog(QDialog):
         form.addRow("Bond opacity", self.bond_alpha_spin)
         form.addRow(self.axes_check)
         form.addRow(self.grid_check)
+        form.addRow(self.distinguish_check)
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel, self)
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
@@ -449,6 +454,7 @@ class AppearanceDialog(QDialog):
             "metallic": self.metallic_spin.value(),
             "axes": self.axes_check.isChecked(),
             "grid": self.grid_check.isChecked(),
+            "distinguish_files": self.distinguish_check.isChecked(),
             "bond_width": self.bond_width_spin.value(),
             "bond_alpha": self.bond_alpha_spin.value(),
         }
@@ -489,6 +495,7 @@ class AppearanceDialog(QDialog):
             "grid": "grid_visible",
             "bond_width": "bond_width",
             "bond_alpha": "bond_alpha",
+            "distinguish_files": "distinguish_files",
         }
         self.accepted_values["changed_scene_values"] = {
             name: self.accepted_values[name]
@@ -1059,6 +1066,24 @@ class WindowManager:
                 }
             viewer.draw_frame(reset_camera=reset_camera)
         self.show_hidden()
+        self.apply_file_colors()
+
+    def apply_file_colors(self):
+        """Tint each subwindow border by its file, or make all borders white."""
+        enabled = bool(
+            self.owner.viewer is not None and self.owner.viewer.distinguish_files
+        )
+        for record in self.records:
+            state = self.owner.files.get(record["file_key"])
+            color = "#ffffff"
+            if enabled and state is not None and state.border_color is not None:
+                source = state.border_color
+                color = (
+                    f"rgba({source.red()}, {source.green()}, {source.blue()}, 90)"
+                )
+            record["subwindow"].setStyleSheet(
+                f"QMdiSubWindow {{ border: 2px solid {color}; }}"
+            )
 
 
 class SettingsDialog(QDialog):
@@ -1475,6 +1500,7 @@ class MainWindow(QMainWindow):
         self.files = {}
         self.active_key = None
         self._active_state = None
+        self._file_color_index = 0
         self.open_handler = open_handler
         self.save_handler = save_handler
         self.updater = None
@@ -2513,7 +2539,7 @@ class MainWindow(QMainWindow):
             "default_custom_radius", "default_atom_scale", "_background_color_value", "material_ambient",
             "material_diffuse", "material_specular", "material_roughness",
             "material_metallic", "axes_visible", "grid_visible", "bond_width",
-            "bond_alpha",
+            "bond_alpha", "distinguish_files",
         )
         return {name: deepcopy(getattr(self.viewer, name)) for name in names}
 
@@ -2529,6 +2555,7 @@ class MainWindow(QMainWindow):
         for name, value in context.items():
             setattr(self.viewer, name, deepcopy(value))
         self.viewer.set_background(self.viewer._background_color_value)
+        self.window_manager.apply_file_colors()
 
     def _refresh_after_change(
         self,
@@ -2758,6 +2785,8 @@ class MainWindow(QMainWindow):
                         setattr(viewer, name, deepcopy(getattr(self.viewer, name)))
                 viewer.set_background(viewer._background_color_value)
             self.window_manager.refresh_all()
+            if "distinguish_files" in changed_global:
+                self.window_manager.apply_file_colors()
             return
 
         for record in self.window_manager.records:
@@ -2778,6 +2807,8 @@ class MainWindow(QMainWindow):
                 viewer.refresh_bonds()
             else:
                 viewer.render()
+        if "distinguish_files" in changed_global:
+            self.window_manager.apply_file_colors()
 
     def _record_coordinate_edit(self, frame_index, before_coordinates, after_coordinates):
         """Record one completed mouse coordinate edit.
@@ -3634,6 +3665,7 @@ class MainWindow(QMainWindow):
             "grid": "grid_visible",
             "bond_width": "bond_width",
             "bond_alpha": "bond_alpha",
+            "distinguish_files": "distinguish_files",
         }
         before_global = {}
         after_global = {}
@@ -4265,9 +4297,16 @@ class MainWindow(QMainWindow):
             f"{freed / (1024 * 1024):.1f} MB."
         )
 
+    def _next_file_color(self):
+        """Return a pastel border color for one newly opened file."""
+        hue = (self._file_color_index * 0.618033988749895) % 1.0
+        self._file_color_index += 1
+        return QColor.fromHslF(hue, 0.45, 0.72)
+
     def _prepare_file_state(self, key, elements, coordinates, lattices):
         """Build one detached FileState from freshly read raw frame lists."""
         state = FileState(key, self.settings["history_limit"])
+        state.border_color = self._next_file_color() if key is not None else None
         state.elements = list(elements)
         state.coordinates = list(coordinates)
         state.lattices = list(lattices)
@@ -4340,7 +4379,7 @@ class MainWindow(QMainWindow):
             "material_diffuse", "material_specular", "material_roughness",
             "material_metallic", "axes_visible", "grid_visible", "bond_width",
             "bond_alpha", "bond_tolerance", "bonds_enabled",
-            "keyboard_translation_step", "perspective_enabled",
+            "keyboard_translation_step", "perspective_enabled", "distinguish_files",
         ):
             if source_viewer is not None:
                 setattr(viewer, name, deepcopy(getattr(source_viewer, name)))
@@ -4357,6 +4396,7 @@ class MainWindow(QMainWindow):
             file_key=key,
         )
         state.retain()
+        self.window_manager.apply_file_colors()
         QApplication.processEvents()
         viewer.set_data(state.elements, state.coordinates, state.lattices)
         viewer.set_frame_state(

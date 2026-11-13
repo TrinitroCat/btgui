@@ -56,6 +56,7 @@ class StructureViewer(QtInteractor):
         self.default_atom_scale = 0.6
         self.keyboard_translation_step = 0.1
         self.perspective_enabled = False
+        self.distinguish_files = True
         self._background_color_value = "#f5f7f7"
         self.bonds_enabled = False
         self.bond_tolerance = 1.2
