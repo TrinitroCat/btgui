@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- Added an independent 1-4 H-H non-bonded term to clean, using the full van der
+  Waals H-H contact distance so alkane conformers favor staggered over
+  eclipsed/gauche contacts, while ordinary non-bonded pairs keep the existing
+  scaling.
+- Clean now optimizes only free coordinates through a shared wrapper, defaults
+  to scipy BFGS, and supports local BFGS/L-BFGS-B/Nelder-Mead or global
+  basinhopping/differential evolution/dual annealing/SHGO/DIRECT backends.
+  Settings > Clean Backend configures the mode, method, iterations, bounds span
+  and workers; workers are used by differential evolution and SHGO.
 - View > Along A/B/C, Reset View, measurement mode and zoom now target the
   focused MDI window; zero-lattice molecules use Cartesian axes for Along, and
   the zoom control follows the active window.

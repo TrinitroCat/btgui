@@ -321,10 +321,19 @@ the frame's existing bond graph is reused when present. The Lennard-Jones term i
 calibrated from the bundled van der Waals radii: its minimum sits at
 `lj_equilibrium_scale * (vdW_i + vdW_j)` with the default `0.75`, which keeps
 non-bonded contacts near 1.5-2 times the covalent bond length. Bonded and 1-3
-pairs are excluded from the non-bonded sum. scipy is a core
-dependency and supplies the L-BFGS-B optimizer. Embedding applications can pass
-`fixed`, `bonds`, `maxiter`, `bond_k`, `angle_k`, `lj_epsilon`,
-`lj_equilibrium_scale` and `lj_cutoff` through `apply_updater`.
+pairs are excluded from the non-bonded sum. A separate 1-4 H-H Lennard-Jones
+term uses the full van der Waals contact distance (`1.0 * (vdW_H + vdW_H)`) so
+alkane conformers prefer staggered over eclipsed/gauche contacts. scipy supplies
+the optimizers. Settings > Clean Backend chooses either a local minimizer
+(`BFGS` default, `L-BFGS-B`, or `Nelder-Mead`) or a global minimizer
+(`basinhopping`, `differential_evolution`, `dual_annealing`, `shgo`, or
+`direct`), with separate iteration settings. `workers` is forwarded only to
+differential evolution and SHGO; fixed coordinates are removed from the
+optimizer variables by a free-coordinate wrapper. Embedding applications can
+pass `fixed`, `bonds`, `maxiter`, `bond_k`, `angle_k`, `lj_epsilon`,
+`lj_equilibrium_scale`, `lj_hh14_epsilon`, `lj_cutoff`, `mode`,
+`local_method`, `global_method`, `workers` and `bounds_span` through
+`apply_updater`.
 
 ## Nuitka build
 

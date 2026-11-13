@@ -59,8 +59,11 @@ from PySide6.QtWidgets import (
     QWidget,
     QColorDialog,
     QGridLayout,
+    QGroupBox,
     QHBoxLayout,
     QMessageBox,
+    QRadioButton,
+    QButtonGroup,
 )
 
 from btgui.backend.core import (
@@ -75,7 +78,11 @@ from btgui.backend.core import (
 )
 from btgui.backend.core import format_atom_selection, parse_atom_selection
 from btgui.backend.hydrogenate import add_hydrogens
-from btgui.backend.updater_presets.clean_structure import clean as clean_structure
+from btgui.backend.updater_presets.clean_structure import (
+    CLEAN_GLOBAL_METHODS,
+    CLEAN_LOCAL_METHODS,
+    clean as clean_structure,
+)
 from btgui.data.appearance import ELEMENT_COLORS, default_color
 from btgui.frontend.cli import CLI
 from btgui.frontend.file_state import FileState
@@ -104,6 +111,14 @@ DEFAULT_SETTINGS = {
     "file_manager_folders_first": True,
     "file_manager_sort_column": 0,
     "file_manager_sort_order": "asc",
+    "clean_mode": "local",
+    "clean_local_method": "BFGS",
+    "clean_local_maxiter": 200,
+    "clean_local_gtol": 1e-5,
+    "clean_global_method": "differential_evolution",
+    "clean_global_maxiter": 200,
+    "clean_workers": 1,
+    "clean_bounds_span": 2.0,
     "updater_path": [],
     "updater_function": [],
 }
@@ -1298,6 +1313,132 @@ class FileManagerDialog(QDialog):
         }
 
 
+class CleanBackendDialog(QDialog):
+    """Configure local or global clean optimizer settings."""
+
+    def __init__(self, settings, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Clean Backend")
+        self.resize(440, 390)
+        self.mode_group = QButtonGroup(self)
+        self.mode_group.setExclusive(True)
+
+        self.local_group = QGroupBox("Local minimizer", self)
+        local_layout = QFormLayout(self.local_group)
+        self.local_radio = QRadioButton("Use local minimizer", self.local_group)
+        self.local_method_combo = QComboBox(self.local_group)
+        for method in CLEAN_LOCAL_METHODS:
+            self.local_method_combo.addItem(method, method)
+        self.local_method_combo.setCurrentIndex(
+            max(0, self.local_method_combo.findData(settings["clean_local_method"]))
+        )
+        self.local_maxiter_spin = QSpinBox(self.local_group)
+        self.local_maxiter_spin.setRange(1, 100000)
+        self.local_maxiter_spin.setValue(settings["clean_local_maxiter"])
+        self.local_gtol_spin = QDoubleSpinBox(self.local_group)
+        self.local_gtol_spin.setDecimals(8)
+        self.local_gtol_spin.setRange(1e-10, 1.0)
+        self.local_gtol_spin.setSingleStep(1e-6)
+        self.local_gtol_spin.setValue(settings["clean_local_gtol"])
+        local_layout.addRow(self.local_radio)
+        local_layout.addRow("Method", self.local_method_combo)
+        local_layout.addRow("Max iterations", self.local_maxiter_spin)
+        local_layout.addRow("Gradient tolerance", self.local_gtol_spin)
+
+        self.global_group = QGroupBox("Global minimizer", self)
+        global_layout = QFormLayout(self.global_group)
+        self.global_radio = QRadioButton("Use global minimizer", self.global_group)
+        self.global_method_combo = QComboBox(self.global_group)
+        for method in CLEAN_GLOBAL_METHODS:
+            self.global_method_combo.addItem(method, method)
+        self.global_method_combo.setCurrentIndex(
+            max(0, self.global_method_combo.findData(settings["clean_global_method"]))
+        )
+        self.global_maxiter_spin = QSpinBox(self.global_group)
+        self.global_maxiter_spin.setRange(1, 100000)
+        self.global_maxiter_spin.setValue(settings["clean_global_maxiter"])
+        self.workers_spin = QSpinBox(self.global_group)
+        self.workers_spin.setRange(1, max(1, (os.cpu_count() or 1)))
+        self.workers_spin.setValue(settings["clean_workers"])
+        self.bounds_spin = QDoubleSpinBox(self.global_group)
+        self.bounds_spin.setRange(0.1, 30.0)
+        self.bounds_spin.setDecimals(2)
+        self.bounds_spin.setSingleStep(0.5)
+        self.bounds_spin.setSuffix(" Å")
+        self.bounds_spin.setValue(settings["clean_bounds_span"])
+        global_layout.addRow(self.global_radio)
+        global_layout.addRow("Method", self.global_method_combo)
+        global_layout.addRow("Max iterations", self.global_maxiter_spin)
+        global_layout.addRow("Workers (DE/SHGO only)", self.workers_spin)
+        global_layout.addRow("Bounds span", self.bounds_spin)
+
+        self.mode_group.addButton(self.local_radio)
+        self.mode_group.addButton(self.global_radio)
+        if settings["clean_mode"] == "global":
+            self.global_radio.setChecked(True)
+        else:
+            self.local_radio.setChecked(True)
+        self.local_radio.toggled.connect(self._update_enabled)
+        self.global_radio.toggled.connect(self._update_enabled)
+        self.global_method_combo.currentIndexChanged.connect(
+            self._update_global_controls
+        )
+        self._update_enabled()
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok
+            | QDialogButtonBox.StandardButton.Cancel,
+            self,
+        )
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout = QVBoxLayout(self)
+        layout.addWidget(self.local_group)
+        layout.addWidget(self.global_group)
+        layout.addWidget(buttons)
+
+    def _update_enabled(self):
+        """Enable only the selected optimizer group's controls."""
+        local = self.local_radio.isChecked()
+        for widget in (
+            self.local_method_combo,
+            self.local_maxiter_spin,
+            self.local_gtol_spin,
+        ):
+            widget.setEnabled(local)
+        for widget in (
+            self.global_method_combo,
+            self.global_maxiter_spin,
+            self.workers_spin,
+            self.bounds_spin,
+        ):
+            widget.setEnabled(not local)
+        self._update_global_controls()
+
+    def _update_global_controls(self):
+        """Disable controls that the selected global method does not support."""
+        if not self.global_radio.isChecked():
+            return
+        method = self.global_method_combo.currentData()
+        self.workers_spin.setEnabled(
+            method in {"differential_evolution", "shgo"}
+        )
+        self.bounds_spin.setEnabled(method != "basinhopping")
+
+    def values(self):
+        """Return the selected clean-backend settings."""
+        return {
+            "clean_mode": "local" if self.local_radio.isChecked() else "global",
+            "clean_local_method": self.local_method_combo.currentData(),
+            "clean_local_maxiter": self.local_maxiter_spin.value(),
+            "clean_local_gtol": self.local_gtol_spin.value(),
+            "clean_global_method": self.global_method_combo.currentData(),
+            "clean_global_maxiter": self.global_maxiter_spin.value(),
+            "clean_workers": self.workers_spin.value(),
+            "clean_bounds_span": self.bounds_spin.value(),
+        }
+
+
 class AddAtomDialog(QDialog):
     """Collect one element and either Cartesian coordinates or a reference mode."""
 
@@ -2047,6 +2188,40 @@ class MainWindow(QMainWindow):
             )
             if sort_order not in {"asc", "desc"}:
                 raise ValueError("file_manager_sort_order must be asc or desc")
+            clean_mode = str(loaded.get("clean_mode", settings["clean_mode"]))
+            if clean_mode not in {"local", "global"}:
+                raise ValueError("clean_mode must be local or global")
+            clean_local_method = str(
+                loaded.get("clean_local_method", settings["clean_local_method"])
+            )
+            if clean_local_method not in CLEAN_LOCAL_METHODS:
+                raise ValueError("clean_local_method is unsupported")
+            clean_global_method = str(
+                loaded.get("clean_global_method", settings["clean_global_method"])
+            )
+            if clean_global_method not in CLEAN_GLOBAL_METHODS:
+                raise ValueError("clean_global_method is unsupported")
+            clean_local_maxiter = int(
+                loaded.get("clean_local_maxiter", settings["clean_local_maxiter"])
+            )
+            clean_global_maxiter = int(
+                loaded.get("clean_global_maxiter", settings["clean_global_maxiter"])
+            )
+            if not 1 <= clean_local_maxiter <= 100000 or not 1 <= clean_global_maxiter <= 100000:
+                raise ValueError("clean iteration limits must be between 1 and 100000")
+            clean_local_gtol = float(
+                loaded.get("clean_local_gtol", settings["clean_local_gtol"])
+            )
+            if not 1e-10 <= clean_local_gtol <= 1.0:
+                raise ValueError("clean_local_gtol must be between 1e-10 and 1")
+            clean_workers = int(loaded.get("clean_workers", settings["clean_workers"]))
+            if not 1 <= clean_workers <= max(1, (os.cpu_count() or 1)):
+                raise ValueError("clean_workers is out of range")
+            clean_bounds_span = float(
+                loaded.get("clean_bounds_span", settings["clean_bounds_span"])
+            )
+            if not 0.1 <= clean_bounds_span <= 30.0:
+                raise ValueError("clean_bounds_span must be between 0.1 and 30")
             buctoolkit_paths = loaded.get("buctoolkit_paths", settings["buctoolkit_paths"])
             if isinstance(buctoolkit_paths, str):
                 buctoolkit_paths = buctoolkit_paths.split(os.pathsep)
@@ -2076,6 +2251,14 @@ class MainWindow(QMainWindow):
                 file_cache_limit_mb=cache_limit_mb,
                 file_manager_sort_column=sort_column,
                 file_manager_sort_order=sort_order,
+                clean_mode=clean_mode,
+                clean_local_method=clean_local_method,
+                clean_global_method=clean_global_method,
+                clean_local_maxiter=clean_local_maxiter,
+                clean_global_maxiter=clean_global_maxiter,
+                clean_local_gtol=clean_local_gtol,
+                clean_workers=clean_workers,
+                clean_bounds_span=clean_bounds_span,
                 **file_manager_flags,
             )
         except (TypeError, ValueError) as error:
@@ -3995,6 +4178,23 @@ class MainWindow(QMainWindow):
         )
         self._record_change(change, frame_index=frame_index)
 
+    def _clean_option_kwargs(self):
+        """Return clean() optimizer keywords from persistent settings."""
+        if self.settings["clean_mode"] == "local":
+            return {
+                "mode": "local",
+                "local_method": self.settings["clean_local_method"],
+                "maxiter": int(self.settings["clean_local_maxiter"]),
+                "gtol": float(self.settings["clean_local_gtol"]),
+            }
+        return {
+            "mode": "global",
+            "global_method": self.settings["clean_global_method"],
+            "maxiter": int(self.settings["clean_global_maxiter"]),
+            "workers": int(self.settings["clean_workers"]),
+            "bounds_span": float(self.settings["clean_bounds_span"]),
+        }
+
     def _clean_current_frame(self):
         """Relax the focused frame in place with the preset clean updater.
 
@@ -4036,7 +4236,11 @@ class MainWindow(QMainWindow):
         self._run_updater(
             record,
             str(frame_index + 1),
-            kwargs={"fixed": fixed, "bonds": bonds},
+            kwargs={
+                "fixed": fixed,
+                "bonds": bonds,
+                **self._clean_option_kwargs(),
+            },
             in_place=True,
         )
 
@@ -4099,6 +4303,7 @@ class MainWindow(QMainWindow):
                 [new_coordinates],
                 fixed=fixed,
                 bonds=new_graph,
+                **self._clean_option_kwargs(),
             )[2][0]
         except Exception as error:
             self._log(f"Add H: hydrogen relaxation skipped ({error}).")
@@ -4293,6 +4498,14 @@ class MainWindow(QMainWindow):
             return
         self.settings.update(dialog.values())
         self._apply_file_manager_settings()
+        self._persist_settings()
+
+    def _show_clean_backend(self):
+        """Open the local/global clean optimizer configuration dialog."""
+        dialog = CleanBackendDialog(self.settings, self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        self.settings.update(dialog.values())
         self._persist_settings()
 
     def _sync_file_manager(self, force=False):
@@ -5183,6 +5396,8 @@ class MainWindow(QMainWindow):
         settings_action.triggered.connect(self._show_settings)
         file_manager_action = settings_menu.addAction("File Manager...")
         file_manager_action.triggered.connect(self._show_file_manager_settings)
+        clean_backend_action = settings_menu.addAction("Clean Backend...")
+        clean_backend_action.triggered.connect(self._show_clean_backend)
         clear_cache_action = settings_menu.addAction("Clear File Cache")
         clear_cache_action.triggered.connect(self._clear_file_cache)
         appearance_action = QAction("Appearance", self)
@@ -5595,6 +5810,9 @@ class MainWindow(QMainWindow):
         Return:
             None. Successful results are committed in the requested mode.
         """
+        kwargs = {} if kwargs is None else dict(kwargs)
+        if updater.get("preset") and updater.get("name") == "clean":
+            kwargs = {**self._clean_option_kwargs(), **kwargs}
         try:
             self.apply_updater(
                 specification,
