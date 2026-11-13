@@ -69,6 +69,7 @@ from btgui.backend.core import (
     wrap_coordinates,
 )
 from btgui.backend.core import format_atom_selection, parse_atom_selection
+from btgui.backend.hydrogenate import add_hydrogens
 from btgui.backend.updater_presets.clean_structure import clean as clean_structure
 from btgui.data.appearance import ELEMENT_COLORS, default_color
 from btgui.frontend.cli import CLI
@@ -979,6 +980,7 @@ class WindowManager:
                     self.owner.atom_frame_styles,
                     self.owner.frame_metrics,
                     self.owner.bond_adjacencies,
+                    self.owner.bond_orders,
                 )
                 viewer.draw_frame(reset_camera=reset_camera)
                 continue
@@ -989,12 +991,14 @@ class WindowManager:
             viewer.lattices = self.owner.lattices
             viewer.bond_frame_indices = set(self.owner.bond_frame_indices)
             viewer.bond_adjacencies = self.owner.bond_adjacencies
+            viewer.bond_orders = self.owner.bond_orders
             viewer.invalidate_bond_meshes()
             viewer.current_index = index
             viewer.set_frame_state(
                 self.owner.atom_frame_styles,
                 self.owner.frame_metrics,
                 self.owner.bond_adjacencies,
+                self.owner.bond_orders,
             )
             viewer.selected_indices = viewer.selected_indices[
                 (viewer.selected_indices >= 0)
@@ -1390,6 +1394,7 @@ class MainWindow(QMainWindow):
         self.atom_frame_styles = []
         self.frame_metrics = []
         self.bond_adjacencies = []
+        self.bond_orders = []
         self.bond_frame_indices = []
         self.open_handler = open_handler
         self.save_handler = save_handler
@@ -1470,6 +1475,12 @@ class MainWindow(QMainWindow):
         )
         self.clean_action.triggered.connect(self._clean_current_frame)
         self.toolbar.addAction(self.clean_action)
+        self.hydrogen_action = QAction("Add H", self)
+        self.hydrogen_action.setToolTip(
+            "Add hydrogens to the focused frame from the explicit bond orders"
+        )
+        self.hydrogen_action.triggered.connect(self._add_hydrogens)
+        self.toolbar.addAction(self.hydrogen_action)
 
         self.bond_menu = QMenu(self)
         self.add_bond_action = self.bond_menu.addAction("Add bond")
@@ -1967,7 +1978,8 @@ class MainWindow(QMainWindow):
         QApplication.processEvents()
         self.viewer.set_data(self.elements, self.coordinates, self.lattices)
         self.viewer.set_frame_state(
-            self.atom_frame_styles, self.frame_metrics, self.bond_adjacencies
+            self.atom_frame_styles, self.frame_metrics, self.bond_adjacencies,
+            self.bond_orders,
         )
         self.viewer.current_index = frame_index
         self.viewer.set_frame(frame_index)
@@ -2117,6 +2129,7 @@ class MainWindow(QMainWindow):
             {"length": {}, "angle": {}} for _ in self.coordinates
         ]
         self.bond_adjacencies = [None for _ in self.coordinates]
+        self.bond_orders = [None for _ in self.coordinates]
 
     def _ensure_frame_names(self):
         """Keep fixed frame names aligned with the structure lists.
@@ -2148,9 +2161,18 @@ class MainWindow(QMainWindow):
             self.frame_metrics.append({"length": {}, "angle": {}})
         while len(self.bond_adjacencies) < len(self.elements):
             self.bond_adjacencies.append(None)
+        while len(self.bond_orders) < len(self.elements):
+            self.bond_orders.append(None)
         del self.atom_frame_styles[len(self.elements):]
         del self.frame_metrics[len(self.elements):]
         del self.bond_adjacencies[len(self.elements):]
+        del self.bond_orders[len(self.elements):]
+        for frame, graph in enumerate(self.bond_adjacencies):
+            orders = self.bond_orders[frame]
+            if graph is None:
+                self.bond_orders[frame] = None
+            elif orders is None or len(orders) != len(graph[0]):
+                self.bond_orders[frame] = np.ones(len(graph[0]), dtype=np.int8)
         for frame, frame_elements in enumerate(self.elements):
             styles = self.atom_frame_styles[frame]
             if len(styles) < len(frame_elements):
@@ -2406,14 +2428,14 @@ class MainWindow(QMainWindow):
                     if len(self.coordinates) > extent:
                         suffix = {
                             name: getattr(self, name)[extent:]
-                            for name in ("atom_frame_styles", "frame_metrics", "bond_adjacencies", "frame_names")
+                            for name in ("atom_frame_styles", "frame_metrics", "bond_adjacencies", "bond_orders", "frame_names")
                         }
                         suffix["bases"] = {frame - extent: value for frame, value in self.supercell_bases.items() if frame >= extent}
                         suffix["transforms"] = {frame - extent: value for frame, value in self.supercell_transforms.items() if frame >= extent}
                         suffix["bond_frames"] = [frame - extent for frame in self.bond_frame_indices if frame >= extent]
                         suffix["current"] = self.current_index - extent if self.current_index >= extent else None
                         suffix["serial"] = self._frame_name_serial
-                        for name in ("atom_frame_styles", "frame_metrics", "bond_adjacencies", "frame_names"):
+                        for name in ("atom_frame_styles", "frame_metrics", "bond_adjacencies", "bond_orders", "frame_names"):
                             del getattr(self, name)[extent:]
                 context = entry.apply(
                     self.elements, self.coordinates, self.lattices, use_after
@@ -2433,10 +2455,12 @@ class MainWindow(QMainWindow):
                         self.frame_metrics.append({"length": {}, "angle": {}})
                     while len(self.bond_adjacencies) < prefix_count:
                         self.bond_adjacencies.append(None)
+                    while len(self.bond_orders) < prefix_count:
+                        self.bond_orders.append(None)
                     while len(self.frame_names) < prefix_count:
                         self._frame_name_serial += 1
                         self.frame_names.append(f"Frame {self._frame_name_serial}")
-                    for name in ("atom_frame_styles", "frame_metrics", "bond_adjacencies", "frame_names"):
+                    for name in ("atom_frame_styles", "frame_metrics", "bond_adjacencies", "bond_orders", "frame_names"):
                         getattr(self, name)[prefix_count:] = suffix[name]
                     for target, saved in ((self.supercell_bases, suffix["bases"]), (self.supercell_transforms, suffix["transforms"])):
                         for frame in list(target):
@@ -2479,6 +2503,7 @@ class MainWindow(QMainWindow):
             for record in self.window_manager.records:
                 viewer = record["viewer"]
                 viewer.bond_adjacencies = self.bond_adjacencies
+                viewer.bond_orders = self.bond_orders
                 viewer.bond_frame_indices = set(self.bond_frame_indices)
                 viewer.selected_bonds.clear()
                 viewer.invalidate_bond_meshes(changed_frames)
@@ -2751,14 +2776,21 @@ class MainWindow(QMainWindow):
         try:
             indices = self._selected_bond_frames()
             before = {frame: self.bond_adjacencies[frame] for frame in indices}
+            before_orders = {frame: self.bond_orders[frame] for frame in indices}
             after = {}
+            after_orders = {}
             for frame_index in indices:
                 after[frame_index] = build_bond_adjacency(
                     self.coordinates[frame_index],
                     self.elements[frame_index],
                     self.viewer.bond_tolerance,
                 )
-            change = BondChange.between("Check bonds", before, after)
+                after_orders[frame_index] = np.ones(
+                    len(after[frame_index][0]), dtype=np.int8
+                )
+            change = BondChange.between(
+                "Check bonds", before, after, before_orders, after_orders
+            )
         except (IndexError, TypeError, ValueError) as error:
             QMessageBox.warning(self, "Bonds", str(error))
             return
@@ -2766,6 +2798,7 @@ class MainWindow(QMainWindow):
         # did not change; history stores only the sparse difference from before.
         for frame in indices:
             self.bond_adjacencies[frame] = after[frame]
+            self.bond_orders[frame] = after_orders[frame]
         if change.frame_indices:
             self._record_change(change, already_applied=True)
         else:
@@ -2786,13 +2819,18 @@ class MainWindow(QMainWindow):
         try:
             indices = self._selected_bond_frames()
             before, after = {}, {}
+            before_orders, after_orders = {}, {}
             for frame_index in indices:
                 if self.bond_adjacencies[frame_index] is None:
                     before[frame_index] = None
+                    before_orders[frame_index] = None
                     after[frame_index] = build_bond_adjacency(
                         self.coordinates[frame_index],
                         self.elements[frame_index],
                         self.viewer.bond_tolerance,
+                    )
+                    after_orders[frame_index] = np.ones(
+                        len(after[frame_index][0]), dtype=np.int8
                     )
         except (IndexError, TypeError, ValueError) as error:
             blocker = QSignalBlocker(self.bond_action)
@@ -2804,7 +2842,13 @@ class MainWindow(QMainWindow):
         # Lazy initialization changes the graph too; record it so older graph
         # deltas can never be replayed against an unrecorded replacement graph.
         if after:
-            self._record_change(BondChange.between("Generate bonds", before, after))
+            for frame_index in after:
+                self.bond_orders[frame_index] = after_orders[frame_index]
+            self._record_change(
+                BondChange.between(
+                    "Generate bonds", before, after, before_orders, after_orders
+                )
+            )
 
     def _clear_bonds(self, checked=False):
         """Clear all graphs while retaining their complete originals in history.
@@ -2819,8 +2863,14 @@ class MainWindow(QMainWindow):
             frame: None if graph is None else np.array(graph, copy=True)
             for frame, graph in enumerate(self.bond_adjacencies)
         }
+        originals_orders = {
+            frame: None if orders is None else np.array(orders, dtype=np.int8, copy=True)
+            for frame, orders in enumerate(self.bond_orders)
+        }
         if originals:
-            self._record_change(ClearBondsChange("Clear bonds", originals))
+            self._record_change(
+                ClearBondsChange("Clear bonds", originals, originals_orders)
+            )
 
     def _begin_bond_addition(self, checked=False):
         """Start the temporary two-atom picker used for manual bonds.
@@ -2837,7 +2887,10 @@ class MainWindow(QMainWindow):
         self.viewer.set_measurement_mode("bond")
         self.viewer.draw_frame()
         self.viewer.setFocus(Qt.FocusReason.OtherFocusReason)
-        self._log("Add bond: select two different atoms; Escape cancels.")
+        self._log(
+            "Add bond: click a bond to cycle 1-2-3, or two atoms; "
+            "hold Ctrl to continue; Escape cancels."
+        )
 
     def _add_bond(self, frame_index, left, right):
         """Append one canonical manual edge independently of the cutoff.
@@ -2854,10 +2907,34 @@ class MainWindow(QMainWindow):
             return
         if left == right or min(left, right) < 0 or max(left, right) >= len(self.elements[frame_index]):
             return
+        pair = tuple(sorted((int(left), int(right))))
         original = self.bond_adjacencies[frame_index]
         graph = normalize_bond_adjacency(original)
-        replacement = normalize_bond_adjacency(np.column_stack((graph, sorted((left, right)))))
-        change = BondChange.between("Add bond", {frame_index: original}, {frame_index: replacement})
+        orders = self.bond_orders[frame_index]
+        if orders is None or len(orders) != len(graph[0]):
+            orders = np.ones(len(graph[0]), dtype=np.int8)
+        order_map = {
+            (int(source), int(target)): int(order)
+            for (source, target), order in zip(graph.T, orders)
+        }
+        if pair in order_map:
+            order_map[pair] = order_map[pair] % 3 + 1
+            description = "Change bond order"
+        else:
+            order_map[pair] = 1
+            description = "Add bond"
+        pairs = sorted(order_map)
+        replacement = np.asarray(pairs, dtype=np.int64).T.reshape(2, -1)
+        replacement_orders = np.asarray(
+            [order_map[item] for item in pairs], dtype=np.int8
+        )
+        change = BondChange.between(
+            description,
+            {frame_index: original},
+            {frame_index: replacement},
+            {frame_index: orders},
+            {frame_index: replacement_orders},
+        )
         if change.frame_indices:
             # Make an explicitly added bond immediately visible, including a
             # previously hidden frame, without computing any other connections.
@@ -2882,11 +2959,28 @@ class MainWindow(QMainWindow):
         if not 0 <= frame_index < len(self.bond_adjacencies) or not len(pairs):
             return
         graph = normalize_bond_adjacency(self.bond_adjacencies[frame_index])
+        orders = self.bond_orders[frame_index]
+        if orders is None or len(orders) != len(graph[0]):
+            orders = np.ones(len(graph[0]), dtype=np.int8)
+        order_map = {
+            (int(source), int(target)): int(order)
+            for (source, target), order in zip(graph.T, orders)
+        }
         pair_dtype = np.dtype([("src", np.int64), ("dst", np.int64)])
         current = np.ascontiguousarray(graph.T).view(pair_dtype).reshape(-1)
         selected = np.ascontiguousarray(np.asarray(pairs, dtype=np.int64)).view(pair_dtype).reshape(-1)
         after = graph[:, ~np.isin(current, selected)]
-        change = BondChange.between("Delete bonds", {frame_index: graph}, {frame_index: after})
+        after_orders = np.asarray(
+            [order_map[tuple(sorted((int(a), int(b))))] for a, b in after.T],
+            dtype=np.int8,
+        )
+        change = BondChange.between(
+            "Delete bonds",
+            {frame_index: graph},
+            {frame_index: after},
+            {frame_index: orders},
+            {frame_index: after_orders},
+        )
         if change.frame_indices:
             self._record_change(change)
 
@@ -3027,6 +3121,7 @@ class MainWindow(QMainWindow):
             bonds = BondChange.between(
                 "Reset supercell bonds",
                 {frame_index: self.bond_adjacencies[frame_index]}, {frame_index: None},
+                {frame_index: self.bond_orders[frame_index]}, {frame_index: None},
             )
             if bonds.frame_indices:
                 change = (bonds, change)
@@ -3216,12 +3311,29 @@ class MainWindow(QMainWindow):
                 return
             original = self.bond_adjacencies[frame_index]
             graph = normalize_bond_adjacency(original)
+            orders = self.bond_orders[frame_index]
+            if orders is None or len(orders) != len(graph[0]):
+                orders = np.ones(len(graph[0]), dtype=np.int8)
+            order_map = {
+                (int(source), int(target)): int(order)
+                for (source, target), order in zip(graph.T, orders)
+            }
             new_indices = np.arange(len(before_elements), len(after_elements), dtype=np.int64)
             # The original reference index survives every preview; subsequent
             # chain links join consecutive appended atoms, not nearest neighbors.
             chain = np.vstack((np.r_[int(reference_index), new_indices[:-1]], new_indices))
-            after_graph = normalize_bond_adjacency(np.concatenate((graph, chain), axis=1))
-            bonds = BondChange.between("Reference atom bonds", {frame_index: original}, {frame_index: after_graph})
+            for source, target in chain.T:
+                order_map[tuple(sorted((int(source), int(target))))] = 1
+            pairs = sorted(order_map)
+            after_graph = np.asarray(pairs, dtype=np.int64).T.reshape(2, -1)
+            after_orders = np.asarray(
+                [order_map[item] for item in pairs], dtype=np.int8
+            )
+            bonds = BondChange.between(
+                "Reference atom bonds",
+                {frame_index: original}, {frame_index: after_graph},
+                {frame_index: orders}, {frame_index: after_orders},
+            )
             change = (change, bonds)
         self._record_change(change, frame_index=frame_index)
 
@@ -3293,12 +3405,25 @@ class MainWindow(QMainWindow):
         # alone cannot restore incident edges, so retain their triples as well.
         original = self.bond_adjacencies[frame_index]
         graph = normalize_bond_adjacency(original)
+        orders = self.bond_orders[frame_index]
+        if orders is None or len(orders) != len(graph[0]):
+            orders = np.ones(len(graph[0]), dtype=np.int8)
+        order_map = {
+            (int(source), int(target)): int(order)
+            for (source, target), order in zip(graph.T, orders)
+        }
         keep = np.ones(len(before_elements), dtype=bool)
         keep[indices] = False
         mapping = np.full(len(before_elements), -1, dtype=np.int64)
         mapping[keep] = np.arange(np.count_nonzero(keep), dtype=np.int64)
         removed = graph[:, ~np.all(keep[graph], axis=0)].T
-        triples = np.column_stack((removed, np.ones(len(removed), dtype=np.int64)))
+        triples = np.asarray(
+            [
+                (int(source), int(target), order_map[(int(source), int(target))])
+                for source, target in removed
+            ],
+            dtype=np.int64,
+        ).reshape(-1, 3)
         bonds = BondChange(
             "Delete atom bonds", {frame_index: triples},
             {frame_index: np.empty((0, 3), dtype=np.int64)},
@@ -3544,6 +3669,109 @@ class MainWindow(QMainWindow):
             in_place=True,
         )
 
+    def _add_hydrogens(self):
+        """Append hydrogens from explicit bond orders and relax only those H.
+
+        Args:
+            None.
+
+        Return:
+            None. One compound history entry restores atoms, orders and bonds.
+        """
+        if not self.coordinates or self.viewer is None:
+            return
+        self._pause_playback()
+        frame_index = int(self.current_index)
+        if not 0 <= frame_index < len(self.coordinates):
+            return
+        original = self.bond_adjacencies[frame_index]
+        if original is None:
+            graph = build_bond_adjacency(
+                self.coordinates[frame_index],
+                self.elements[frame_index],
+                self.viewer.bond_tolerance,
+            )
+            orders = np.ones(len(graph[0]), dtype=np.int8)
+            original_orders = None
+            self._log("Add H: bonds were uncomputed; using Check bonds.")
+        else:
+            graph = normalize_bond_adjacency(original)
+            orders = self.bond_orders[frame_index]
+            if orders is None or len(orders) != len(graph[0]):
+                orders = np.ones(len(graph[0]), dtype=np.int8)
+            original_orders = orders
+        if len(graph[0]) == 0:
+            self._log("Add H: no bonds are available; run Check bonds first.")
+            return
+
+        before_count = len(self.elements[frame_index])
+        selected = np.asarray(self.viewer.selected_indices, dtype=int)
+        selected = selected[(selected >= 0) & (selected < before_count)]
+        new_elements, new_coordinates, new_graph, new_orders = add_hydrogens(
+            self.elements[frame_index],
+            self.coordinates[frame_index],
+            graph,
+            orders,
+            selected=selected if len(selected) else None,
+        )
+        added = len(new_elements) - before_count
+        if added == 0:
+            self._log("Add H: no main-group atom needs hydrogen.")
+            return
+
+        fixed = np.zeros_like(new_coordinates)
+        fixed[before_count:] = 1.0
+        try:
+            relaxed = clean_structure(
+                [self.lattices[frame_index]],
+                [new_elements],
+                [new_coordinates],
+                fixed=fixed,
+                bonds=new_graph,
+            )[2][0]
+        except Exception as error:
+            self._log(f"Add H: hydrogen relaxation skipped ({error}).")
+            relaxed = np.array(new_coordinates, copy=True)
+        if not self._confirm_metrics_topology_change():
+            return
+
+        before_elements = self.elements[frame_index]
+        before_coordinates = self.coordinates[frame_index]
+        before_lattice = self.lattices[frame_index]
+        after_elements = np.asarray(new_elements, dtype=before_elements.dtype)
+        after_coordinates = np.asarray(relaxed, dtype=float)
+        before_context = self._supercell_context(frame_index)
+        after_context = self._identity_supercell_context(
+            after_elements, after_coordinates, before_lattice
+        )
+        after_context["atom_styles"] = (
+            deepcopy(self.atom_frame_styles[frame_index])
+            + [dict() for _ in range(added)]
+        )
+        after_context["metrics"] = {"length": {}, "angle": {}}
+        after_context["appearance"] = self._appearance_context()
+        change = StructureChange.for_frame(
+            "Add hydrogens",
+            frame_index,
+            before_elements,
+            before_coordinates,
+            before_lattice,
+            after_elements,
+            after_coordinates,
+            before_lattice,
+            before_context=before_context,
+            after_context=after_context,
+        )
+        bonds = BondChange.between(
+            "Add hydrogen bonds",
+            {frame_index: original},
+            {frame_index: new_graph},
+            {frame_index: original_orders},
+            {frame_index: new_orders},
+        )
+        self._record_change((change, bonds), frame_index=frame_index)
+        self._log(f"Add H: appended {added} hydrogen atom(s).")
+
     def _sync_atom_actions(self, indices=None):
         """Enable replacement only when the current frame has a valid selection."""
         if not hasattr(self, "replace_atom_action"):
@@ -3667,6 +3895,7 @@ class MainWindow(QMainWindow):
                 self.atom_frame_styles,
                 self.frame_metrics,
                 self.bond_adjacencies,
+                self.bond_orders,
             )
         self.window_manager.refresh_all()
         self._sync_frame_controls()
@@ -3726,7 +3955,8 @@ class MainWindow(QMainWindow):
         QApplication.processEvents()
         viewer.set_data(self.elements, self.coordinates, self.lattices)
         viewer.set_frame_state(
-            self.atom_frame_styles, self.frame_metrics, self.bond_adjacencies
+            self.atom_frame_styles, self.frame_metrics, self.bond_adjacencies,
+            self.bond_orders,
         )
         # set_data initializes visibility to off; restore shared bond settings
         # after attaching the authoritative graph list to the new viewer.
@@ -3789,6 +4019,7 @@ class MainWindow(QMainWindow):
         self.atom_frame_styles.append([dict() for _ in self.elements[frame]])
         self.frame_metrics.append({"length": {}, "angle": {}})
         self.bond_adjacencies.append(None)
+        self.bond_orders.append(None)
         if name is None:
             self._frame_name_serial += 1
             name = f"Frame {self._frame_name_serial}"
@@ -3820,6 +4051,7 @@ class MainWindow(QMainWindow):
             self.atom_frame_styles,
             self.frame_metrics,
             self.bond_adjacencies,
+            self.bond_orders,
             self.frame_names,
         ):
             target[:] = [target[index] for index in retained]
@@ -3899,9 +4131,14 @@ class MainWindow(QMainWindow):
             frame: self.bond_adjacencies[frame]
             for frame in range(anchor_index + 1, len(self.elements))
         }
+        before_orders = {
+            frame: self.bond_orders[frame]
+            for frame in range(anchor_index + 1, len(self.elements))
+        }
         remove_bonds = BondChange.between(
             "Move copied frame bonds", before_graphs,
             {frame: None for frame in before_graphs},
+            before_orders, {frame: None for frame in before_graphs},
         )
         snapshots = []
         for index in selected:
@@ -3913,6 +4150,7 @@ class MainWindow(QMainWindow):
                     "styles": deepcopy(self.atom_frame_styles[index]),
                     "metrics": deepcopy(self.frame_metrics[index]),
                     "bonds": None if self.bond_adjacencies[index] is None else np.array(self.bond_adjacencies[index], copy=True),
+                    "orders": None if self.bond_orders[index] is None else np.array(self.bond_orders[index], dtype=np.int8, copy=True),
                     "name": f"{self.frame_names[index]}_copy",
                     "base": deepcopy(self.supercell_bases[index]),
                     "transform": deepcopy(self.supercell_transforms[index]),
@@ -3928,6 +4166,7 @@ class MainWindow(QMainWindow):
             self.atom_frame_styles.insert(position, snapshot["styles"])
             self.frame_metrics.insert(position, snapshot["metrics"])
             self.bond_adjacencies.insert(position, snapshot["bonds"])
+            self.bond_orders.insert(position, snapshot["orders"])
             self.frame_names.insert(position, snapshot["name"])
         self.bond_frame_indices = [
             index + len(snapshots) if index >= insert_at else index
@@ -3952,8 +4191,13 @@ class MainWindow(QMainWindow):
             frame: self.bond_adjacencies[frame]
             for frame in range(insert_at, len(self.elements))
         }
+        after_orders = {
+            frame: self.bond_orders[frame]
+            for frame in range(insert_at, len(self.elements))
+        }
         add_bonds = BondChange.between(
             "Restore copied frame bonds", {frame: None for frame in after_graphs}, after_graphs,
+            {frame: None for frame in after_graphs}, after_orders,
         )
         structure = StructureChange.for_batch(
             "Copy frames", before_elements, before_coordinates, before_lattices,
@@ -3981,6 +4225,7 @@ class MainWindow(QMainWindow):
             self.atom_frame_styles,
             self.frame_metrics,
             self.bond_adjacencies,
+            self.bond_orders,
             self.frame_names,
         ):
             old = list(target)
@@ -4780,6 +5025,11 @@ class MainWindow(QMainWindow):
                     contexts[frame]["metrics"] = self.frame_metrics[frame]
                     new_contexts[frame]["styles"] = [dict() for _ in new_elem[slot]]
                     new_contexts[frame]["metrics"] = {"length": {}, "angle": {}}
+                if rebuild:
+                    contexts[frame]["orders"] = self.bond_orders[frame]
+                    new_contexts[frame]["orders"] = np.ones(
+                        len(replacements[3][slot][0]), dtype=np.int8
+                    )
             if changed_frames:
                 # Four-field format: wholly unchanged fields collapse to None;
                 # mixed fields keep aligned None slots, never dummy array copies.
@@ -4804,6 +5054,8 @@ class MainWindow(QMainWindow):
                         if "styles" in context:
                             self.atom_frame_styles[frame] = context["styles"]
                             self.frame_metrics[frame] = context["metrics"]
+                        if "orders" in context:
+                            self.bond_orders[frame] = context["orders"]
                 self._record_change(change, already_applied=True)
             self._log(f"Updater changed {len(changed_frames)} frame(s) in-place: {updater_name}.")
         else:
@@ -5227,6 +5479,7 @@ class MainWindow(QMainWindow):
         before_coordinates = [np.array(value, copy=True) for value in self.coordinates]
         before_lattices = [np.array(value, copy=True) for value in self.lattices]
         before_graphs = list(self.bond_adjacencies)
+        before_orders = list(self.bond_orders)
         # Keep edges when node numbering is still valid (coordinate/species
         # edits or append-only updates). Unknown node-count replacements have
         # no reliable permutation, so their removed triples must be undoable.
@@ -5234,9 +5487,13 @@ class MainWindow(QMainWindow):
             frame: graph for frame, graph in enumerate(before_graphs)
             if frame >= len(elements) or len(before_elements[frame]) != len(elements[frame])
         }
+        reset_orders = {
+            frame: before_orders[frame] for frame in reset_graphs
+        }
         bonds = BondChange.between(
             "Reset updated frame bonds", reset_graphs,
             {frame: None for frame in reset_graphs},
+            reset_orders, {frame: None for frame in reset_graphs},
         )
         topology_changed = len(before_elements) != len(elements) or any(
             not np.array_equal(previous, current)
@@ -5257,6 +5514,10 @@ class MainWindow(QMainWindow):
             self._ensure_frame_state()
         self.bond_adjacencies[:] = [
             before_graphs[frame] if frame < len(before_graphs) and frame not in reset_graphs else None
+            for frame in range(len(elements))
+        ]
+        self.bond_orders[:] = [
+            before_orders[frame] if frame < len(before_orders) and frame not in reset_graphs else None
             for frame in range(len(elements))
         ]
         self._ensure_frame_names()

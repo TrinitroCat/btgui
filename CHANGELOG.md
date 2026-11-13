@@ -2,6 +2,28 @@
 
 ## Unreleased
 
+- Trimmed the default Nuitka VTK payload to the 36 modules listed in
+  `vtk_modules.txt`; this removes the unused VTK-m accelerators and their
+  roughly 39 MB VisKores dependency. `FULL_VTK=1` restores the complete
+  `vtkmodules` package.
+- Added root `Makefile` and Windows `build.bat` wrappers with `standalone` and
+  `onefile` Nuitka targets, packaging the `btgui` package, data tables, settings,
+  icon, and scipy. The batch wrapper uses `UPX_EXE` and clears `UPX` so the UPX
+  child process does not parse the executable path as its own configuration.
+- Retuned the preset Lennard-Jones term from the bundled van der Waals radii:
+  its minimum sits at `0.75 * (vdW_i + vdW_j)`, and bonded plus 1-3 pairs are
+  excluded from the non-bonded sum, so non-bonded atoms no longer settle at
+  bonding distances.
+- Added per-frame explicit bond orders (parallel `int8` arrays), Add bond order
+  cycling with Ctrl-persistent repeated clicks, and bond-order rendering as
+  parallel cylinders of constant total diameter. Check bonds still creates
+  single bonds only; clean ignores explicit orders.
+- Added the toolbar Add H action: hydrogens are counted from the valence left by
+  the explicit bond orders, placed around the missing-direction axis, and
+  relaxed by clean with all pre-existing atoms fixed.
+- Ctrl+left-drag box selection now adds the boxed atoms to the current atom
+  selection instead of replacing it; an empty Ctrl box leaves the selection
+  unchanged.
 - Added the built-in `clean` updater and its preset graph, bond-order, and force
   field modules; the toolbar Clean action relaxes the focused frame in place,
   honors an atom selection, and reuses the frame's existing bond graph. scipy is

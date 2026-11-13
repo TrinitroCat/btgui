@@ -47,6 +47,7 @@ class StructureViewer(QtInteractor):
         self.atom_frame_styles = []
         self.frame_metrics = []
         self.bond_adjacencies = []
+        self.bond_orders = []
         self.bond_frame_indices = set()
         self.bond_mesh_cache = {}
         self.bond_actor_cache = {}
@@ -172,6 +173,7 @@ class StructureViewer(QtInteractor):
         self.selected_indices = np.empty(0, dtype=int)
         self.selected_bonds.clear()
         self.bond_adjacencies = []
+        self.bond_orders = []
         self.bond_frame_indices = set()
         self.bond_mesh_cache = {}
         self.bond_actor_cache = {}
@@ -181,13 +183,14 @@ class StructureViewer(QtInteractor):
         self.set_measurement_mode(None)
         self.draw_frame(reset_camera=True)
 
-    def set_frame_state(self, atom_styles, metrics, bond_adjacencies=None):
+    def set_frame_state(self, atom_styles, metrics, bond_adjacencies=None, bond_orders=None):
         """Attach frame-aligned atom styles and measurement mappings.
 
         Args:
             atom_styles: Per-frame lists of per-atom style dictionaries.
             metrics: Per-frame dictionaries containing length and angle mappings.
             bond_adjacencies: Optional per-frame sparse bond index arrays.
+            bond_orders: Optional per-frame int8 bond-order arrays.
 
         Return:
             None. The provided containers remain owned by the main window.
@@ -196,6 +199,8 @@ class StructureViewer(QtInteractor):
         self.frame_metrics = metrics
         if bond_adjacencies is not None:
             self.bond_adjacencies = bond_adjacencies
+        if bond_orders is not None:
+            self.bond_orders = bond_orders
         if 0 <= self.current_index < len(metrics):
             self.length_measurements = metrics[self.current_index]["length"]
             self.angle_measurements = metrics[self.current_index]["angle"]
@@ -375,6 +380,9 @@ class StructureViewer(QtInteractor):
                 positions,
                 elements,
                 self.bond_adjacencies[self.current_index],
+                self.bond_orders[self.current_index]
+                if 0 <= self.current_index < len(self.bond_orders)
+                else None,
             )
         self.refresh_bond_selection(render=False)
         self._draw_measurements(positions)
@@ -519,13 +527,55 @@ class StructureViewer(QtInteractor):
             return vdw_radius(symbol) * float(style["scale"])
         return max(0.01, float(style["radius"]))
 
-    def _draw_bonds(self, positions, elements, adjacency):
-        """Draw cached covalent bonds as one batched world-coordinate tube mesh.
+    def _offset_tube_points(self, positions, left, right, order, colors):
+        """Return interleaved line points, endpoints, and colors for one order.
+
+        Multiple bond orders split the original cylinder along a diameter into
+        ``order`` touching cylinders of radius ``bond_width / order``; the
+        outer diameter is unchanged.
+        """
+        count = len(left)
+        axis = positions[right] - positions[left]
+        lengths = np.linalg.norm(axis, axis=1)
+        unit = axis / np.maximum(lengths, 1e-12)[:, None]
+        reference = np.array([0.0, 0.0, 1.0])
+        perpendicular = np.cross(unit, reference)
+        parallel = np.linalg.norm(perpendicular, axis=1) < 1e-6
+        if np.any(parallel):
+            perpendicular[parallel] = np.cross(
+                unit[parallel], np.array([0.0, 1.0, 0.0])
+            )
+        perpendicular /= np.maximum(
+            np.linalg.norm(perpendicular, axis=1), 1e-12
+        )[:, None]
+        offsets = (
+            np.arange(order, dtype=float) - (order - 1) / 2.0
+        ) * (2.0 * self.bond_width / order)
+        point_blocks = []
+        endpoint_blocks = []
+        color_blocks = []
+        for offset in offsets:
+            shifted_left = positions[left] + perpendicular * offset
+            shifted_right = positions[right] + perpendicular * offset
+            point_blocks.append(
+                np.stack((shifted_left, shifted_right), axis=1).reshape(-1, 3)
+            )
+            endpoint_blocks.append(np.column_stack((left, right)))
+            color_blocks.append(colors)
+        return (
+            np.concatenate(point_blocks),
+            np.concatenate(endpoint_blocks),
+            np.concatenate(color_blocks),
+        )
+
+    def _draw_bonds(self, positions, elements, adjacency, orders=None):
+        """Draw cached bonds as batched tubes, split by bond order.
 
         Args:
             positions: Current frame Cartesian positions.
             elements: Current frame element symbols.
             adjacency: Sparse COO index array shaped ``(2, E)``.
+            orders: Optional per-edge bond orders (1, 2 or 3).
 
         Return:
             None. Bond actors are added to the current renderer.
@@ -533,11 +583,14 @@ class StructureViewer(QtInteractor):
         adjacency = np.asarray(adjacency, dtype=np.int64)
         if adjacency.ndim != 2 or adjacency.shape[0] != 2:
             return
+        orders = None if orders is None else np.asarray(orders, dtype=np.int64).reshape(-1)
+        if orders is None or len(orders) != adjacency.shape[1]:
+            orders = np.ones(adjacency.shape[1], dtype=np.int64)
+        orders = np.clip(orders, 1, 3)
         cached = self.bond_mesh_cache.get(self.current_index)
         if cached is None:
-            # Section: one batched tube mesh. VTK expands the complete sparse
-            # edge list in one native pipeline instead of Python constructing
-            # and merging a separate cylinder for every bond.
+            # Section: one batched tube mesh per order. VTK expands each sparse
+            # group in one native pipeline instead of merging one cylinder per bond.
             left = adjacency[0]
             right = adjacency[1]
             valid = (
@@ -548,21 +601,13 @@ class StructureViewer(QtInteractor):
             )
             left = left[valid]
             right = right[valid]
+            orders = orders[valid]
             nonzero = np.linalg.norm(positions[right] - positions[left], axis=1) > 0.0
             left = left[nonzero]
             right = right[nonzero]
+            orders = orders[nonzero]
             cached = []
             if len(left):
-                points = np.empty((len(left) * 2, 3), dtype=float)
-                points[0::2] = positions[left]
-                points[1::2] = positions[right]
-                line_cells = np.column_stack(
-                    (
-                        np.full(len(left), 2, dtype=np.int64),
-                        np.arange(len(left) * 2, dtype=np.int64).reshape(-1, 2),
-                    )
-                ).ravel()
-                lines = pv.PolyData(points, lines=line_cells)
                 atom_colors = [
                     self._style_for(symbol, index)["color"]
                     for index, symbol in enumerate(elements)
@@ -581,16 +626,37 @@ class StructureViewer(QtInteractor):
                     ],
                     dtype=np.uint8,
                 )
-                lines.cell_data["bond_colors"] = colors
-                # Tube filtering propagates each input line's endpoints to its
-                # output cells. Pick by coordinates, never by transient cell IDs.
-                lines.cell_data["bond_endpoints"] = np.column_stack((left, right))
-                tubes = lines.tube(
-                    radius=self.bond_width,
-                    n_sides=8,
-                    capping=False,
-                )
-                cached.append(("bond_colors", tubes))
+                for order in (1, 2, 3):
+                    selected = orders == order
+                    if not np.any(selected):
+                        continue
+                    chosen_left = left[selected]
+                    chosen_right = right[selected]
+                    points, endpoints, cell_colors = self._offset_tube_points(
+                        positions,
+                        chosen_left,
+                        chosen_right,
+                        order,
+                        colors[selected],
+                    )
+                    line_count = len(chosen_left) * order
+                    line_cells = np.column_stack(
+                        (
+                            np.full(line_count, 2, dtype=np.int64),
+                            np.arange(line_count * 2, dtype=np.int64).reshape(-1, 2),
+                        )
+                    ).ravel()
+                    lines = pv.PolyData(points, lines=line_cells)
+                    lines.cell_data["bond_colors"] = cell_colors
+                    # Tube filtering propagates each input line's endpoints to its
+                    # output cells. Pick by coordinates, never by transient cell IDs.
+                    lines.cell_data["bond_endpoints"] = endpoints
+                    tubes = lines.tube(
+                        radius=self.bond_width / order,
+                        n_sides=8,
+                        capping=False,
+                    )
+                    cached.append(("bond_colors", tubes))
             self.bond_mesh_cache[self.current_index] = cached
             while len(self.bond_mesh_cache) > 4:
                 oldest = next(iter(self.bond_mesh_cache))
@@ -650,6 +716,9 @@ class StructureViewer(QtInteractor):
                 np.asarray(positions, dtype=float),
                 np.asarray(self.elements[self.current_index], dtype=str),
                 self.bond_adjacencies[self.current_index],
+                self.bond_orders[self.current_index]
+                if 0 <= self.current_index < len(self.bond_orders)
+                else None,
             )
         self.refresh_bond_selection(render=False)
         if render:
@@ -2147,57 +2216,81 @@ class StructureViewer(QtInteractor):
                     self._update_selection(np.empty(0, dtype=int), additive=False)
                 elif self.measurement_mode is not None:
                     if not self.dragged:
-                        picked = self._pick_atom(finish)
-                        if len(picked) == 0:
-                            self.set_measurement_mode(None)
-                            self.draw_frame(reset_camera=False)
-                        else:
-                            atom_index = int(picked[0])
-                            if atom_index not in self.measurement_selection:
-                                self.measurement_selection.append(atom_index)
-                            expected_count = 3 if self.measurement_mode == "angle" else 2
-                            if len(self.measurement_selection) == expected_count:
-                                if self.measurement_mode == "bond":
-                                    left, right = self.measurement_selection
+                        keep_mode = bool(
+                            event.modifiers() & Qt.KeyboardModifier.ControlModifier
+                        )
+                        handled_bond = False
+                        if self.measurement_mode == "bond":
+                            _, picked_bond = self._pick_structure(finish)
+                            if picked_bond is not None:
+                                self.measurement_selection = []
+                                self.bondAdded.emit(
+                                    int(self.current_index),
+                                    int(picked_bond[0]),
+                                    int(picked_bond[1]),
+                                )
+                                if not keep_mode:
                                     self.set_measurement_mode(None)
-                                    self.bondAdded.emit(int(self.current_index), left, right)
-                                elif self.measurement_mode == "length":
-                                    key = frozenset(self.measurement_selection)
-                                    if len(key) == 2:
-                                        if key in self.length_measurements:
-                                            del self.length_measurements[key]
-                                        else:
-                                            self.length_measurements[key] = {
-                                                "value": distance_between(
-                                                    self.coordinates[self.current_index],
-                                                    self.measurement_selection[0],
-                                                    self.measurement_selection[1],
-                                                ),
-                                                "style": self.default_metric_style(),
-                                            }
-                                else:
-                                    vertex = self.measurement_selection[1]
-                                    endpoints = frozenset(
-                                        (self.measurement_selection[0], self.measurement_selection[2])
-                                    )
-                                    if len(endpoints) == 2:
-                                        key = (vertex, endpoints)
-                                        if key in self.angle_measurements:
-                                            del self.angle_measurements[key]
-                                        else:
-                                            self.angle_measurements[key] = {
-                                                "value": angle_between(
-                                                    self.coordinates[self.current_index],
-                                                    vertex,
-                                                    self.measurement_selection[0],
-                                                    self.measurement_selection[2],
-                                                ),
-                                                "style": self.default_metric_style(),
-                                            }
+                                self.draw_frame(reset_camera=False)
+                                handled_bond = True
+                        if not handled_bond:
+                            picked = self._pick_atom(finish)
+                            if len(picked) == 0:
                                 self.set_measurement_mode(None)
                                 self.draw_frame(reset_camera=False)
                             else:
-                                self.draw_frame(reset_camera=False)
+                                atom_index = int(picked[0])
+                                if atom_index not in self.measurement_selection:
+                                    self.measurement_selection.append(atom_index)
+                                expected_count = 3 if self.measurement_mode == "angle" else 2
+                                if len(self.measurement_selection) == expected_count:
+                                    if self.measurement_mode == "bond":
+                                        left, right = self.measurement_selection
+                                        self.measurement_selection = []
+                                        self.bondAdded.emit(
+                                            int(self.current_index), int(left), int(right)
+                                        )
+                                        if not keep_mode:
+                                            self.set_measurement_mode(None)
+                                        self.draw_frame(reset_camera=False)
+                                    else:
+                                        if self.measurement_mode == "length":
+                                            key = frozenset(self.measurement_selection)
+                                            if len(key) == 2:
+                                                if key in self.length_measurements:
+                                                    del self.length_measurements[key]
+                                                else:
+                                                    self.length_measurements[key] = {
+                                                        "value": distance_between(
+                                                            self.coordinates[self.current_index],
+                                                            self.measurement_selection[0],
+                                                            self.measurement_selection[1],
+                                                        ),
+                                                        "style": self.default_metric_style(),
+                                                    }
+                                        else:
+                                            vertex = self.measurement_selection[1]
+                                            endpoints = frozenset(
+                                                (self.measurement_selection[0], self.measurement_selection[2])
+                                            )
+                                            if len(endpoints) == 2:
+                                                key = (vertex, endpoints)
+                                                if key in self.angle_measurements:
+                                                    del self.angle_measurements[key]
+                                                else:
+                                                    self.angle_measurements[key] = {
+                                                        "value": angle_between(
+                                                            self.coordinates[self.current_index],
+                                                            vertex,
+                                                            self.measurement_selection[0],
+                                                            self.measurement_selection[2],
+                                                        ),
+                                                        "style": self.default_metric_style(),
+                                                    }
+                                        self.set_measurement_mode(None)
+                                        self.draw_frame(reset_camera=False)
+                                else:
+                                    self.draw_frame(reset_camera=False)
                 elif self.dragged:
                     screen = self._project_atoms()
                     inside = (
@@ -2206,7 +2299,12 @@ class StructureViewer(QtInteractor):
                         & (screen[:, 1] >= min(self.press_position[1], finish[1]))
                         & (screen[:, 1] <= max(self.press_position[1], finish[1]))
                     )
-                    self._update_selection(np.flatnonzero(inside), additive=False)
+                    picked = np.flatnonzero(inside)
+                    if additive:
+                        # Section: Ctrl+box adds atoms; an empty rectangle
+                        # leaves the current atom selection unchanged.
+                        picked = np.union1d(self.selected_indices, picked)
+                    self._update_selection(picked, additive=False)
                 else:
                     picked_atom, picked_bond = self._pick_structure(finish)
                     # Section: Only Ctrl multiselect locks the current kind.

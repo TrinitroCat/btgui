@@ -64,6 +64,7 @@ The standalone entry point uses built-in serial readers and writers. File Open s
 - Left-click: select one atom or visible bond; blank space clears selection.
 - Ctrl+left-click: toggle atoms or bonds within the current selection type.
 - Left-drag: clear the old selection and select only atoms inside the rectangle.
+- Ctrl+left-drag: add atoms inside the rectangle to the current atom selection.
 - Scroll: zoom.
 
 Metrics > Length and Metrics > Angle temporarily replace normal atom selection. Pick
@@ -88,22 +89,29 @@ scale `1.0`; vdW spheres use `vdW radius × scale`. Appearance shows an editable
 Scale for these modes, an absolute Custom radius (Å) for custom spheres, and a
 disabled size control for points. Custom radius and Scale retain independent
 values. Display scaling does not affect bond detection. Bond width defaults to
-`0.3 Å` (the cylinder radius). The toolbar
+`0.3 Å` (the single-bond cylinder radius). The toolbar
 below it contains structure operations and current-frame playback/navigation.
 Axes and Grid are optional Appearance settings and default to off. Bond display
-and its tolerance are grouped under Bonds. Add bond temporarily selects two
-atoms to connect, independently of distance cutoffs. Check bonds computes the
+and its tolerance are grouped under Bonds. Add bond selects two atoms or an
+existing bond: two atoms receive a single bond, while a click on an existing bond
+cycles its order through 1-2-3-1. Hold Ctrl to keep Add bond active for repeated
+bond or atom-pair clicks; Escape cancels. Check bonds computes the
 complete pair-distance matrix and fully rebuilds each selected frame's COO graph;
-this may restore manually deleted bonds. Show bonds initializes only uncomputed
-graphs and otherwise displays existing connections. Clear bonds explicitly empties
-all graphs and keeps full originals in history. Add/Delete/Check use edge deltas
+this resets that frame's bond orders to single bonds. Show bonds initializes only
+uncomputed graphs and otherwise displays existing connections. Clear bonds
+explicitly empties all graphs and keeps full originals in history. Each frame
+stores a parallel `int8` bond-order array; an order-n bond is drawn as n parallel
+cylinders of radius `bond width / n`, keeping the total diameter unchanged.
+Orders affect automatic hydrogen addition and rendering only; clean ignores
+them. Add/Delete/Check use edge deltas
 in the shared Undo/Redo history. Atom and bond clicks pick the nearest rendered
 sphere/tube surface, with roughly one physical pixel of edge tolerance, so bond
 hit regions follow the displayed width under zoom and either projection.
 Ordinary clicks switch between atom and bond selections, releasing the previous
 kind. Ctrl toggles within the current kind and ignores hits on the other kind.
 Blank clicks clear both kinds; box selection clears the previous selection and
-selects atoms only. Delete removes the selected kind. Bond selection prints one-based endpoints,
+selects atoms only. Ctrl+left-drag adds the boxed atoms to the current atom
+selection. Delete removes the selected kind. Bond selection prints one-based endpoints,
 element symbols and Cartesian length in Å. Resize is available
 from the Supercell menu. PBC wrap applies fractional-coordinate wrapping to the
 selected frames and is undoable. The View menu contains lattice-axis views and
@@ -131,6 +139,17 @@ or out-of-range input is rejected with a warning and changes nothing. Renderer-w
 defaults and scene settings ignore the frame selector, and a listed frame that
 lacks a selected index keeps its own atoms. Background, axes, grid, and bond
 settings remain scene-wide.
+
+### Automatic hydrogen addition
+
+The toolbar **Add H** action appends hydrogens to the focused frame from the
+stored bond orders. For each main-group atom, the used valence is the sum of its
+incident bond orders; the remaining valence is filled with H (`<= 0` adds none).
+Check bonds creates single bonds only, so double and triple bonds must be set
+with Add bond before an unsaturated structure is hydrogenated. New hydrogens are
+placed around the missing-direction axis with roughly uniform azimuths and then
+relaxed by the clean force field while every pre-existing atom stays fixed. The
+atom count, bond orders, and hydrogen coordinates are committed as one undo step.
 
 Enter `help` in the bottom command line for available commands. Property overlays can be added with `MainWindow.register_property_renderer(name, callback)`; the callback receives `(plotter, frame_index, positions)`.
 
@@ -258,12 +277,97 @@ are not considered.
 The updater is registered like any other updater and follows the standard frame
 scope and append semantics. The toolbar **Clean** action runs it in place on the
 focused frame: with a non-empty atom selection only the selected atoms move, and
-the frame's existing bond graph is reused when present. scipy is a core
+the frame's existing bond graph is reused when present. The Lennard-Jones term is
+calibrated from the bundled van der Waals radii: its minimum sits at
+`lj_equilibrium_scale * (vdW_i + vdW_j)` with the default `0.75`, which keeps
+non-bonded contacts near 1.5-2 times the covalent bond length. Bonded and 1-3
+pairs are excluded from the non-bonded sum. scipy is a core
 dependency and supplies the L-BFGS-B optimizer. Embedding applications can pass
-`fixed`, `bonds`, `maxiter`, `bond_k`, `angle_k`, `lj_epsilon`, `lj_sigma_scale`
-and `lj_cutoff` through `apply_updater`.
+`fixed`, `bonds`, `maxiter`, `bond_k`, `angle_k`, `lj_epsilon`,
+`lj_equilibrium_scale` and `lj_cutoff` through `apply_updater`.
 
-For a Nuitka standalone build (including onefile), place an editable
-`settings.json` beside the executable; it takes precedence over the packaged
-defaults. `BTGUI_CONFIG_FILE` can be used to point to another configuration
-file.
+## Nuitka build
+
+A root `Makefile` wraps the standalone and onefile builds around
+`src/btgui/app.py`, the same entry point as the `btgui` console script.
+
+Prerequisites:
+
+- a Python environment with this project installed editable (`pip install -e .`);
+- Nuitka (`pip install nuitka`) and a working C compiler;
+- GNU Make for the `Makefile` targets, or `build.bat` on Windows without GNU Make.
+
+```text
+make help
+make standalone     # build/nuitka/app.dist/btgui.exe
+make onefile        # build/nuitka/btgui.exe
+make clean
+```
+
+On Linux and macOS the Makefile adds `--static-libpython=no`, because conda's
+`libpython*.a` is frequently an LTO/LLVM archive that the system linker rejects
+with `File format not recognized`. Override with
+`make standalone STATIC_LIBPYTHON=--static-libpython=yes` only if the static
+archive is known to be valid.
+
+Variables can be overridden on the command line:
+
+```text
+make standalone PYTHON=python JOBS=8 OUTPUT_DIR=build/nuitka
+make standalone CONSOLE_MODE=disable
+make onefile UPX=C:/tools/upx.exe
+make standalone EXTRA_FLAGS="--include-package=scipy"
+make standalone FULL_VTK=1
+```
+
+On Windows without GNU Make, use `build.bat`, which carries the same options:
+
+```bat
+build.bat standalone
+build.bat onefile
+build.bat clean
+build.bat help
+```
+
+Override the same settings through environment variables:
+
+```bat
+set OUTPUT_DIR=D:\nuitka_build
+set CONSOLE_MODE=disable
+set UPX_EXE=C:\tools\upx.exe
+build.bat standalone
+```
+
+`build.bat flags` prints the expanded Nuitka command line for inspection.
+
+By default the build includes only the 36 VTK modules listed in
+`vtk_modules.txt`, the set PyVista/PyVistaQt actually loads for btgui. This
+drops the unused `vtkAcceleratorsVTKm*` modules and their roughly 39 MB VisKores
+dependency, plus other unused VTK readers and filters. Set `FULL_VTK=1` to package
+all of `vtkmodules` instead (larger, but useful as a compatibility fallback):
+
+```text
+make standalone FULL_VTK=1
+```
+
+```bat
+set FULL_VTK=1
+build.bat standalone
+```
+
+> **UPX is optional and off by default.** Windows Defender often flags
+> UPX-packed scipy DLLs (the temporary `*.upx` files) as malware and may
+> quarantine them while Nuitka is working, which then fails with
+> `OSError: [Errno 22]` or a UPX plugin error. Prefer building without
+> `UPX_EXE` and compressing the finished `app.dist` with 7z or an installer.
+> If UPX is required, exclude the build directory from real-time scanning for
+> the duration of the build, but expect the packed binaries to be flagged on
+> other machines too.
+
+The Makefile and batch wrapper set `PYTHONPATH=src`, include the complete
+`btgui` package, `scipy.optimize`, PyVista/PyVistaQt, the selected VTK modules,
+the JSON data tables, and `settings.json`; on Windows they also apply
+`gui_logo.ico` and the requested console mode. For an editable configuration,
+place a `settings.json` beside the built executable (or point
+`BTGUI_CONFIG_FILE` at another file); it takes precedence over the packaged
+defaults.

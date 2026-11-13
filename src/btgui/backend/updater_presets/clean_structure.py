@@ -16,7 +16,7 @@ from btgui.backend.updater_presets.simple_forcefield import (
     Harmonics,
     LennardJones,
 )
-from btgui.data.appearance import covalent_radius
+from btgui.data.appearance import covalent_radius, vdw_radius
 
 
 BOND_LENGTH_OFFSETS = {1: 0.0, 2: 0.18, 3: 0.30}
@@ -75,7 +75,7 @@ def _relax_frame(
     bond_k,
     angle_k,
     lj_epsilon,
-    lj_sigma_scale,
+    lj_equilibrium_scale,
     lj_cutoff,
     optimizer,
 ):
@@ -103,8 +103,11 @@ def _relax_frame(
         ],
         dtype=object,
     )
-    radii = np.asarray(
+    covalent_radii = np.asarray(
         [covalent_radius(str(symbol)) for symbol in elements], dtype=float
+    )
+    vdw_radii = np.asarray(
+        [vdw_radius(str(symbol)) for symbol in elements], dtype=float
     )
 
     bond_mask = graph.bond_mask
@@ -125,14 +128,14 @@ def _relax_frame(
         )
         k_values[bond_mask] = bond_k * orders
         l_values[bond_mask] = (
-            radii[bond_edges[0]] + radii[bond_edges[1]] - offsets
+            covalent_radii[bond_edges[0]] + covalent_radii[bond_edges[1]] - offsets
         )
 
     terms = (
         Harmonics(k_values, l_values),
         AngleCosineHarmonics(angle_k, labels),
         LennardJones(
-            lj_epsilon, lj_sigma_scale, lj_cutoff, radii
+            lj_epsilon, lj_equilibrium_scale, lj_cutoff, vdw_radii
         ),
     )
 
@@ -214,7 +217,7 @@ def clean(
     bond_k=10.0,
     angle_k=1.0,
     lj_epsilon=5e-3,
-    lj_sigma_scale=0.8,
+    lj_equilibrium_scale=0.75,
     lj_cutoff=6.0,
     optimizer=None,
 ):
@@ -237,7 +240,9 @@ def clean(
         bond_k: Harmonic bond force constant per unit bond order.
         angle_k: Cosine-angle force constant.
         lj_epsilon: Weak Lennard-Jones well depth.
-        lj_sigma_scale: Multiplier on the covalent-radius sum for sigma.
+        lj_equilibrium_scale: Multiplier on the van der Waals radius sum that
+            places the Lennard-Jones minimum at
+            ``scale * (vdW_i + vdW_j)``.
         lj_cutoff: Lennard-Jones cutoff; candidates are stored to 1.3 times
             this value.
         optimizer: Optional ``callable(objective, x0) -> ndarray`` replacing
@@ -276,7 +281,7 @@ def clean(
             bond_k=bond_k,
             angle_k=angle_k,
             lj_epsilon=lj_epsilon,
-            lj_sigma_scale=lj_sigma_scale,
+            lj_equilibrium_scale=lj_equilibrium_scale,
             lj_cutoff=lj_cutoff,
             optimizer=optimizer,
         )

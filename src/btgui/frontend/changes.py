@@ -11,6 +11,36 @@ import numpy as np
 from btgui.backend.core import normalize_bond_adjacency
 
 
+def _bond_order_map(graph, orders):
+    """Return a canonical endpoint-pair to bond-order mapping."""
+    graph = normalize_bond_adjacency(graph)
+    pairs = graph.T
+    if orders is None or len(orders) != len(pairs):
+        values = np.ones(len(pairs), dtype=np.int64)
+    else:
+        values = np.asarray(orders, dtype=np.int64)
+    return {
+        (int(source), int(target)): int(order)
+        for (source, target), order in zip(pairs, values)
+    }
+
+
+def _mapped_order_map(order_map, mapping, inverse=False):
+    """Remap endpoint keys, dropping deleted atoms and canonicalizing pairs."""
+    if inverse:
+        retained = np.flatnonzero(mapping >= 0)
+        inverse_map = np.empty(len(retained), dtype=np.int64)
+        inverse_map[mapping[retained]] = retained
+        mapping = inverse_map
+    result = {}
+    for (source, target), order in order_map.items():
+        new_source = int(mapping[source])
+        new_target = int(mapping[target])
+        if new_source >= 0 and new_target >= 0:
+            result[tuple(sorted((new_source, new_target)))] = order
+    return result
+
+
 @dataclass
 class BondChange:
     """Store only changed COO triples and optional atom-index mappings.
@@ -27,9 +57,9 @@ class BondChange:
         A reversible graph delta, never a pair of full graph snapshots.
 
     Note:
-        The graph is currently unweighted: ``info == 1`` denotes an edge.
-        Endpoint indices are zero-based; console formatting alone is one-based.
-        ``None`` is uncomputed, whereas empty ``(2, 0)`` is an explicit graph.
+        The third triple column is the bond order (1, 2 or 3). Endpoint indices
+        are zero-based; console formatting alone is one-based. ``None`` is
+        uncomputed, whereas empty ``(2, 0)`` is an explicit graph.
     """
 
     description: str
@@ -52,39 +82,42 @@ class BondChange:
         return tuple(sorted(self.before_missing))
 
     @classmethod
-    def between(cls, description, before, after):
-        """Compare canonical edge coordinates using vectorized sorted matching.
+    def between(cls, description, before, after, before_orders=None, after_orders=None):
+        """Compare canonical edge coordinates and bond orders.
 
         Args:
             description: History label.
             before: Mapping from frame to its old COO or ``None``.
             after: Mapping from frame to its replacement COO or ``None``.
+            before_orders: Optional mapping from frame to old order arrays.
+            after_orders: Optional mapping from frame to new order arrays.
 
         Return:
-            A delta containing only removed/added ``(i, j, 1)`` triples.
+            A delta containing only removed/added ``(i, j, order)`` triples.
         """
+        before_orders = before_orders or {}
+        after_orders = after_orders or {}
         removed, added, missing, after_missing = {}, {}, {}, {}
         for frame, replacement in after.items():
-            old = normalize_bond_adjacency(before[frame])
-            new = normalize_bond_adjacency(replacement)
-            # Section: Structured pairs compare lexicographically without i*N+j
-            # packing, which would introduce an atom-count/overflow dependency.
-            pair_dtype = np.dtype([("src", np.int64), ("dst", np.int64)])
-            old_pairs = np.ascontiguousarray(old.T).view(pair_dtype).reshape(-1)
-            new_pairs = np.ascontiguousarray(new.T).view(pair_dtype).reshape(-1)
-            old_only = ~np.isin(old_pairs, new_pairs, assume_unique=True)
-            new_only = ~np.isin(new_pairs, old_pairs, assume_unique=True)
+            old_orders = _bond_order_map(before[frame], before_orders.get(frame))
+            new_orders = _bond_order_map(replacement, after_orders.get(frame))
+            removed_rows = []
+            added_rows = []
+            for key in sorted(set(old_orders) - set(new_orders)):
+                removed_rows.append((*key, old_orders[key]))
+            for key in sorted(set(new_orders) - set(old_orders)):
+                added_rows.append((*key, new_orders[key]))
+            for key in sorted(set(old_orders) & set(new_orders)):
+                if old_orders[key] != new_orders[key]:
+                    removed_rows.append((*key, old_orders[key]))
+                    added_rows.append((*key, new_orders[key]))
             if (
-                not old_only.any() and not new_only.any()
+                not removed_rows and not added_rows
                 and (before[frame] is None) == (replacement is None)
             ):
                 continue
-            removed[frame] = np.column_stack((
-                old[:, old_only].T, np.ones(old_only.sum(), dtype=np.int64),
-            ))
-            added[frame] = np.column_stack((
-                new[:, new_only].T, np.ones(new_only.sum(), dtype=np.int64),
-            ))
+            removed[frame] = np.asarray(removed_rows, dtype=np.int64).reshape(-1, 3)
+            added[frame] = np.asarray(added_rows, dtype=np.int64).reshape(-1, 3)
             missing[frame] = before[frame] is None
             after_missing[frame] = replacement is None
         return cls(description, removed, added, missing, after_missing=after_missing)
@@ -93,46 +126,53 @@ class BondChange:
         """Apply a delta or its inverse without touching unrelated graph edges.
 
         Args:
-            window: Owner of frame-aligned ``bond_adjacencies``.
+            window: Owner of frame-aligned ``bond_adjacencies`` and
+                ``bond_orders``.
             use_after: True for Redo, False for Undo.
 
         Return:
-            None. Every replaced graph remains canonical.
+            None. Every replaced graph remains canonical and orders stay aligned.
         """
         for frame in self.frame_indices:
             graph = normalize_bond_adjacency(window.bond_adjacencies[frame])
+            orders = getattr(window, "bond_orders", None)
+            current_orders = (
+                orders[frame] if orders is not None and frame < len(orders) else None
+            )
+            order_map = _bond_order_map(graph, current_orders)
             drop = self.removed[frame] if use_after else self.added[frame]
             insert = self.added[frame] if use_after else self.removed[frame]
             # Section: Remove triples in the current index space BEFORE mapping.
-            if len(drop):
-                pair_dtype = np.dtype([("src", np.int64), ("dst", np.int64)])
-                current_pairs = np.ascontiguousarray(graph.T).view(pair_dtype).reshape(-1)
-                drop_pairs = np.ascontiguousarray(drop[:, :2]).view(pair_dtype).reshape(-1)
-                graph = graph[:, ~np.isin(current_pairs, drop_pairs, assume_unique=True)]
+            for source, target, _order in drop:
+                order_map.pop((int(source), int(target)), None)
             if self.mappings is not None and frame in self.mappings:
-                mapping = self.mappings[frame]
-                if use_after:
-                    graph = mapping[graph]
-                    graph = graph[:, np.all(graph >= 0, axis=0)]
-                else:
-                    # Invert the old->new map explicitly so both endpoints use
-                    # the same inverse even if retained nodes were reordered.
-                    retained = np.flatnonzero(mapping >= 0)
-                    inverse = np.empty(len(retained), dtype=np.int64)
-                    inverse[mapping[retained]] = retained
-                    graph = inverse[graph]
-            if len(insert):
-                graph = np.concatenate((graph, insert[:, :2].T), axis=1)
-            # Missing/explicit-empty is metadata, not an edge delta. Retain it
-            # separately so Undo of lazy generation or a topology reset is exact.
+                order_map = _mapped_order_map(
+                    order_map, self.mappings[frame], inverse=not use_after
+                )
+            for source, target, order in insert:
+                pair = tuple(sorted((int(source), int(target))))
+                order_map[pair] = int(order)
             if use_after:
                 missing = self.after_missing is not None and self.after_missing.get(frame, False)
             else:
                 missing = self.before_missing[frame]
-            window.bond_adjacencies[frame] = (
-                None if missing
-                else normalize_bond_adjacency(graph)
-            )
+            if missing:
+                window.bond_adjacencies[frame] = None
+                if orders is not None and frame < len(orders):
+                    orders[frame] = None
+                continue
+            pairs = sorted(order_map)
+            if pairs:
+                replacement = np.asarray(pairs, dtype=np.int64).T
+                replacement_orders = np.asarray(
+                    [order_map[pair] for pair in pairs], dtype=np.int8
+                )
+            else:
+                replacement = np.empty((2, 0), dtype=np.int64)
+                replacement_orders = np.empty(0, dtype=np.int8)
+            window.bond_adjacencies[frame] = normalize_bond_adjacency(replacement)
+            if orders is not None and frame < len(orders):
+                orders[frame] = replacement_orders
 
 
 @dataclass
@@ -142,6 +182,7 @@ class ClearBondsChange:
     Args:
         description: History label.
         originals: Detached per-frame COO snapshots, including ``None``.
+        orders: Optional detached per-frame bond-order snapshots.
 
     Return:
         A clear/restore event; other bond edits use sparse deltas.
@@ -149,6 +190,7 @@ class ClearBondsChange:
 
     description: str
     originals: dict
+    orders: dict | None = None
 
     @property
     def frame_indices(self):
@@ -166,7 +208,7 @@ class ClearBondsChange:
         """Clear graphs on Redo and restore their exact snapshots on Undo.
 
         Args:
-            window: Owner of the graph list.
+            window: Owner of the graph and order lists.
             use_after: Whether to clear rather than restore.
 
         Return:
@@ -175,10 +217,20 @@ class ClearBondsChange:
         for frame, original in self.originals.items():
             if use_after:
                 window.bond_adjacencies[frame] = np.empty((2, 0), dtype=np.int64)
+                window.bond_orders[frame] = np.empty(0, dtype=np.int8)
             else:
                 window.bond_adjacencies[frame] = (
                     None if original is None else np.array(original, copy=True)
                 )
+                saved = None if self.orders is None else self.orders.get(frame)
+                if saved is not None:
+                    window.bond_orders[frame] = np.array(saved, dtype=np.int8, copy=True)
+                elif original is None:
+                    window.bond_orders[frame] = None
+                else:
+                    window.bond_orders[frame] = np.ones(
+                        len(np.asarray(original).reshape(2, -1)[0]), dtype=np.int8
+                    )
 
 
 @dataclass
@@ -254,6 +306,7 @@ class InplaceUpdaterChange:
                 ("transform", window.supercell_transforms),
                 ("styles", window.atom_frame_styles),
                 ("metrics", window.frame_metrics),
+                ("orders", window.bond_orders),
             ):
                 if key in saved:
                     target[frame], saved[key] = saved[key], target[frame]

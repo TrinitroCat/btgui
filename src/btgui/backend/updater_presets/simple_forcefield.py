@@ -205,29 +205,62 @@ class AngleCosineHarmonics(StdTerm):
 
 
 class LennardJones(StdTerm):
-    """Weak Lennard-Jones term on non-bonded candidate pairs.
+    """Lennard-Jones term calibrated by the van der Waals radii.
 
     The graph stores non-bonded candidates up to ``1.3 * cutoff``; the term
     only applies the potential to pairs within ``cutoff``. The 1/2 factor
-    keeps symmetric ``ij``/``ji`` entries from double counting.
+    keeps symmetric ``ij``/``ji`` entries from double counting. For each pair,
+    ``r_min = equilibrium_scale * (vdW_i + vdW_j)`` and
+    ``sigma = r_min / 2**(1/6)``, so the potential minimum sits at the scaled
+    van der Waals contact distance rather than at a covalent bond length.
     """
 
     def __init__(
             self,
             epsilon: float,
-            sigma_scale: float,
+            equilibrium_scale: float,
             cutoff: float,
-            radii: np.ndarray,
+            vdw_radii: np.ndarray,
     ):
         self.epsilon = float(epsilon)
-        self.sigma_scale = float(sigma_scale)
+        self.equilibrium_scale = float(equilibrium_scale)
         self.cutoff = float(cutoff)
-        self.radii = np.asarray(radii, dtype=float)
+        self.vdw_radii = np.asarray(vdw_radii, dtype=float)
+        self._excluded = None
+
+    def _exclusion_mask(self, G: ChemGraph):
+        """Exclude bonded and 1-3 pairs from the non-bonded term."""
+        count = G.indices.shape[1]
+        excluded = np.zeros(count, dtype=bool)
+        if G.bond_mask is None:
+            return excluded
+        excluded |= G.bond_mask
+        neighbours = [set() for _ in range(G.n_atoms)]
+        for source, target in G.indices[:, G.bond_mask].T:
+            source, target = int(source), int(target)
+            neighbours[source].add(target)
+            neighbours[target].add(source)
+        lookup = {
+            (int(source), int(target)): index
+            for index, (source, target) in enumerate(G.indices.T)
+        }
+        for centre, adjacent in enumerate(neighbours):
+            ordered = sorted(adjacent)
+            for first in range(len(ordered)):
+                for second in range(first + 1, len(ordered)):
+                    pair = (ordered[first], ordered[second])
+                    index = lookup.get(pair)
+                    if index is not None:
+                        excluded[index] = True
+        return excluded
 
     def apply(self, G: ChemGraph):
+        if self._excluded is None:
+            self._excluded = self._exclusion_mask(G)
         mask = ~G.bond_mask if G.bond_mask is not None else np.ones(
             G.indices.shape[1], dtype=bool
         )
+        mask &= ~self._excluded
         mask &= G.dist_ij <= self.cutoff
         if not np.any(mask):
             return 0.0, np.zeros((G.n_atoms, 3), dtype=float)
@@ -235,7 +268,8 @@ class LennardJones(StdTerm):
         indices = G.indices[:, mask]
         distance = G.dist_ij[mask]
         vector = G.r_ij[mask]
-        sigma = self.sigma_scale * (self.radii[indices[0]] + self.radii[indices[1]])
+        pair_radius = self.vdw_radii[indices[0]] + self.vdw_radii[indices[1]]
+        sigma = self.equilibrium_scale * pair_radius / 2.0 ** (1.0 / 6.0)
         safe = np.where(distance > 0.0, distance, np.inf)
         ratio6 = (sigma / safe) ** 6
         energy = 0.5 * 4.0 * self.epsilon * float(
