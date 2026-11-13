@@ -1847,6 +1847,7 @@ class MainWindow(QMainWindow):
         self.file_tree.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.file_tree.doubleClicked.connect(self._file_tree_double_clicked)
         self.file_tree.customContextMenuRequested.connect(self._show_file_context_menu)
+        self.file_model.fileRenamed.connect(self._on_file_renamed)
         self.file_placeholder = QLabel(
             "Open a structure file to browse its directory.", self.file_dock
         )
@@ -4139,10 +4140,35 @@ class MainWindow(QMainWindow):
                 continue
             try:
                 key.relative_to(path)
-                return True
             except ValueError:
                 continue
+            if path.is_dir() or key == self.active_key or state.window_refs:
+                return True
         return False
+
+    def _on_file_renamed(self, directory, old_name, new_name):
+        """Move a cached file-state key after an inline filesystem rename."""
+        directory = Path(directory)
+        old_path = directory / old_name
+        new_path = directory / new_name
+        state = self.files.pop(old_path, None)
+        if state is not None and state.window_refs == 0 and not state.closed:
+            state.path = new_path.resolve()
+            self.files[state.path] = state
+        self._sync_file_manager(force=True)
+
+    def _drop_cached_paths(self, path):
+        """Release cached states for a deleted file or directory."""
+        path = Path(path)
+        for key, state in list(self.files.items()):
+            if key is None or state.window_refs or key == self.active_key:
+                continue
+            try:
+                key.relative_to(path)
+            except ValueError:
+                continue
+            self.files.pop(key, None)
+            state.close()
 
     def _show_file_context_menu(self, position):
         """Offer the standard file operations for the selected tree item."""
@@ -4204,6 +4230,7 @@ class MainWindow(QMainWindow):
         if answer != QMessageBox.StandardButton.Yes:
             return
         if QFile.moveToTrash(str(path)):
+            self._drop_cached_paths(path)
             self._sync_file_manager(force=True)
             return
         fallback = QMessageBox.question(
@@ -4221,6 +4248,8 @@ class MainWindow(QMainWindow):
         )
         if not removed:
             QMessageBox.warning(self, "Delete", f"Could not delete {path.name}.")
+        else:
+            self._drop_cached_paths(path)
         self._sync_file_manager(force=True)
 
     def _copy_path(self, path):
