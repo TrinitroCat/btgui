@@ -6,6 +6,7 @@
   "atom_edge_color": "#202020",
   "atom_edge_width": 1.0,
   "keyboard_translation_step": 0.1,
+  "file_cache_limit_mb": 1024,
   "buctoolkit_paths": [],
   "updater_path": [],
   "updater_function": []

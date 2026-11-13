@@ -2,6 +2,21 @@
 
 ## Unreleased
 
+- Reworked structure data into per-file workspaces with independent frames,
+  playback, Undo/Redo and CLI scope. Windows are unique per `(file, frame)`;
+  opening a file creates a new window, while reopening it only focuses its
+  existing window.
+- Added the left Files dock above the frame list, with directory following,
+  double-click opening, and Open/New Folder/Rename/Delete/Copy Path/Refresh
+  actions that avoid renaming or deleting open files.
+- Added window reference-counted file caching with a configurable 1 GB default,
+  automatic release of unreferenced files, and a Settings > Clear File Cache
+  action.
+- Added a one-based `file[frame]` overlay in each viewer, pastel per-file window
+  borders controlled by the default-on Appearance option "distinguish files by
+  frame colours", and a default atom-radius floor of `1.15 × bond width`.
+- Split the toolbar into thin-bordered Edit, Structure, Measure, Update and
+  Frames groups; Bonds belongs to Structure and Clean/Add H to Update.
 - Trimmed the default Nuitka VTK payload to the 36 modules listed in
   `vtk_modules.txt`; this removes the unused VTK-m accelerators and their
   roughly 39 MB VisKores dependency. `FULL_VTK=1` restores the complete

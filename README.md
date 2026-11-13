@@ -47,7 +47,7 @@ Omitting files opens an empty viewer. Use `btgui --help` for command-line help
 and `btgui -- -structure.xyz` for a filename beginning with a hyphen. Startup
 files use the same reader as File Open; loading errors appear in the GUI console.
 
-The standalone entry point uses built-in serial readers and writers. File Open supports multi-selection and appends POSCAR, CIF, XYZ, EXTXYZ, or complete OUTCAR trajectories directly to the three GUI lists. The command `open PATH` accepts one path or a path list; `save PATH` writes the current frame as POSCAR, CIF, or XYZ. File > Export batch writes a selected inclusive one-based frame list such as `1-2, 4, 6,8,10-30` in POSCAR, CIF, or XYZ format. The built-in path contains no multiprocessing branch and always exports the current authoritative GUI data. Portions adapted from BUCToolkit are distributed under its MIT license in `LICENSES/BUCToolkit-MIT.txt`.
+The standalone entry point uses built-in serial readers and writers. File Open supports multi-selection and opens each POSCAR, CIF, XYZ, EXTXYZ, or complete OUTCAR trajectory file in its own workspace window. The command `open PATH` accepts one path or a path list; `save PATH` writes the current frame as POSCAR, CIF, or XYZ. File > Export batch writes a selected inclusive one-based frame list such as `1-2, 4, 6,8,10-30` in POSCAR, CIF, or XYZ format. The built-in path contains no multiprocessing branch and always exports the current authoritative GUI data. Portions adapted from BUCToolkit are distributed under its MIT license in `LICENSES/BUCToolkit-MIT.txt`.
 
 ## Mouse controls
 
@@ -81,17 +81,48 @@ and `Ctrl+Y`, or the toolbar arrows, to undo and redo committed coordinate
 edits. The undo limit, keyboard translation step, and default atom material,
 lighting, and boundary style are editable through Settings and stored in
 `src/btgui/settings.json` (or the equivalent installed package directory).
+Settings also controls the file-cache limit (default `1024 MB`) and provides
+**Clear File Cache** for unreferenced files.
+
+## File workspaces
+
+Every opened structure file is a separate workspace. Its frames, playback,
+Undo/Redo history, measurements, and CLI variables are independent of other
+files. A unique window exists for each `(file, frame)` pair; opening the same
+file again focuses its existing window without changing the displayed frame.
+Double-clicking an unopened file in the Files tree creates a new window on its
+first frame and leaves older windows open.
+
+The left dock stacks the file manager above the Frames list. The tree follows
+the focused file's directory, supports normal selection and expansion, and its
+context menu provides Open, New Folder, Rename, Delete, Copy Path, and Refresh.
+Renaming or deleting a file that is currently open is blocked.
+
+Closed files stay cached until the total estimated memory exceeds the configured
+limit. Only files with no display windows are released; if all referenced files
+exceed the limit they are kept, and a file is released as soon as its last
+window closes. `File > Open` opens each selected file in its own window and
+focuses the last one; directories are expanded to their supported files first.
+Save As starts from the active file path and writes only the current frame; it
+does not rename or split the in-memory workspace.
+
+Each viewer shows `file_name[frame]` in a translucent upper-left overlay, with a
+one-based frame number and the full path in its tooltip. Appearance's default-on
+**distinguish files by frame colours** option gives every file a pastel border
+shared by all of its frame windows; disabling it makes every border white.
 
 The top menu bar contains File, Settings, Appearance, Windows, and View. View
 defaults to orthographic projection; enabling Perspective makes nearby objects
 appear larger. Covalent spheres default to `0.6 × covalent radius × scale`, with
-scale `1.0`; vdW spheres use `vdW radius × scale`. Appearance shows an editable
-Scale for these modes, an absolute Custom radius (Å) for custom spheres, and a
-disabled size control for points. Custom radius and Scale retain independent
-values. Display scaling does not affect bond detection. Bond width defaults to
-`0.3 Å` (the single-bond cylinder radius). The toolbar
-below it contains structure operations and current-frame playback/navigation.
-Axes and Grid are optional Appearance settings and default to off. Bond display
+scale `1.0`; vdW spheres use `vdW radius × scale`. Default covalent and vdW
+radii are clamped to `1.15 × bond width` so hydrogen spheres remain thicker than
+bonds. Appearance shows an editable Scale for these modes, an absolute Custom
+radius (Å) for custom spheres, and a disabled size control for points. Custom
+radius and Scale retain independent values. Display scaling does not affect bond
+detection. Bond width defaults to `0.3 Å` (the single-bond cylinder radius). The
+toolbar below it is split into thin-bordered Edit, Structure, Measure, Update,
+and Frames groups. Axes and Grid are optional Appearance settings and default
+to off. Bond display
 and its tolerance are grouped under Bonds. Add bond selects two atoms or an
 existing bond: two atoms receive a single bond, while a click on an existing bond
 cycles its order through 1-2-3-1. Hold Ctrl to keep Add bond active for repeated
@@ -117,19 +148,19 @@ from the Supercell menu. PBC wrap applies fractional-coordinate wrapping to the
 selected frames and is undoable. The View menu contains lattice-axis views and
 zoom controls. The
 toolbar frame controls use zero-based indices. Save As writes only the
-currently displayed frame. Opening another file appends
-its frames to the current batch; the current frame field rejects invalid or
-out-of-range input without changing the displayed frame. The play/pause icon starts
+currently displayed frame and suggests the active file path. Opening another
+file creates a separate workspace and window; the current frame field rejects
+invalid or out-of-range input without changing the displayed frame. The play/pause icon starts
 at the current frame; its adjacent menu controls FPS, an inclusive frame range,
 stride, and once/loop completion behavior. Playback updates atom and lattice geometry
 incrementally, while the right mouse button remains available for camera rotation.
-The display-window close button closes the focused display window without
-removing its frame. Windows > Delete removes selected frames, and Windows > Show Frames
-opens a frame sidebar for navigation, multi-selection, duplication, deletion, renaming, and
-undoable drag reordering. Single-clicking a frame switches the focused viewer;
-double-clicking or choosing Open creates a new shared-data viewer window. Frame
-names remain attached to their data while reordering, and copies use an `_copy`
-suffix. File > New adds an empty or populated frame. Appearance contains atom and
+The display-window close button closes the focused display window; its frame
+remains cached in the file workspace. Windows > Delete removes selected frames,
+and Windows > Show Frames opens the frame sidebar for navigation,
+multi-selection, duplication, deletion, renaming, and undoable drag reordering.
+Single-clicking a frame switches the focused viewer; double-clicking or choosing
+Open creates the unique window for that file and frame. Frame names remain
+attached while reordering, and copies use an `_copy` suffix. File > New adds an empty or populated frame. Appearance contains atom and
 frame selectors plus per-element settings. An empty atom selector applies color,
 opacity, display radius, material, lighting, PBR, and atom-boundary settings to
 all atoms; element symbols and one-based atom numbers/ranges limit those settings
@@ -187,7 +218,10 @@ edges are restored in their required index spaces before a single redraw.
 
 The command console is implemented in `frontend/cli.py`. Python commands receive
 three ordinary editable variables: `elements`, `coo`, and `cell`, each a
-`List[np.ndarray]`, plus NumPy as `np`. Every command edits detached working
+`List[np.ndarray]`, plus NumPy as `np`. The console is scoped to the focused
+file: its protected variables reference only that file, and switching to a
+different file clears the console output and persistent user variables before
+rebinding the new file's frames. Every command edits detached working
 copies. Shape, dtype, frame-count, and finite-value checks run before a valid
 change is committed to the viewer; invalid changes print `Invalid change for
 inner variables` and leave the displayed data unchanged. Completed commands also

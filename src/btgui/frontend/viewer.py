@@ -155,6 +155,8 @@ class StructureViewer(QtInteractor):
     def resizeEvent(self, event):
         """Reposition overlay children after the render widget resizes."""
         super().resizeEvent(event)
+        if not hasattr(self, "file_header"):
+            return
         self._position_file_header()
         if self.file_header.isVisible():
             self.file_header.raise_()
@@ -162,6 +164,8 @@ class StructureViewer(QtInteractor):
     def showEvent(self, event):
         """Reposition the overlay when the viewer becomes visible."""
         super().showEvent(event)
+        if not hasattr(self, "file_header"):
+            return
         self._position_file_header()
         if self.file_header.isVisible():
             self.file_header.raise_()
