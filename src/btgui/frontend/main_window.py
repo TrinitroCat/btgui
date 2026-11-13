@@ -78,6 +78,7 @@ from btgui.frontend.changes import (
     AppearanceChange, BondChange, ClearBondsChange, FramePermutationChange,
     InplaceUpdaterChange, StructureChange,
 )
+from btgui.integrations.structure_io import normalize_structure_files
 from btgui.integrations.updater import load_updater_module
 from btgui.frontend.viewer import StructureViewer
 
@@ -840,7 +841,7 @@ class WindowManager:
         self._closing = set()
         self.area.subWindowActivated.connect(self._activated)
 
-    def add(self, viewer, frame_index, title="Frame", show=True):
+    def add(self, viewer, frame_index, title="Frame", show=True, file_key=None):
         """Add one viewer subwindow and retain its current frame index."""
         subwindow = ManagedSubWindow(self.area)
         subwindow.setWidget(viewer)
@@ -857,7 +858,12 @@ class WindowManager:
         subwindow.setWindowTitle(title)
         subwindow.setOption(QMdiSubWindow.SubWindowOption.RubberBandMove, True)
         subwindow.setOption(QMdiSubWindow.SubWindowOption.RubberBandResize, True)
-        record = {"viewer": viewer, "subwindow": subwindow, "frame_index": int(frame_index)}
+        record = {
+            "viewer": viewer,
+            "subwindow": subwindow,
+            "frame_index": int(frame_index),
+            "file_key": file_key,
+        }
         self.records.append(record)
         subwindow.closed.connect(self._close_record)
         if show:
@@ -865,6 +871,19 @@ class WindowManager:
             subwindow.show()
             self.area.setActiveSubWindow(subwindow)
         return record
+
+    def find(self, file_key, frame_index=None):
+        """Return the unique record for one file/frame, or ``None``."""
+        for record in self.records:
+            if record["file_key"] != file_key:
+                continue
+            if frame_index is None or record["frame_index"] == int(frame_index):
+                return record
+        return None
+
+    def records_for_file(self, file_key):
+        """Return all records displaying one file."""
+        return [record for record in self.records if record["file_key"] == file_key]
 
     def show_hidden(self):
         """Show windows that were populated while hidden without changing focus."""
@@ -880,11 +899,15 @@ class WindowManager:
             return
         record["viewer"].render()
 
-    def find_frame(self, frame_index):
-        """Return the open window record displaying ``frame_index``, if any."""
+    def find_frame(self, frame_index, file_key=None):
+        """Return an open window record for one frame, optionally per file."""
         frame_index = int(frame_index)
         return next(
-            (record for record in self.records if record["frame_index"] == frame_index),
+            (
+                record for record in self.records
+                if record["frame_index"] == frame_index
+                and (file_key is None or record["file_key"] == file_key)
+            ),
             None,
         )
 
@@ -921,6 +944,9 @@ class WindowManager:
             viewer.deleteLater()
             subwindow.deleteLater()
             self._closing.discard(subwindow)
+            state = self.owner.files.get(record["file_key"])
+            if state is not None:
+                state.release()
 
         QTimer.singleShot(0, finalize_close)
 
@@ -946,66 +972,74 @@ class WindowManager:
         for record in list(self.records):
             record["subwindow"].close()
 
-    def close_for_frames(self, indices):
+    def close_for_frames(self, indices, file_key=None):
         """Close windows displaying any frame in ``indices``."""
         targets = set(int(index) for index in indices)
         for record in list(self.records):
+            if file_key is not None and record["file_key"] != file_key:
+                continue
             if record["frame_index"] in targets:
                 record["subwindow"].close()
 
-    def remove_frames(self, indices):
+    def remove_frames(self, indices, file_key=None):
         """Drop deleted indices and shift surviving window references."""
         deleted = set(int(index) for index in indices)
         for record in self.records:
+            if file_key is not None and record["file_key"] != file_key:
+                continue
             index = record["frame_index"]
             record["frame_index"] = index - sum(old < index for old in deleted)
 
-    def apply_permutation(self, inverse):
+    def apply_permutation(self, inverse, file_key=None):
         """Update every displayed frame through an old-to-new permutation."""
         for record in self.records:
+            if file_key is not None and record["file_key"] != file_key:
+                continue
             index = record["frame_index"]
             if 0 <= index < len(inverse):
                 record["frame_index"] = int(inverse[index])
 
     def refresh_all(self, reset_camera=False):
-        """Redraw all open viewers against the owner's shared frame lists."""
+        """Redraw every open viewer against its own file state."""
         for record in list(self.records):
             viewer = record["viewer"]
-            index = record["frame_index"]
-            if not self.owner.coordinates:
-                viewer.elements = self.owner.elements
-                viewer.coordinates = self.owner.coordinates
-                viewer.lattices = self.owner.lattices
+            state = self.owner.files.get(record["file_key"])
+            if state is None or state.closed:
+                continue
+            if not state.coordinates:
+                viewer.elements = state.elements
+                viewer.coordinates = state.coordinates
+                viewer.lattices = state.lattices
                 viewer.current_index = 0
                 viewer.set_frame_state(
-                    self.owner.atom_frame_styles,
-                    self.owner.frame_metrics,
-                    self.owner.bond_adjacencies,
-                    self.owner.bond_orders,
+                    state.atom_frame_styles,
+                    state.frame_metrics,
+                    state.bond_adjacencies,
+                    state.bond_orders,
                 )
                 viewer.draw_frame(reset_camera=reset_camera)
                 continue
-            index = min(max(index, 0), len(self.owner.coordinates) - 1)
+            index = min(max(int(record["frame_index"]), 0), len(state.coordinates) - 1)
             record["frame_index"] = index
-            viewer.elements = self.owner.elements
-            viewer.coordinates = self.owner.coordinates
-            viewer.lattices = self.owner.lattices
-            viewer.bond_frame_indices = set(self.owner.bond_frame_indices)
-            viewer.bond_adjacencies = self.owner.bond_adjacencies
-            viewer.bond_orders = self.owner.bond_orders
+            viewer.elements = state.elements
+            viewer.coordinates = state.coordinates
+            viewer.lattices = state.lattices
+            viewer.bond_frame_indices = set(state.bond_frame_indices)
+            viewer.bond_adjacencies = state.bond_adjacencies
+            viewer.bond_orders = state.bond_orders
             viewer.invalidate_bond_meshes()
             viewer.current_index = index
             viewer.set_frame_state(
-                self.owner.atom_frame_styles,
-                self.owner.frame_metrics,
-                self.owner.bond_adjacencies,
-                self.owner.bond_orders,
+                state.atom_frame_styles,
+                state.frame_metrics,
+                state.bond_adjacencies,
+                state.bond_orders,
             )
             viewer.selected_indices = viewer.selected_indices[
                 (viewer.selected_indices >= 0)
-                & (viewer.selected_indices < len(self.owner.elements[index]))
+                & (viewer.selected_indices < len(state.elements[index]))
             ]
-            graph = self.owner.bond_adjacencies[index]
+            graph = state.bond_adjacencies[index]
             # Graph-only events already clear their selections. This also
             # protects views reassigned by frame deletion or batch replacement.
             if graph is None:
@@ -1013,7 +1047,7 @@ class WindowManager:
             elif viewer.selected_bonds:
                 viewer.selected_bonds = {
                     pair for pair in viewer.selected_bonds
-                    if max(pair) < len(self.owner.elements[index])
+                    if max(pair) < len(state.elements[index])
                     and np.any(np.all(graph == np.asarray(pair)[:, None], axis=0))
                 }
             viewer.draw_frame(reset_camera=reset_camera)
@@ -1982,15 +2016,26 @@ class MainWindow(QMainWindow):
     def _activate_viewer(self, viewer):
         """Make one displayed viewer the target of toolbar and edit actions."""
         self.viewer = viewer
-        for record in self.window_manager.records:
-            if record["viewer"] is viewer:
-                self.current_index = record["frame_index"]
-                break
+        record = next(
+            (item for item in self.window_manager.records if item["viewer"] is viewer),
+            None,
+        )
+        if record is not None:
+            state = self.files.get(record["file_key"])
+            if state is not None and not state.closed:
+                self.active_key = record["file_key"]
+                self._active_state = state
+                self.current_index = min(
+                    max(int(record["frame_index"]), 0), max(0, len(state.coordinates) - 1)
+                )
+                state.current_index = self.current_index
         if hasattr(self, "perspective_action"):
             blocker = QSignalBlocker(self.perspective_action)
             self.perspective_action.setChecked(viewer.perspective_enabled)
             del blocker
         self._sync_frame_controls()
+        self._sync_frame_list()
+        self._sync_history_actions()
 
     def _ensure_data_window(self):
         """Create the first structure window when data exists but none is open."""
@@ -2000,9 +2045,14 @@ class MainWindow(QMainWindow):
             self.viewer = StructureViewer(self)
             self._configure_viewer(self.viewer)
         frame_index = min(max(self.current_index, 0), len(self.coordinates) - 1)
-        self.window_manager.add(
-            self.viewer, frame_index, self.frame_names[frame_index], show=True
+        record = self.window_manager.add(
+            self.viewer,
+            frame_index,
+            self._file_title(self._active_state, frame_index),
+            show=True,
+            file_key=self.active_key,
         )
+        self._active_state.retain()
         QApplication.processEvents()
         self.viewer.set_data(self.elements, self.coordinates, self.lattices)
         self.viewer.set_frame_state(
@@ -2011,6 +2061,7 @@ class MainWindow(QMainWindow):
         )
         self.viewer.current_index = frame_index
         self.viewer.set_frame(frame_index)
+        self.window_manager.refresh_all()
 
     def _connect_extra_viewer(self, viewer):
         """Connect shared edit and drop signals for an additional viewer."""
@@ -3918,13 +3969,6 @@ class MainWindow(QMainWindow):
             self._sync_frame_list()
         for row in range(self.frame_list.count()):
             self.frame_list.item(row).setData(Qt.ItemDataRole.UserRole, row)
-        for record in self.window_manager.records:
-            record["viewer"].set_frame_state(
-                self.atom_frame_styles,
-                self.frame_metrics,
-                self.bond_adjacencies,
-                self.bond_orders,
-            )
         self.window_manager.refresh_all()
         self._sync_frame_controls()
 
@@ -3948,16 +3992,59 @@ class MainWindow(QMainWindow):
         self._pending_frame_row = None
         self._open_frame_window(self.frame_list.row(item))
 
-    def _open_frame_window(self, frame_index):
-        """Create one shared-data viewer for a valid frame index."""
-        if not 0 <= int(frame_index) < len(self.elements):
-            return
+    def _prepare_file_state(self, key, elements, coordinates, lattices):
+        """Build one detached FileState from freshly read raw frame lists."""
+        state = FileState(key, self.settings["history_limit"])
+        state.elements = list(elements)
+        state.coordinates = list(coordinates)
+        state.lattices = list(lattices)
+        state.frame_names = []
+        state._frame_name_serial = 0
+        for _ in state.elements:
+            state._frame_name_serial += 1
+            state.frame_names.append(f"Frame {state._frame_name_serial}")
+        state.atom_frame_styles = [
+            [dict() for _ in frame_elements] for frame_elements in state.elements
+        ]
+        state.frame_metrics = [
+            {"length": {}, "angle": {}} for _ in state.coordinates
+        ]
+        state.bond_adjacencies = [None for _ in state.coordinates]
+        state.bond_orders = [None for _ in state.coordinates]
+        state.bond_frame_indices = []
+        state.supercell_bases = {
+            frame: {
+                "elements": np.array(state.elements[frame], copy=True),
+                "coordinates": np.array(state.coordinates[frame], copy=True),
+                "lattice": np.array(state.lattices[frame], copy=True),
+            }
+            for frame in range(len(state.coordinates))
+        }
+        state.supercell_transforms = {
+            frame: (np.ones(3, dtype=np.int64), np.eye(3, dtype=np.int64))
+            for frame in range(len(state.coordinates))
+        }
+        state.current_index = 0
+        return state
+
+    def _file_title(self, state, frame_index):
+        """Return the visible file-and-frame label for one window."""
+        name = state.path.name if state.path is not None else "Untitled"
+        return f"{name}[{int(frame_index) + 1}]"
+
+    def _focus_record(self, record):
+        """Raise and activate one existing MDI record without changing its frame."""
+        record["subwindow"].show()
+        self.mdi_area.setActiveSubWindow(record["subwindow"])
+        self._activate_viewer(record["viewer"])
+
+    def _create_viewer_for_state(self, state, key, frame_index, show=True):
+        """Create one viewer bound to a specific file and frame."""
         frame_index = int(frame_index)
-        existing = self.window_manager.find_frame(frame_index)
+        existing = self.window_manager.find(key, frame_index)
         if existing is not None:
-            existing["subwindow"].show()
-            self.mdi_area.setActiveSubWindow(existing["subwindow"])
-            return
+            self._focus_record(existing)
+            return existing
         viewer = StructureViewer(self.mdi_area)
         source_viewer = self.viewer
         if source_viewer is None:
@@ -3979,20 +4066,40 @@ class MainWindow(QMainWindow):
         else:
             self._connect_extra_viewer(viewer)
             viewer.camera.SetParallelProjection(not viewer.perspective_enabled)
-        self.window_manager.add(viewer, frame_index, self.frame_names[frame_index])
-        QApplication.processEvents()
-        viewer.set_data(self.elements, self.coordinates, self.lattices)
-        viewer.set_frame_state(
-            self.atom_frame_styles, self.frame_metrics, self.bond_adjacencies,
-            self.bond_orders,
+        record = self.window_manager.add(
+            viewer,
+            frame_index,
+            self._file_title(state, frame_index),
+            show=show,
+            file_key=key,
         )
-        # set_data initializes visibility to off; restore shared bond settings
-        # after attaching the authoritative graph list to the new viewer.
+        state.retain()
+        QApplication.processEvents()
+        viewer.set_data(state.elements, state.coordinates, state.lattices)
+        viewer.set_frame_state(
+            state.atom_frame_styles, state.frame_metrics, state.bond_adjacencies,
+            state.bond_orders,
+        )
         if source_viewer is not None:
             viewer.bonds_enabled = source_viewer.bonds_enabled
-        viewer.bond_frame_indices = set(self.bond_frame_indices)
+        viewer.bond_frame_indices = set(state.bond_frame_indices)
+        viewer.current_index = frame_index
         viewer.set_frame(frame_index)
         QTimer.singleShot(0, viewer.render)
+        return record
+
+    def _open_frame_window(self, frame_index):
+        """Create one unique viewer for one frame of the active file."""
+        if not 0 <= int(frame_index) < len(self.elements):
+            return
+        frame_index = int(frame_index)
+        existing = self.window_manager.find(self.active_key, frame_index)
+        if existing is not None:
+            self._focus_record(existing)
+            return
+        self._create_viewer_for_state(
+            self._active_state, self.active_key, frame_index, show=True
+        )
 
     def _show_frame_context_menu(self, position):
         """Show multi-frame Copy and Delete actions for the clicked frame."""
@@ -4069,7 +4176,7 @@ class MainWindow(QMainWindow):
         indices = [index for index in indices if 0 <= index < len(self.elements)]
         if not indices:
             return
-        self.window_manager.close_for_frames(indices)
+        self.window_manager.close_for_frames(indices, self.active_key)
         deleted = set(indices)
         retained = [index for index in range(len(self.elements)) if index not in deleted]
         for target in (
@@ -4098,7 +4205,7 @@ class MainWindow(QMainWindow):
         ]
         if self.viewer is not None:
             self.viewer.bond_frame_indices = set(self.bond_frame_indices)
-        self.window_manager.remove_frames(indices)
+        self.window_manager.remove_frames(indices, self.active_key)
         old_current = self.current_index
         if not self.elements:
             self.current_index = 0
@@ -4201,6 +4308,9 @@ class MainWindow(QMainWindow):
             for index in self.bond_frame_indices
         ]
         self.viewer.bond_frame_indices = set(self.bond_frame_indices)
+        for record in self.window_manager.records_for_file(self.active_key):
+            if record["frame_index"] >= insert_at:
+                record["frame_index"] += len(snapshots)
         old_bases = self.supercell_bases
         old_transforms = self.supercell_transforms
         source_order = list(range(old_count))
@@ -4264,7 +4374,7 @@ class MainWindow(QMainWindow):
         self.supercell_transforms = {
             new: old_transforms[int(old)] for new, old in enumerate(permutation)
         }
-        self.window_manager.apply_permutation(inverse)
+        self.window_manager.apply_permutation(inverse, self.active_key)
         if update_current and len(permutation):
             self.current_index = int(inverse[min(self.current_index, len(permutation) - 1)])
         self.bond_frame_indices = sorted(
@@ -5273,40 +5383,44 @@ class MainWindow(QMainWindow):
         except (ImportError, OSError, RuntimeError, TypeError, ValueError) as error:
             self._log(f"Export error: {error}")
 
+    def _open_file(self, path):
+        """Open one file in a new window, or focus its existing window."""
+        key = Path(path).expanduser().resolve()
+        records = self.window_manager.records_for_file(key)
+        if records:
+            self._focus_record(records[-1])
+            return records[-1]
+        state = self.files.get(key)
+        if state is None or state.closed:
+            elements, coordinates, lattices = self.open_handler([key])
+            validate_data(elements, coordinates, lattices)
+            state = self._prepare_file_state(key, elements, coordinates, lattices)
+            self.files[key] = state
+        record = self._create_viewer_for_state(state, key, 0, show=True)
+        self.active_key = key
+        self._active_state = state
+        self.current_index = 0
+        state.current_index = 0
+        self._activate_viewer(record["viewer"])
+        self._log(
+            f"Opened {key.name}: {len(state.elements)} frame(s), "
+            f"{sum(map(len, state.elements))} atoms total."
+        )
+        return record
+
     def _open(self, paths):
-        """Load selected files and append their frames to the current batch.
-
-        Args:
-            paths: One path or a list of paths passed to the configured handler.
-
-        Return:
-            None. Updates the viewer and logs the number of loaded frames.
-        """
+        """Open selected files in separate windows and focus the last one."""
         if self.open_handler is None:
             raise RuntimeError("file opening is not configured; provide an open_handler")
         self._pause_playback()
-        elements, coordinates, lattices = self.open_handler(paths)
-        validate_data(elements, coordinates, lattices)
-        previous_count = len(self.coordinates)
         self.timer.stop()
         self.play_indices = []
-        returns_aggregate = bool(getattr(self.open_handler, "returns_aggregate", False))
-        if previous_count == 0:
-            self.set_data(elements, coordinates, lattices)
-        else:
-            # Use the same batch-history boundary as updater appends. Resetting
-            # graphs here would silently invalidate older sparse bond events.
-            if not returns_aggregate:
-                elements = list(self.elements) + list(elements)
-                coordinates = list(self.coordinates) + list(coordinates)
-                lattices = list(self.lattices) + list(lattices)
-            self._on_cli_data_changed(
-                elements, coordinates, lattices,
-                description="Open structures", preserve_existing_context=True,
-            )
-            self.current_index = min(previous_count, len(self.coordinates) - 1)
-            self._refresh_after_change(frame_index=self.current_index)
-            self._log(f"Appended {len(self.coordinates) - previous_count} frame(s) from selected files")
+        files = normalize_structure_files(paths)
+        last_record = None
+        for path in files:
+            last_record = self._open_file(path) or last_record
+        if last_record is not None:
+            self._focus_record(last_record)
         self.cli.bind_data(self.elements, self.coordinates, self.lattices)
 
     def _save(self, path):

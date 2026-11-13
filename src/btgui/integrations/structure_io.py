@@ -422,6 +422,19 @@ def _parse_outcar(path: Path) -> tuple[list[np.ndarray], list[np.ndarray], list[
     return elements, coordinates, lattices
 
 
+def normalize_structure_files(paths) -> list[Path]:
+    """Expand selected files and directories without reading their contents.
+
+    Args:
+        paths: One path or a sequence of selected files and directories.
+
+    Return:
+        Resolved supported files in stable order. ``read_structure_files``
+        semantics are unchanged.
+    """
+    return _normalize_paths(paths)
+
+
 def read_structure_files(paths) -> tuple[list[np.ndarray], list[np.ndarray], list[np.ndarray]]:
     """Read supported files into the three raw frame lists.
 
