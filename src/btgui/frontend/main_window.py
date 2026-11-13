@@ -92,6 +92,7 @@ DEFAULT_SETTINGS = {
     "atom_edge_width": 1.0,
     "buctoolkit_paths": [],
     "keyboard_translation_step": 0.1,
+    "file_cache_limit_mb": 1024,
     "updater_path": [],
     "updater_function": [],
 }
@@ -933,6 +934,7 @@ class WindowManager:
                 self.owner._activate_viewer(replacement["viewer"])
             else:
                 self.owner.viewer = None
+                self.owner._activate_empty_state()
         subwindow.setWidget(None)
         subwindow.hide()
 
@@ -947,6 +949,7 @@ class WindowManager:
             state = self.owner.files.get(record["file_key"])
             if state is not None:
                 state.release()
+                self.owner._on_file_released(state)
 
         QTimer.singleShot(0, finalize_close)
 
@@ -1082,6 +1085,11 @@ class SettingsDialog(QDialog):
         self.history_limit_spin = QSpinBox(self)
         self.history_limit_spin.setRange(1, 1000)
         self.history_limit_spin.setValue(settings["history_limit"])
+        self.cache_limit_spin = QSpinBox(self)
+        self.cache_limit_spin.setRange(64, 65536)
+        self.cache_limit_spin.setSingleStep(256)
+        self.cache_limit_spin.setSuffix(" MB")
+        self.cache_limit_spin.setValue(settings["file_cache_limit_mb"])
         self.material_combo = QComboBox(self)
         self.material_combo.addItem("Default", "default")
         self.material_combo.addItem("Matte", "matte")
@@ -1112,6 +1120,7 @@ class SettingsDialog(QDialog):
 
         form = QFormLayout()
         form.addRow("Undo history steps", self.history_limit_spin)
+        form.addRow("File cache limit", self.cache_limit_spin)
         form.addRow("Default material", self.material_combo)
         form.addRow(self.lighting_check)
         form.addRow(self.edges_check)
@@ -1161,6 +1170,7 @@ class SettingsDialog(QDialog):
             "atom_edge_width": self.edge_width_spin.value(),
             "buctoolkit_paths": self.buctoolkit_paths,
             "keyboard_translation_step": self.keyboard_translation_step_spin.value(),
+            "file_cache_limit_mb": self.cache_limit_spin.value(),
         }
 
 
@@ -1852,6 +1862,11 @@ class MainWindow(QMainWindow):
             )
             if not 0.001 <= translation_step <= 100.0:
                 raise ValueError("keyboard_translation_step must be between 0.001 and 100")
+            cache_limit_mb = int(
+                loaded.get("file_cache_limit_mb", settings["file_cache_limit_mb"])
+            )
+            if not 64 <= cache_limit_mb <= 65536:
+                raise ValueError("file_cache_limit_mb must be between 64 and 65536")
             buctoolkit_paths = loaded.get("buctoolkit_paths", settings["buctoolkit_paths"])
             if isinstance(buctoolkit_paths, str):
                 buctoolkit_paths = buctoolkit_paths.split(os.pathsep)
@@ -1878,6 +1893,7 @@ class MainWindow(QMainWindow):
                 atom_edge_width=edge_width,
                 buctoolkit_paths=buctoolkit_paths,
                 keyboard_translation_step=translation_step,
+                file_cache_limit_mb=cache_limit_mb,
             )
         except (TypeError, ValueError) as error:
             warning_messages.append(f"base settings: {error}; using defaults")
@@ -2037,6 +2053,19 @@ class MainWindow(QMainWindow):
         self._sync_frame_list()
         self._sync_history_actions()
 
+    def _activate_empty_state(self):
+        """Replace the active state with an empty untitled state."""
+        old = self.files.get(None)
+        empty = FileState(None, self.settings["history_limit"])
+        self.files[None] = empty
+        self.active_key = None
+        self._active_state = empty
+        if old is not None and old is not empty and old.window_refs == 0:
+            old.close()
+        self._sync_frame_list()
+        self._sync_frame_controls()
+        self._sync_history_actions()
+
     def _ensure_data_window(self):
         """Create the first structure window when data exists but none is open."""
         if self.window_manager.records or not self.coordinates:
@@ -2156,6 +2185,7 @@ class MainWindow(QMainWindow):
                 "keyboard_translation_step"
             ]
         self._sync_history_actions()
+        self._trim_file_cache()
         self._persist_settings()
 
     def _sync_history_actions(self):
@@ -3992,6 +4022,78 @@ class MainWindow(QMainWindow):
         self._pending_frame_row = None
         self._open_frame_window(self.frame_list.row(item))
 
+    def _cache_limit_bytes(self):
+        """Return the configured file-cache limit in bytes."""
+        return max(64, int(self.settings["file_cache_limit_mb"])) * 1024 * 1024
+
+    def _cache_total_bytes(self):
+        """Estimate memory retained by every live file state."""
+        return sum(
+            state.nbytes()
+            for state in self.files.values()
+            if not state.closed
+        )
+
+    def _close_file_state(self, key):
+        """Close one unreferenced, non-active file state and drop its key."""
+        if key == self.active_key:
+            return 0
+        state = self.files.get(key)
+        if state is None or state.closed or state.window_refs:
+            return 0
+        size = state.nbytes()
+        self.files.pop(key, None)
+        state.close()
+        return size
+
+    def _trim_file_cache(self):
+        """Release the largest unreferenced caches while over the limit."""
+        limit = self._cache_limit_bytes()
+        total = self._cache_total_bytes()
+        released = []
+        while total > limit:
+            candidates = [
+                (state.nbytes(), key, state)
+                for key, state in self.files.items()
+                if key != self.active_key and not state.closed and state.window_refs == 0
+            ]
+            if not candidates:
+                break
+            size, key, _state = max(candidates, key=lambda item: item[0])
+            freed = self._close_file_state(key)
+            total = self._cache_total_bytes()
+            released.append((key, freed))
+        if released:
+            freed = sum(size for _key, size in released)
+            self._log(
+                f"File cache: released {len(released)} file(s), "
+                f"{freed / (1024 * 1024):.1f} MB."
+            )
+        return total
+
+    def _on_file_released(self, state):
+        """Release an unreferenced state immediately when the cache is full."""
+        if state is None or state.closed or state.window_refs:
+            return
+        if self._cache_total_bytes() > self._cache_limit_bytes():
+            self._trim_file_cache()
+
+    def _clear_file_cache(self):
+        """Manually close every unreferenced, non-active cached file."""
+        removed = []
+        for key, state in list(self.files.items()):
+            if key == self.active_key or state.window_refs:
+                continue
+            size = state.nbytes()
+            self.files.pop(key, None)
+            state.close()
+            removed.append((key, size))
+        freed = sum(size for _key, size in removed)
+        self._log(
+            f"File cache cleared: {len(removed)} file(s), "
+            f"{freed / (1024 * 1024):.1f} MB."
+        )
+
     def _prepare_file_state(self, key, elements, coordinates, lattices):
         """Build one detached FileState from freshly read raw frame lists."""
         state = FileState(key, self.settings["history_limit"])
@@ -4568,9 +4670,11 @@ class MainWindow(QMainWindow):
         save_action.triggered.connect(self._save_dialog)
         export_action = file_menu.addAction("Export Batch...")
         export_action.triggered.connect(self._export_dialog)
-        settings_action = QAction("Settings", self)
+        settings_menu = menu_bar.addMenu("Settings")
+        settings_action = settings_menu.addAction("Preferences...")
         settings_action.triggered.connect(self._show_settings)
-        menu_bar.addAction(settings_action)
+        clear_cache_action = settings_menu.addAction("Clear File Cache")
+        clear_cache_action.triggered.connect(self._clear_file_cache)
         appearance_action = QAction("Appearance", self)
         appearance_action.triggered.connect(self._show_appearance)
         menu_bar.addAction(appearance_action)
@@ -5401,6 +5505,7 @@ class MainWindow(QMainWindow):
         self._active_state = state
         self.current_index = 0
         state.current_index = 0
+        self._trim_file_cache()
         self._activate_viewer(record["viewer"])
         self._log(
             f"Opened {key.name}: {len(state.elements)} frame(s), "
