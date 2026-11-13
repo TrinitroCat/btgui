@@ -1026,7 +1026,11 @@ class StructureViewer(QtInteractor):
         )
         norm = float(np.linalg.norm(vector))
         if norm == 0:
-            return
+            # Non-periodic molecules store a zero lattice; fall back to the
+            # corresponding Cartesian viewing axis instead of doing nothing.
+            vector = np.zeros(3, dtype=float)
+            vector[int(direction) % 3] = 1.0
+            norm = 1.0
         vector /= norm
         bounds = self._scene_bounds(
             np.asarray(self.coordinates[self.current_index], dtype=float),

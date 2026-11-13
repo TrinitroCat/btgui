@@ -1859,7 +1859,7 @@ class MainWindow(QMainWindow):
         self.zoom_input.setValue(100)
         self.zoom_input.setSuffix("%")
         self.zoom_input.setToolTip("Zoom percentage")
-        self.zoom_input.valueChanged.connect(lambda value: self.viewer.set_zoom_percent(value))
+        self.zoom_input.valueChanged.connect(self._on_zoom_changed)
         self.zoom_plus_button = QToolButton(self)
         self.zoom_plus_button.setText("+")
         self.zoom_plus_button.setToolTip("Increase zoom")
@@ -2235,6 +2235,10 @@ class MainWindow(QMainWindow):
             blocker = QSignalBlocker(self.perspective_action)
             self.perspective_action.setChecked(viewer.perspective_enabled)
             del blocker
+        blocker = QSignalBlocker(self.zoom_input)
+        self.zoom_input.setValue(int(viewer.zoom_percent))
+        del blocker
+        self._sync_measurement_actions(viewer.measurement_mode)
         self._sync_frame_controls()
         self._sync_frame_list()
         self._sync_history_actions()
@@ -3024,6 +3028,11 @@ class MainWindow(QMainWindow):
         """Toggle coordinate grid visibility."""
         self.viewer.set_grid_visible(visible)
 
+    def _active_viewer(self):
+        """Return the viewer for the active MDI subwindow, if any."""
+        record = self.window_manager.active_record()
+        return None if record is None else record["viewer"]
+
     def _set_view(self, direction):
         """Set a lattice-axis view and reset its relative zoom control.
 
@@ -3033,7 +3042,12 @@ class MainWindow(QMainWindow):
         Return:
             None. The viewer camera and toolbar zoom value are synchronized.
         """
-        self.viewer.set_view(direction)
+        viewer = self._active_viewer()
+        if viewer is None:
+            return
+        if viewer is not self.viewer:
+            self._activate_viewer(viewer)
+        viewer.set_view(direction)
         blocker = QSignalBlocker(self.zoom_input)
         self.zoom_input.setValue(100)
         del blocker
@@ -3058,12 +3072,17 @@ class MainWindow(QMainWindow):
 
     def _set_measurement_mode(self, mode):
         """Activate one special measurement selector or restore atom selection."""
+        viewer = self._active_viewer()
+        if viewer is None:
+            return
+        if viewer is not self.viewer:
+            self._activate_viewer(viewer)
         if mode == "length":
             self.angle_measure_action.setChecked(False)
         elif mode == "angle":
             self.length_measure_action.setChecked(False)
-        self.viewer.set_measurement_mode(mode)
-        self.viewer.draw_frame()
+        viewer.set_measurement_mode(mode)
+        viewer.draw_frame()
 
     def _sync_measurement_actions(self, mode):
         """Reflect the viewer's special measurement mode in toolbar buttons."""
@@ -5110,6 +5129,15 @@ class MainWindow(QMainWindow):
         self._set_play_button_state(False)
         self._sync_frame_controls()
 
+    def _on_zoom_changed(self, value):
+        """Apply the zoom control to the active MDI viewer."""
+        viewer = self._active_viewer()
+        if viewer is None:
+            return
+        if viewer is not self.viewer:
+            self._activate_viewer(viewer)
+        viewer.set_zoom_percent(value)
+
     def _change_zoom(self, delta):
         """Change the zoom spin box by one toolbar step."""
         self.zoom_input.setValue(self.zoom_input.value() + delta)
@@ -6189,7 +6217,12 @@ class MainWindow(QMainWindow):
         Return:
             None. The viewer returns to its default camera view.
         """
-        self.viewer.reset_view()
+        viewer = self._active_viewer()
+        if viewer is None:
+            return
+        if viewer is not self.viewer:
+            self._activate_viewer(viewer)
+        viewer.reset_view()
         blocker = QSignalBlocker(self.zoom_input)
         self.zoom_input.setValue(100)
         del blocker
