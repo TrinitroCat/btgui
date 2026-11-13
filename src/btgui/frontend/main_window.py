@@ -2694,7 +2694,7 @@ class MainWindow(QMainWindow):
                 frames.update(indices)
         changed_frames = None if all_frames else tuple(sorted(frames))
         if all(isinstance(entry, (BondChange, ClearBondsChange)) for entry in entries):
-            for record in self.window_manager.records:
+            for record in self.window_manager.records_for_file(self.active_key):
                 viewer = record["viewer"]
                 viewer.bond_adjacencies = self.bond_adjacencies
                 viewer.bond_orders = self.bond_orders
@@ -2719,7 +2719,7 @@ class MainWindow(QMainWindow):
                 )) or (isinstance(entry, InplaceUpdaterChange) and bool(entry.topology_frames))
                 for entry in entries
             )
-            for record in self.window_manager.records:
+            for record in self.window_manager.records_for_file(self.active_key):
                 # In-place multi-frame edits only invalidate selections in views
                 # whose atom-count/index space actually changed.
                 frame_topology_changed = topology_changed
