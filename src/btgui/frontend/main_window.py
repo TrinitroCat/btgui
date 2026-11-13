@@ -1109,7 +1109,7 @@ class SettingsDialog(QDialog):
         """
         super().__init__(parent)
         self.setWindowTitle("Settings")
-        self.resize(420, 260)
+        self.resize(420, 300)
         self.buctoolkit_paths = list(settings.get("buctoolkit_paths", []))
         self.history_limit_spin = QSpinBox(self)
         self.history_limit_spin.setRange(1, 1000)
@@ -2125,6 +2125,7 @@ class MainWindow(QMainWindow):
         self._cli_file_key = key
         self.cli.reset_scope(self.elements, self.coordinates, self.lattices)
         self.output.clear()
+        self.command.clear()
         name = key.name if key is not None else "Untitled"
         self._log(f"CLI scope: {name} ({len(self.elements)} frame(s)).")
 
@@ -2246,14 +2247,15 @@ class MainWindow(QMainWindow):
             return
         self.settings.update(dialog.values())
         self.undo_stack = deque(self.undo_stack, maxlen=self.settings["history_limit"])
-        self.viewer.set_appearance(
-            self.viewer.atom_styles,
-            self.settings["default_atom_material"],
-            self.settings["atom_lighting"],
-            self.settings["atom_edges"],
-            self.settings["atom_edge_color"],
-            self.settings["atom_edge_width"],
-        )
+        if self.viewer is not None:
+            self.viewer.set_appearance(
+                self.viewer.atom_styles,
+                self.settings["default_atom_material"],
+                self.settings["atom_lighting"],
+                self.settings["atom_edges"],
+                self.settings["atom_edge_color"],
+                self.settings["atom_edge_width"],
+            )
         viewers = {record["viewer"] for record in self.window_manager.records}
         if self.viewer is not None:
             viewers.add(self.viewer)
@@ -4196,7 +4198,23 @@ class MainWindow(QMainWindow):
         )
         if answer != QMessageBox.StandardButton.Yes:
             return
-        if not QFile.moveToTrash(str(path)):
+        if QFile.moveToTrash(str(path)):
+            self._sync_file_manager(force=True)
+            return
+        fallback = QMessageBox.question(
+            self,
+            "Delete",
+            "The trash is unavailable. Delete permanently?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        )
+        if fallback != QMessageBox.StandardButton.Yes:
+            return
+        removed = (
+            QDir(str(path)).removeRecursively()
+            if path.is_dir()
+            else QFile.remove(str(path))
+        )
+        if not removed:
             QMessageBox.warning(self, "Delete", f"Could not delete {path.name}.")
         self._sync_file_manager(force=True)
 
