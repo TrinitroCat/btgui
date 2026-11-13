@@ -151,7 +151,8 @@ selection. Delete removes the selected kind. Bond selection prints one-based end
 element symbols and Cartesian length in Å. Resize is available
 from the Supercell menu. PBC wrap applies fractional-coordinate wrapping to the
 selected frames and is undoable. The View menu contains lattice-axis views and
-zoom controls. The
+zoom controls; these commands target the focused window, and zero-lattice
+molecules fall back to Cartesian axes. The
 toolbar frame controls use zero-based indices. Save As writes only the
 currently displayed frame and suggests the active file path. Opening another
 file creates a separate workspace and window; the current frame field rejects

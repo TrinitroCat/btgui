@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- View > Along A/B/C, Reset View, measurement mode and zoom now target the
+  focused MDI window; zero-lattice molecules use Cartesian axes for Along, and
+  the zoom control follows the active window.
 - Show bonds is now a per-frame visibility flag. Its checked state follows the
   current frame and file, and checking/unchecking only changes the selected
   frame scope instead of leaving a global renderer switch enabled.
