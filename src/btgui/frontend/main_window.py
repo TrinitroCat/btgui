@@ -1843,7 +1843,6 @@ class MainWindow(QMainWindow):
         self.file_tree.setSortingEnabled(True)
         self.file_tree.setEditTriggers(
             QAbstractItemView.EditTrigger.EditKeyPressed
-            | QAbstractItemView.EditTrigger.SelectedClicked
         )
         self.file_tree.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.file_tree.doubleClicked.connect(self._file_tree_double_clicked)
@@ -2790,11 +2789,16 @@ class MainWindow(QMainWindow):
             for name in changed_global:
                 setattr(viewer, name, deepcopy(getattr(self.viewer, name)))
             viewer.set_background(viewer._background_color_value)
-            frame = viewer.current_index
-            if {"axes_visible", "grid_visible"} & changed_global and 0 <= frame < len(self.coordinates):
+            state = self.files.get(record["file_key"])
+            frame = int(record["frame_index"])
+            if (
+                {"axes_visible", "grid_visible"} & changed_global
+                and state is not None
+                and 0 <= frame < len(state.coordinates)
+            ):
                 viewer._apply_reference_widgets(
-                    np.asarray(self.coordinates[frame], dtype=float),
-                    np.asarray(self.lattices[frame], dtype=float),
+                    np.asarray(state.coordinates[frame], dtype=float),
+                    np.asarray(state.lattices[frame], dtype=float),
                 )
             for actor in viewer.bond_actors:
                 actor.GetProperty().SetOpacity(viewer.bond_alpha)
@@ -4612,6 +4616,7 @@ class MainWindow(QMainWindow):
                 }
             )
         old_count = len(self.elements)
+        active_before_insert = self.window_manager.active_record()
         insert_at = anchor_index + 1
         for offset, snapshot in enumerate(snapshots):
             position = insert_at + offset
@@ -4644,7 +4649,11 @@ class MainWindow(QMainWindow):
             new: (snapshots[-old - 1].get("transform") if old < 0 else deepcopy(old_transforms[old]))
             for new, old in enumerate(source_order)
         }
-        self.current_index = insert_at + len(snapshots) - 1
+        self.current_index = (
+            int(active_before_insert["frame_index"])
+            if active_before_insert is not None
+            else insert_at + len(snapshots) - 1
+        )
         after_graphs = {
             frame: self.bond_adjacencies[frame]
             for frame in range(insert_at, len(self.elements))
@@ -5663,10 +5672,11 @@ class MainWindow(QMainWindow):
         Return:
             None. Saves selected path or does nothing when canceled.
         """
+        default_path = str(self.active_key) if self.active_key is not None else ""
         path, _ = QFileDialog.getSaveFileName(
             self,
             "Save current frame",
-            "",
+            default_path,
             "POSCAR (*.vasp);;CIF (*.cif);;XYZ (*.xyz);;All files (*)",
         )
         if path:
@@ -5730,8 +5740,10 @@ class MainWindow(QMainWindow):
         key = Path(path).expanduser().resolve()
         records = self.window_manager.records_for_file(key)
         if records:
-            self._focus_record(records[-1])
-            return records[-1]
+            active = self.window_manager.active_record()
+            target = active if active in records else records[-1]
+            self._focus_record(target)
+            return target
         state = self.files.get(key)
         if state is None or state.closed:
             elements, coordinates, lattices = self.open_handler([key])
