@@ -1768,6 +1768,7 @@ class MainWindow(QMainWindow):
             on_executed=self._refresh_after_cli_execution,
             buctoolkit_paths=self.settings["buctoolkit_paths"],
         )
+        self._cli_file_key = object()
         self.viewer.set_error_handler(self._log)
         self.setAcceptDrops(True)
         if updater is not None:
@@ -2089,6 +2090,20 @@ class MainWindow(QMainWindow):
         self._sync_frame_list()
         self._sync_history_actions()
         self._sync_file_manager()
+        self._sync_cli_scope()
+
+    def _sync_cli_scope(self, force=False):
+        """Reset CLI variables and output when the focused file changes."""
+        if not hasattr(self, "cli"):
+            return
+        key = self.active_key
+        if not force and key == self._cli_file_key:
+            return
+        self._cli_file_key = key
+        self.cli.reset_scope(self.elements, self.coordinates, self.lattices)
+        self.output.clear()
+        name = key.name if key is not None else "Untitled"
+        self._log(f"CLI scope: {name} ({len(self.elements)} frame(s)).")
 
     def _activate_empty_state(self):
         """Replace the active state with an empty untitled state."""
@@ -2103,6 +2118,7 @@ class MainWindow(QMainWindow):
         self._sync_frame_controls()
         self._sync_history_actions()
         self._sync_file_manager()
+        self._sync_cli_scope()
 
     def _ensure_data_window(self):
         """Create the first structure window when data exists but none is open."""
@@ -4903,6 +4919,7 @@ class MainWindow(QMainWindow):
         self._sync_frame_list()
         self._sync_history_actions()
         self._sync_file_manager()
+        self._sync_cli_scope(force=True)
         self._log(f"Loaded {len(elements)} frame(s), {sum(map(len, elements))} atoms total.")
 
     def _rebuild_update_menu(self):

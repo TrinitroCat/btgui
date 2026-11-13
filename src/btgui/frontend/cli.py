@@ -313,6 +313,21 @@ class CLI:
         self._console.resetbuffer()
         self._continuation = False
 
+    def reset_scope(self, elements: list, coordinates: list, lattices: list) -> None:
+        """Discard persistent user variables and bind a new file scope."""
+        self.bind_data(elements, coordinates, lattices)
+        self._namespace.clear()
+        self._namespace.update({
+            "__builtins__": __builtins__,
+            "np": np,
+            "to_bt": self.to_bt,
+            "coo": self.coo,
+            "cell": self.cell,
+            "elements": self.elements,
+        })
+        self._console = _CapturedConsole(self._namespace)
+        self._continuation = False
+
     def _candidate_variables(self) -> dict[str, list]:
         """Read protected names from the persistent Python namespace.
 
