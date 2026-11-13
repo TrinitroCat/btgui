@@ -5,7 +5,7 @@ import pyvista as pv
 from pyvistaqt import QtInteractor
 from PySide6.QtCore import Qt, Signal, QRect
 from PySide6.QtGui import QMouseEvent
-from PySide6.QtWidgets import QRubberBand
+from PySide6.QtWidgets import QRubberBand, QLabel
 from vtkmodules.vtkCommonTransforms import vtkTransform
 from vtkmodules.vtkRenderingCore import vtkCellPicker, vtkLight
 
@@ -122,11 +122,48 @@ class StructureViewer(QtInteractor):
         self._add_preview_position = None
         self.add_reference_symbol = None
         self.add_reference_index = None
+        self.file_header = QLabel("", self)
+        self.file_header.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        self.file_header.setStyleSheet(
+            "QLabel { background-color: rgba(20, 20, 20, 150); "
+            "color: white; border-radius: 4px; padding: 3px 8px; }"
+        )
+        self.file_header.hide()
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self.set_background(self._background_color_value)
         self.camera.SetParallelProjection(True)
         self._configure_lights()
         self.enable_anti_aliasing("msaa")
+
+    def set_file_header(self, text, tooltip=""):
+        """Show the file-and-frame label in the viewer's upper-left corner."""
+        self.file_header.setText(text)
+        self.file_header.setToolTip(tooltip)
+        if text:
+            self.file_header.adjustSize()
+            self._position_file_header()
+            self.file_header.show()
+            self.file_header.raise_()
+        else:
+            self.file_header.hide()
+
+    def _position_file_header(self):
+        """Keep the overlay label anchored at the upper-left margin."""
+        self.file_header.move(10, 10)
+
+    def resizeEvent(self, event):
+        """Reposition overlay children after the render widget resizes."""
+        super().resizeEvent(event)
+        self._position_file_header()
+        if self.file_header.isVisible():
+            self.file_header.raise_()
+
+    def showEvent(self, event):
+        """Reposition the overlay when the viewer becomes visible."""
+        super().showEvent(event)
+        self._position_file_header()
+        if self.file_header.isVisible():
+            self.file_header.raise_()
 
     def _configure_lights(self):
         """Install a key and fill light for shaded sphere rendering.

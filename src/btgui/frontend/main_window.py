@@ -1016,6 +1016,7 @@ class WindowManager:
                 viewer.coordinates = state.coordinates
                 viewer.lattices = state.lattices
                 viewer.current_index = 0
+                viewer.set_file_header("")
                 viewer.set_frame_state(
                     state.atom_frame_styles,
                     state.frame_metrics,
@@ -1026,6 +1027,7 @@ class WindowManager:
                 continue
             index = min(max(int(record["frame_index"]), 0), len(state.coordinates) - 1)
             record["frame_index"] = index
+            self.owner._set_record_header(record)
             viewer.elements = state.elements
             viewer.coordinates = state.coordinates
             viewer.lattices = state.lattices
@@ -4303,6 +4305,16 @@ class MainWindow(QMainWindow):
         name = state.path.name if state.path is not None else "Untitled"
         return f"{name}[{int(frame_index) + 1}]"
 
+    def _set_record_header(self, record):
+        """Refresh one viewer's in-scene file/frame overlay."""
+        state = self.files.get(record["file_key"])
+        if state is None or state.closed:
+            return
+        record["viewer"].set_file_header(
+            self._file_title(state, record["frame_index"]),
+            str(state.path) if state.path is not None else "",
+        )
+
     def _focus_record(self, record):
         """Raise and activate one existing MDI record without changing its frame."""
         record["subwindow"].show()
@@ -4356,6 +4368,7 @@ class MainWindow(QMainWindow):
         viewer.bond_frame_indices = set(state.bond_frame_indices)
         viewer.current_index = frame_index
         viewer.set_frame(frame_index)
+        self._set_record_header(record)
         QTimer.singleShot(0, viewer.render)
         return record
 
@@ -4701,6 +4714,7 @@ class MainWindow(QMainWindow):
         active = self.window_manager.active_record()
         if active is not None:
             active["frame_index"] = int(index)
+            self._set_record_header(active)
         self.viewer.set_frame(index)
         self._sync_frame_controls()
 
@@ -5803,6 +5817,7 @@ class MainWindow(QMainWindow):
         active = self.window_manager.active_record()
         if active is not None:
             active["frame_index"] = int(index)
+            self._set_record_header(active)
         self._sync_frame_controls()
         if self.play_position == len(self.play_indices) - 1:
             if self.playback_loop:
