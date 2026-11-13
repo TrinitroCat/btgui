@@ -412,8 +412,7 @@ class StructureViewer(QtInteractor):
 
         self._draw_lattice(np.asarray(self.lattices[self.current_index], dtype=float))
         show_bonds = (
-            self.bonds_enabled
-            and self.current_index in self.bond_frame_indices
+            self.current_index in self.bond_frame_indices
             and 0 <= self.current_index < len(self.bond_adjacencies)
             and self.bond_adjacencies[self.current_index] is not None
         )
@@ -746,8 +745,7 @@ class StructureViewer(QtInteractor):
             self.renderer.RemoveActor(actor)
         self.bond_actors = []
         show_bonds = (
-            self.bonds_enabled
-            and self.current_index in self.bond_frame_indices
+            self.current_index in self.bond_frame_indices
             and 0 <= self.current_index < len(self.bond_adjacencies)
             and self.bond_adjacencies[self.current_index] is not None
             and 0 <= self.current_index < len(self.coordinates)
@@ -1152,20 +1150,28 @@ class StructureViewer(QtInteractor):
         self.draw_frame()
 
     def set_bonds(self, enabled, frame_indices=None):
-        """Enable or disable cached bonds for selected frames.
+        """Show or hide bonds on the given frames.
 
         Args:
-            enabled: Requested bond visibility.
-            frame_indices: Optional zero-based frames allowed to show bonds.
+            enabled: Whether those frames should display bonds.
+            frame_indices: Optional zero-based frames; the current frame is
+                used when omitted.
 
         Return:
-            None. The current scene is redrawn.
+            None. Visibility is stored per frame and the scene is redrawn.
         """
-        self.bonds_enabled = bool(enabled)
-        if not self.bonds_enabled:
+        frames = (
+            {int(self.current_index)}
+            if frame_indices is None
+            else {int(index) for index in frame_indices}
+        )
+        if enabled:
+            self.bond_frame_indices |= frames
+        else:
+            self.bond_frame_indices -= frames
+        self.bonds_enabled = bool(self.bond_frame_indices)
+        if self.current_index not in self.bond_frame_indices:
             self.selected_bonds.clear()
-        if frame_indices is not None:
-            self.bond_frame_indices = {int(index) for index in frame_indices}
         self.refresh_bonds()
 
     def set_bond_tolerance(self, tolerance):
@@ -1190,7 +1196,7 @@ class StructureViewer(QtInteractor):
         """
         self.bond_width = max(0.001, float(width))
         self.invalidate_bond_meshes()
-        if self.bonds_enabled:
+        if self.bond_frame_indices:
             self.refresh_bonds()
 
     def set_bond_alpha(self, alpha):
@@ -1203,7 +1209,7 @@ class StructureViewer(QtInteractor):
             None. Visible bonds are redrawn immediately.
         """
         self.bond_alpha = float(np.clip(alpha, 0.0, 1.0))
-        if self.bonds_enabled:
+        if self.bond_frame_indices:
             for actor in self.bond_actors:
                 actor.GetProperty().SetOpacity(self.bond_alpha)
             self.render()

@@ -1102,6 +1102,7 @@ class SettingsDialog(QDialog):
 
         Args:
             settings: Validated application settings.
+        self.owner._sync_bond_action()
             parent: Optional Qt parent widget.
 
         Return:
@@ -2239,6 +2240,7 @@ class MainWindow(QMainWindow):
         except OSError as error:
             self._log(f"Settings save error: {error}")
 
+        self._sync_bond_action()
     def _show_settings(self):
         """Open settings and apply accepted history and rendering defaults.
 
@@ -2270,6 +2272,7 @@ class MainWindow(QMainWindow):
                 "keyboard_translation_step"
             ]
         self._sync_history_actions()
+        self._sync_bond_action()
         self._trim_file_cache()
         self._persist_settings()
 
@@ -2964,9 +2967,6 @@ class MainWindow(QMainWindow):
             len(self.coordinates),
             self.current_index,
         )
-        self.bond_frame_indices = indices
-        self.viewer.bond_frame_indices = set(indices)
-        return indices
 
     def _check_bonds(self, checked=False):
         """Force recalculation of cached bond adjacency for selected frames.
@@ -3017,9 +3017,6 @@ class MainWindow(QMainWindow):
         Return:
             None. Invalid input restores the previous check state.
         """
-        if not enabled:
-            self.viewer.set_bonds(False, self.bond_frame_indices)
-            return
         try:
             indices = self._selected_bond_frames()
             before, after = {}, {}
@@ -3037,12 +3034,20 @@ class MainWindow(QMainWindow):
                         len(after[frame_index][0]), dtype=np.int8
                     )
         except (IndexError, TypeError, ValueError) as error:
-            blocker = QSignalBlocker(self.bond_action)
-            self.bond_action.setChecked(not enabled)
-            del blocker
+            self._sync_bond_action()
             QMessageBox.warning(self, "Bonds", str(error))
             return
-        self.viewer.set_bonds(True, indices)
+        visible = set(self.bond_frame_indices)
+        if enabled:
+            visible.update(indices)
+        else:
+            visible.difference_update(indices)
+        self.bond_frame_indices = sorted(visible)
+        for record in self.window_manager.records_for_file(self.active_key):
+            record["viewer"].bond_frame_indices = set(visible)
+            if record["frame_index"] not in visible:
+                record["viewer"].selected_bonds.clear()
+            record["viewer"].refresh_bonds()
         # Lazy initialization changes the graph too; record it so older graph
         # deltas can never be replayed against an unrecorded replacement graph.
         if after:
@@ -3140,14 +3145,13 @@ class MainWindow(QMainWindow):
             {frame_index: replacement_orders},
         )
         if change.frame_indices:
-            # Make an explicitly added bond immediately visible, including a
-            # previously hidden frame, without computing any other connections.
-            self.bond_frame_indices = sorted(set(self.bond_frame_indices) | {frame_index})
-            blocker = QSignalBlocker(self.bond_action)
-            self.bond_action.setChecked(True)
-            del blocker
-            for record in self.window_manager.records:
-                record["viewer"].bonds_enabled = True
+            # Make an explicitly added bond immediately visible on this frame,
+            # including a previously hidden one, without computing any others.
+            self.bond_frame_indices = sorted(
+                set(self.bond_frame_indices) | {frame_index}
+            )
+            for record in self.window_manager.records_for_file(self.active_key):
+                record["viewer"].bond_frame_indices = set(self.bond_frame_indices)
             self._record_change(change)
 
     def _delete_selected_bonds(self, frame_index, pairs):
@@ -3176,6 +3180,25 @@ class MainWindow(QMainWindow):
         after = graph[:, ~np.isin(current, selected)]
         after_orders = np.asarray(
             [order_map[tuple(sorted((int(a), int(b))))] for a, b in after.T],
+        self._sync_bond_action()
+
+    def _sync_bond_action(self):
+        """Reflect the current frame's bond-visibility flag in the menu action."""
+        if not hasattr(self, "bond_action"):
+            return
+        graph = (
+            self.bond_adjacencies[self.current_index]
+            if 0 <= self.current_index < len(self.bond_adjacencies)
+            else None
+        )
+        checked = (
+            self.current_index in self.bond_frame_indices
+            and graph is not None
+            and len(graph[0]) > 0
+        )
+        blocker = QSignalBlocker(self.bond_action)
+        self.bond_action.setChecked(checked)
+        del blocker
             dtype=np.int8,
         )
         change = BondChange.between(
@@ -3272,6 +3295,7 @@ class MainWindow(QMainWindow):
         multipliers, matrix = self.supercell_transforms[frame_index]
         dialog = SupercellDialog(multipliers, matrix, self)
         if dialog.exec() != QDialog.DialogCode.Accepted:
+            self._sync_bond_action()
             return
         if dialog.resize_requested:
             self._resize_supercell()
@@ -4430,7 +4454,7 @@ class MainWindow(QMainWindow):
             "default_custom_radius", "default_atom_scale", "_background_color_value", "material_ambient",
             "material_diffuse", "material_specular", "material_roughness",
             "material_metallic", "axes_visible", "grid_visible", "bond_width",
-            "bond_alpha", "bond_tolerance", "bonds_enabled",
+            "bond_alpha", "bond_tolerance",
             "keyboard_translation_step", "perspective_enabled", "distinguish_files",
         ):
             if source_viewer is not None:
@@ -4456,7 +4480,7 @@ class MainWindow(QMainWindow):
             state.bond_orders,
         )
         if source_viewer is not None:
-            viewer.bonds_enabled = source_viewer.bonds_enabled
+            viewer.bonds_enabled = bool(state.bond_frame_indices)
         viewer.bond_frame_indices = set(state.bond_frame_indices)
         viewer.current_index = frame_index
         viewer.set_frame(frame_index)
@@ -4975,6 +4999,7 @@ class MainWindow(QMainWindow):
 
         windows_menu = menu_bar.addMenu("Windows")
         show_files_action = self.file_dock.toggleViewAction()
+        self._sync_bond_action()
         show_files_action.setText("Show Files")
         windows_menu.addAction(show_files_action)
         show_frames_action = self.frame_dock.toggleViewAction()
@@ -6098,6 +6123,7 @@ class MainWindow(QMainWindow):
 
         Returns:
             None. In-place NumPy mutations become visible immediately.
+        self._sync_bond_action()
         """
         self._refresh_after_change(frame_index=self.current_index)
 
