@@ -73,6 +73,7 @@ from btgui.backend.hydrogenate import add_hydrogens
 from btgui.backend.updater_presets.clean_structure import clean as clean_structure
 from btgui.data.appearance import ELEMENT_COLORS, default_color
 from btgui.frontend.cli import CLI
+from btgui.frontend.file_state import FileState
 from btgui.frontend.changes import (
     AppearanceChange, BondChange, ClearBondsChange, FramePermutationChange,
     InplaceUpdaterChange, StructureChange,
@@ -1382,25 +1383,54 @@ class MainWindow(QMainWindow):
         A main window with an empty toolbar and an initially empty viewer.
     """
 
+    _STATE_ATTRS = frozenset({
+        "elements",
+        "coordinates",
+        "lattices",
+        "frame_names",
+        "_frame_name_serial",
+        "atom_frame_styles",
+        "frame_metrics",
+        "bond_adjacencies",
+        "bond_orders",
+        "bond_frame_indices",
+        "supercell_bases",
+        "supercell_transforms",
+        "current_index",
+        "undo_stack",
+        "redo_stack",
+    })
+
+    def __getattr__(self, name):
+        """Read one frame-owned attribute from the active file state."""
+        if name in type(self)._STATE_ATTRS:
+            state = self.__dict__.get("_active_state")
+            if state is not None:
+                return getattr(state, name)
+        raise AttributeError(
+            f"{type(self).__name__!r} object has no attribute {name!r}"
+        )
+
+    def __setattr__(self, name, value):
+        """Write one frame-owned attribute into the active file state."""
+        if name in type(self)._STATE_ATTRS:
+            state = self.__dict__.get("_active_state")
+            if state is not None:
+                setattr(state, name, value)
+                return
+        object.__setattr__(self, name, value)
+
     def __init__(self, open_handler=None, save_handler=None, parent=None, updater=None):
         super().__init__(parent)
         self.setWindowTitle("btgui - Structure Viewer")
         self.resize(1100, 760)
-        self.elements = []
-        self.coordinates = []
-        self.lattices = []
-        self.frame_names = []
-        self._frame_name_serial = 0
-        self.atom_frame_styles = []
-        self.frame_metrics = []
-        self.bond_adjacencies = []
-        self.bond_orders = []
-        self.bond_frame_indices = []
+        self.files = {}
+        self.active_key = None
+        self._active_state = None
         self.open_handler = open_handler
         self.save_handler = save_handler
         self.updater = None
         self.updaters = []
-        self.current_index = 0
         self.play_indices = []
         self.play_position = 0
         self.playback_loop = False
@@ -1418,10 +1448,8 @@ class MainWindow(QMainWindow):
         self.settings = self._load_settings()
         self.updater_warning = None
         self._load_configured_updaters()
-        self.undo_stack = deque(maxlen=self.settings["history_limit"])
-        self.redo_stack = deque()
-        self.supercell_bases = {}
-        self.supercell_transforms = {}
+        self._active_state = FileState(None, self.settings["history_limit"])
+        self.files[None] = self._active_state
         self.timer = QTimer(self)
         self.timer.timeout.connect(self._advance_frame)
 
