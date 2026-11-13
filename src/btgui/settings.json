@@ -22,7 +22,7 @@
   "clean_global_maxiter": 200,
   "clean_workers": 1,
   "clean_bounds_span": 2.0,
-  "language": "en",
+  "language": "zh_CN",
   "updater_path": [],
   "updater_function": []
 }
