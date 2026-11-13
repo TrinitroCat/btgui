@@ -49,7 +49,7 @@ if /i "%FULL_VTK%"=="1" (
     set "VTK_FLAGS=!VTK_FLAGS! --include-package=vtkmodules.numpy_interface --include-package=vtkmodules.util"
 )
 
-set "COMMON_FLAGS=--enable-plugin=pyside6 --include-qt-plugins=sensible --include-package=btgui --include-package=scipy.optimize --include-package=pyvista.plotting --include-package=pyvistaqt %VTK_FLAGS% --include-data-files=src\btgui\settings.json=btgui\settings.json --include-data-dir=src\btgui\data=btgui\data --output-dir="%OUTPUT_DIR%" --output-filename=btgui.exe --jobs=%JOBS% --lto=no --windows-console-mode=%CONSOLE_MODE% --windows-icon-from-ico="%ICON%" %UPX_FLAGS% %EXTRA_FLAGS%"
+set "COMMON_FLAGS=--enable-plugin=pyside6 --include-qt-plugins=sensible --include-package=btgui --include-package=scipy.optimize --include-package=pyvista.plotting --include-package=pyvistaqt %VTK_FLAGS% --include-data-files=src\btgui\settings.json=btgui\settings.json --include-data-dir=src\btgui\data=btgui\data --include-data-dir=src\btgui\frontend\locales=btgui\frontend\locales --output-dir="%OUTPUT_DIR%" --output-filename=btgui.exe --jobs=%JOBS% --lto=no --windows-console-mode=%CONSOLE_MODE% --windows-icon-from-ico="%ICON%" %UPX_FLAGS% %EXTRA_FLAGS%"
 
 if /i "%~1"=="standalone" goto standalone
 if /i "%~1"=="onefile" goto onefile

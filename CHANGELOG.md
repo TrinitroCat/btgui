@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Added an English/简体中文 main-window localization with JSON locale files,
+  Settings > Language switching, and translated menus, toolbars, dock titles,
+  frame/playback controls, file headers, and visible button labels. Nested
+  dialogs remain in English for this first pass.
 - Added an independent 1-4 H-H non-bonded term to clean, using the full van der
   Waals H-H contact distance so alkane conformers favor staggered over
   eclipsed/gauche contacts, while ordinary non-bonded pairs keep the existing

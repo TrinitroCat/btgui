@@ -19,7 +19,7 @@ from PySide6.QtCore import (
     QSignalBlocker, QTimer, Qt, Signal, QDir, QFile, QModelIndex,
     QSortFilterProxyModel,
 )
-from PySide6.QtGui import QAction, QColor, QDoubleValidator, QIntValidator
+from PySide6.QtGui import QAction, QActionGroup, QColor, QDoubleValidator, QIntValidator
 from PySide6.QtWidgets import (
     QComboBox,
     QCheckBox,
@@ -92,6 +92,7 @@ from btgui.frontend.changes import (
 )
 from btgui.integrations.structure_io import normalize_structure_files
 from btgui.integrations.updater import load_updater_module
+from btgui.frontend.i18n import Catalog, available_languages, language_codes
 from btgui.frontend.viewer import StructureViewer
 
 
@@ -119,6 +120,7 @@ DEFAULT_SETTINGS = {
     "clean_global_maxiter": 200,
     "clean_workers": 1,
     "clean_bounds_span": 2.0,
+    "language": "en",
     "updater_path": [],
     "updater_function": [],
 }
@@ -692,6 +694,22 @@ class FileSortProxyModel(QSortFilterProxyModel):
     def __init__(self, parent=None):
         super().__init__(parent)
         self._folders_first = True
+        self._header_labels = {}
+
+    def set_header_labels(self, labels):
+        """Set translated labels for the horizontal file-tree headers."""
+        self._header_labels = dict(labels)
+        self.headerDataChanged.emit(Qt.Orientation.Horizontal, 0, 3)
+
+    def headerData(self, section, orientation, role=Qt.ItemDataRole.DisplayRole):
+        """Translate the file-tree header while preserving model defaults."""
+        if (
+            orientation == Qt.Orientation.Horizontal
+            and role == Qt.ItemDataRole.DisplayRole
+            and section in self._header_labels
+        ):
+            return self._header_labels[section]
+        return super().headerData(section, orientation, role)
 
     def set_folders_first(self, enabled):
         """Set whether directories sort before files and refresh the view."""
@@ -1756,6 +1774,8 @@ class MainWindow(QMainWindow):
             self.settings_path = package_settings
         self.settings_warning = None
         self.settings = self._load_settings()
+        self.catalog = Catalog(self.settings["language"])
+        self.language_actions = {}
         self.updater_warning = None
         self._load_configured_updaters()
         self._active_state = FileState(None, self.settings["history_limit"])
@@ -1829,7 +1849,8 @@ class MainWindow(QMainWindow):
         bond_frames_widget = QWidget(self.bond_menu)
         bond_frames_layout = QHBoxLayout(bond_frames_widget)
         bond_frames_layout.setContentsMargins(8, 4, 8, 4)
-        bond_frames_layout.addWidget(QLabel("Frames:", bond_frames_widget))
+        self.bond_frames_label = QLabel("Frames:", bond_frames_widget)
+        bond_frames_layout.addWidget(self.bond_frames_label)
         self.bond_frames_edit = QLineEdit(bond_frames_widget)
         self.bond_frames_edit.setPlaceholderText("current or all")
         self.bond_frames_edit.setMinimumWidth(160)
@@ -1933,7 +1954,8 @@ class MainWindow(QMainWindow):
         fps_widget = QWidget(self.playback_menu)
         fps_layout = QHBoxLayout(fps_widget)
         fps_layout.setContentsMargins(8, 4, 8, 4)
-        fps_layout.addWidget(QLabel("fps:", fps_widget))
+        self.fps_caption = QLabel("fps:", fps_widget)
+        fps_layout.addWidget(self.fps_caption)
         self.playback_fps_slider = QSlider(Qt.Orientation.Horizontal, fps_widget)
         self.playback_fps_slider.setRange(1, 60)
         self.playback_fps_slider.setValue(3)
@@ -1951,7 +1973,8 @@ class MainWindow(QMainWindow):
         range_widget = QWidget(self.playback_menu)
         range_layout = QHBoxLayout(range_widget)
         range_layout.setContentsMargins(8, 4, 8, 4)
-        range_layout.addWidget(QLabel("range:", range_widget))
+        self.range_caption = QLabel("range:", range_widget)
+        range_layout.addWidget(self.range_caption)
         self.playback_range_start = QLineEdit(range_widget)
         self.playback_range_end = QLineEdit(range_widget)
         for edit in (self.playback_range_start, self.playback_range_end):
@@ -1969,7 +1992,8 @@ class MainWindow(QMainWindow):
         stride_widget = QWidget(self.playback_menu)
         stride_layout = QHBoxLayout(stride_widget)
         stride_layout.setContentsMargins(8, 4, 8, 4)
-        stride_layout.addWidget(QLabel("stride:", stride_widget))
+        self.stride_caption = QLabel("stride:", stride_widget)
+        stride_layout.addWidget(self.stride_caption)
         self.playback_stride = QLineEdit("1", stride_widget)
         self.playback_stride.setFixedWidth(54)
         self.playback_stride.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -2222,6 +2246,9 @@ class MainWindow(QMainWindow):
             )
             if not 0.1 <= clean_bounds_span <= 30.0:
                 raise ValueError("clean_bounds_span must be between 0.1 and 30")
+            language = str(loaded.get("language", settings["language"]))
+            if language not in language_codes():
+                language = "en"
             buctoolkit_paths = loaded.get("buctoolkit_paths", settings["buctoolkit_paths"])
             if isinstance(buctoolkit_paths, str):
                 buctoolkit_paths = buctoolkit_paths.split(os.pathsep)
@@ -2259,6 +2286,7 @@ class MainWindow(QMainWindow):
                 clean_local_gtol=clean_local_gtol,
                 clean_workers=clean_workers,
                 clean_bounds_span=clean_bounds_span,
+                language=language,
                 **file_manager_flags,
             )
         except (TypeError, ValueError) as error:
@@ -4594,17 +4622,29 @@ class MainWindow(QMainWindow):
         path = Path(self.file_model.filePath(source_index))
         menu = QMenu(self.file_tree)
         if path.is_file():
-            menu.addAction("Open", lambda: self._file_tree_double_clicked(index))
+            menu.addAction(
+                self._t("action.context.open"),
+                lambda: self._file_tree_double_clicked(index),
+            )
             menu.addSeparator()
         menu.addAction(
-            "New Folder...",
+            self._t("action.context.new_folder"),
             lambda: self._new_folder(path if path.is_dir() else path.parent),
         )
-        menu.addAction("Rename", lambda: self._rename_file(index))
-        menu.addAction("Delete", lambda: self._delete_file(path))
-        menu.addAction("Copy Path", lambda: self._copy_path(path))
+        menu.addAction(
+            self._t("action.context.rename"), lambda: self._rename_file(index)
+        )
+        menu.addAction(
+            self._t("action.context.delete"), lambda: self._delete_file(path)
+        )
+        menu.addAction(
+            self._t("action.context.copy_path"), lambda: self._copy_path(path)
+        )
         menu.addSeparator()
-        menu.addAction("Refresh", lambda: self._sync_file_manager(force=True))
+        menu.addAction(
+            self._t("action.context.refresh"),
+            lambda: self._sync_file_manager(force=True),
+        )
         menu.exec(self.file_tree.viewport().mapToGlobal(position))
 
     def _new_folder(self, directory):
@@ -4906,10 +4946,22 @@ class MainWindow(QMainWindow):
             item.setSelected(True)
             selected_rows = [row]
         menu = QMenu(self.frame_list)
-        menu.addAction("Open", lambda: self._open_frame_window(row))
-        menu.addAction("Copy", lambda: self._duplicate_frames(selected_rows, row))
-        menu.addAction("Delete", lambda: self._delete_frames(selected_rows))
-        menu.addAction("Rename", lambda: self._rename_frame(row))
+        menu.addAction(
+            self._t("action.context.open"),
+            lambda: self._open_frame_window(row),
+        )
+        menu.addAction(
+            self._t("action.context.copy"),
+            lambda: self._duplicate_frames(selected_rows, row),
+        )
+        menu.addAction(
+            self._t("action.context.delete"),
+            lambda: self._delete_frames(selected_rows),
+        )
+        menu.addAction(
+            self._t("action.context.rename"),
+            lambda: self._rename_frame(row),
+        )
         menu.exec(self.frame_list.mapToGlobal(position))
 
     def _rename_frame(self, frame_index):
@@ -5259,7 +5311,9 @@ class MainWindow(QMainWindow):
             None. Updates the menu button to show the active behavior.
         """
         self.playback_loop = not self.playback_loop
-        self.playback_repeat_button.setText("loop" if self.playback_loop else "once")
+        self.playback_repeat_button.setText(
+            self._t("action.repeat_loop" if self.playback_loop else "action.repeat_once")
+        )
 
     def _toggle_playback(self, checked=False):
         """Pause active playback or start it with the menu settings.
@@ -5311,7 +5365,9 @@ class MainWindow(QMainWindow):
             else QStyle.StandardPixmap.SP_MediaPlay
         )
         self.play_button.setIcon(self.style().standardIcon(icon))
-        self.play_button.setToolTip("Pause" if playing else "Play")
+        self.play_button.setToolTip(
+            self._t("action.pause" if playing else "action.play")
+        )
         color = "#ef5350" if playing else "#4caf50"
         hover = "#e53935" if playing else "#43a047"
         self.play_button.setStyleSheet(
@@ -5370,70 +5426,200 @@ class MainWindow(QMainWindow):
         return bar
 
     def _create_menus(self):
-        """Create File, Settings, Appearance, and View menus.
+        """Create the localized main-window menu bar and its controls.
 
         Args:
             None.
 
         Return:
-            None. Connects top-level actions and embeds zoom controls in View.
+            None. Menu objects are retained so a language switch can update
+            their titles and action text in place.
         """
         menu_bar = self.menuBar()
-        file_menu = menu_bar.addMenu("File")
-        new_action = file_menu.addAction("New...")
-        new_action.setShortcut("Ctrl+N")
-        new_action.triggered.connect(self._new_frame)
-        open_action = file_menu.addAction("Open...")
-        open_action.setShortcut("Ctrl+O")
-        open_action.triggered.connect(self._open_dialog)
-        save_action = file_menu.addAction("Save As...")
-        save_action.setShortcut("Ctrl+Shift+S")
-        save_action.triggered.connect(self._save_dialog)
-        export_action = file_menu.addAction("Export Batch...")
-        export_action.triggered.connect(self._export_dialog)
-        settings_menu = menu_bar.addMenu("Settings")
-        settings_action = settings_menu.addAction("Preferences...")
-        settings_action.triggered.connect(self._show_settings)
-        file_manager_action = settings_menu.addAction("File Manager...")
-        file_manager_action.triggered.connect(self._show_file_manager_settings)
-        clean_backend_action = settings_menu.addAction("Clean Backend...")
-        clean_backend_action.triggered.connect(self._show_clean_backend)
-        clear_cache_action = settings_menu.addAction("Clear File Cache")
-        clear_cache_action.triggered.connect(self._clear_file_cache)
-        appearance_action = QAction("Appearance", self)
-        appearance_action.triggered.connect(self._show_appearance)
-        menu_bar.addAction(appearance_action)
+        self.file_menu = menu_bar.addMenu("File")
+        self.new_action = self.file_menu.addAction("New...")
+        self.new_action.setShortcut("Ctrl+N")
+        self.new_action.triggered.connect(self._new_frame)
+        self.open_action = self.file_menu.addAction("Open...")
+        self.open_action.setShortcut("Ctrl+O")
+        self.open_action.triggered.connect(self._open_dialog)
+        self.save_action = self.file_menu.addAction("Save As...")
+        self.save_action.setShortcut("Ctrl+Shift+S")
+        self.save_action.triggered.connect(self._save_dialog)
+        self.export_action = self.file_menu.addAction("Export Batch...")
+        self.export_action.triggered.connect(self._export_dialog)
 
-        windows_menu = menu_bar.addMenu("Windows")
-        show_files_action = self.file_dock.toggleViewAction()
-        show_files_action.setText("Show Files")
-        windows_menu.addAction(show_files_action)
-        show_frames_action = self.frame_dock.toggleViewAction()
-        show_frames_action.setText("Show Frames")
-        windows_menu.addAction(show_frames_action)
-        delete_action = windows_menu.addAction("Delete...")
-        delete_action.triggered.connect(self._show_delete_frames)
-        windows_menu.addAction("Close All", self._close_all_views)
+        self.settings_menu = menu_bar.addMenu("Settings")
+        self.preferences_action = self.settings_menu.addAction("Preferences...")
+        self.preferences_action.triggered.connect(self._show_settings)
+        self.file_manager_action = self.settings_menu.addAction("File Manager...")
+        self.file_manager_action.triggered.connect(self._show_file_manager_settings)
+        self.clean_backend_action = self.settings_menu.addAction("Clean Backend...")
+        self.clean_backend_action.triggered.connect(self._show_clean_backend)
+        self.clear_cache_action = self.settings_menu.addAction("Clear File Cache")
+        self.clear_cache_action.triggered.connect(self._clear_file_cache)
+        self.language_menu = self.settings_menu.addMenu("Language")
+        self.language_group = QActionGroup(self)
+        self.language_group.setExclusive(True)
+        for code, name in available_languages():
+            action = QAction(name, self)
+            action.setCheckable(True)
+            action.triggered.connect(
+                lambda checked=False, code=code: self._set_language(code)
+            )
+            self.language_group.addAction(action)
+            self.language_menu.addAction(action)
+            self.language_actions[code] = action
 
-        view_menu = menu_bar.addMenu("View")
-        view_menu.addAction("Along A", lambda: self._set_view(0))
-        view_menu.addAction("Along B", lambda: self._set_view(1))
-        view_menu.addAction("Along C", lambda: self._set_view(2))
-        view_menu.addSeparator()
-        self.perspective_action = view_menu.addAction("Perspective")
+        self.appearance_action = QAction("Appearance", self)
+        self.appearance_action.triggered.connect(self._show_appearance)
+        menu_bar.addAction(self.appearance_action)
+
+        self.windows_menu = menu_bar.addMenu("Windows")
+        self.show_files_action = self.file_dock.toggleViewAction()
+        self.show_files_action.setText("Show Files")
+        self.windows_menu.addAction(self.show_files_action)
+        self.show_frames_action = self.frame_dock.toggleViewAction()
+        self.show_frames_action.setText("Show Frames")
+        self.windows_menu.addAction(self.show_frames_action)
+        self.delete_action = self.windows_menu.addAction("Delete...")
+        self.delete_action.triggered.connect(self._show_delete_frames)
+        self.close_all_action = self.windows_menu.addAction(
+            "Close All", self._close_all_views
+        )
+
+        self.view_menu = menu_bar.addMenu("View")
+        self.along_actions = [
+            self.view_menu.addAction("Along A", lambda: self._set_view(0)),
+            self.view_menu.addAction("Along B", lambda: self._set_view(1)),
+            self.view_menu.addAction("Along C", lambda: self._set_view(2)),
+        ]
+        self.view_menu.addSeparator()
+        self.perspective_action = self.view_menu.addAction("Perspective")
         self.perspective_action.setCheckable(True)
         self.perspective_action.setChecked(False)
         self.perspective_action.toggled.connect(self._set_perspective_enabled)
-        view_menu.addSeparator()
-        zoom_controls = QWidget(view_menu)
+        self.view_menu.addSeparator()
+        zoom_controls = QWidget(self.view_menu)
         zoom_layout = QHBoxLayout(zoom_controls)
         zoom_layout.setContentsMargins(8, 4, 8, 4)
         zoom_layout.addWidget(self.zoom_minus_button)
         zoom_layout.addWidget(self.zoom_input)
         zoom_layout.addWidget(self.zoom_plus_button)
-        zoom_action = QWidgetAction(view_menu)
+        zoom_action = QWidgetAction(self.view_menu)
         zoom_action.setDefaultWidget(zoom_controls)
-        view_menu.addAction(zoom_action)
+        self.view_menu.addAction(zoom_action)
+        self._localize_main_page()
+
+    def _t(self, key):
+        """Translate a visible main-window key through the active catalog."""
+        return self.catalog.text(key)
+
+    def _sync_language_actions(self):
+        """Reflect the active catalog in the Settings > Language menu."""
+        for code, action in self.language_actions.items():
+            action.setChecked(code == self.catalog.code)
+
+    def _set_language(self, code):
+        """Switch the main-window language and persist the choice."""
+        if code not in language_codes():
+            return
+        self.settings["language"] = code
+        self.catalog.set_language(code)
+        self._localize_main_page()
+        self._persist_settings()
+
+    def _localize_main_page(self):
+        """Apply the current catalog to visible main-window controls."""
+        self.setWindowTitle(self._t("window.title"))
+        self.file_menu.setTitle(self._t("menu.file"))
+        self.settings_menu.setTitle(self._t("menu.settings"))
+        self.windows_menu.setTitle(self._t("menu.windows"))
+        self.view_menu.setTitle(self._t("menu.view"))
+        self.appearance_action.setText(self._t("menu.appearance"))
+        self.language_menu.setTitle(self._t("menu.language"))
+        self.new_action.setText(self._t("action.new"))
+        self.open_action.setText(self._t("action.open"))
+        self.save_action.setText(self._t("action.save_as"))
+        self.export_action.setText(self._t("action.export"))
+        self.preferences_action.setText(self._t("action.preferences"))
+        self.file_manager_action.setText(self._t("action.file_manager"))
+        self.clean_backend_action.setText(self._t("action.clean_backend"))
+        self.clear_cache_action.setText(self._t("action.clear_cache"))
+        self.show_files_action.setText(self._t("action.show_files"))
+        self.show_frames_action.setText(self._t("action.show_frames"))
+        self.delete_action.setText(self._t("action.delete"))
+        self.close_all_action.setText(self._t("action.close_all"))
+        for action, key in zip(
+            self.along_actions,
+            ("action.along_a", "action.along_b", "action.along_c"),
+        ):
+            action.setText(self._t(key))
+        self.perspective_action.setText(self._t("action.perspective"))
+        self._sync_language_actions()
+
+        for key, bar in self.toolbar_groups.items():
+            bar.setWindowTitle(self._t(f"toolbar.{key}"))
+        self.undo_action.setText(self._t("action.undo"))
+        self.undo_action.setToolTip(self._t("action.undo_tooltip"))
+        self.redo_action.setText(self._t("action.redo"))
+        self.redo_action.setToolTip(self._t("action.redo_tooltip"))
+        self.supercell_action.setText(self._t("action.supercell_build"))
+        self.supercell_button.setText(self._t("action.supercell"))
+        self.add_atom_action.setText(self._t("action.add_atom"))
+        self.replace_atom_action.setText(self._t("action.replace_atom"))
+        self.clean_action.setText(self._t("action.clean"))
+        self.clean_action.setToolTip(self._t("action.clean_tooltip"))
+        self.hydrogen_action.setText(self._t("action.add_h"))
+        self.hydrogen_action.setToolTip(self._t("action.add_h_tooltip"))
+        self.bond_button.setText(self._t("action.bonds"))
+        self.add_bond_action.setText(self._t("action.add_bond"))
+        self.check_bonds_action.setText(self._t("action.check_bonds"))
+        self.bond_action.setText(self._t("action.show_bonds"))
+        self.clear_bonds_action.setText(self._t("action.clear_bonds"))
+        self.bond_frames_label.setText(self._t("label.frames"))
+        self.bond_frames_edit.setPlaceholderText(
+            self._t("placeholder.current_or_all")
+        )
+        self.tolerance_spin.setPrefix(self._t("label.tolerance") + " ")
+        self.pbc_wrap_button.setText(self._t("action.pbc_wrap"))
+        self.pbc_frames_edit.setPlaceholderText(
+            self._t("placeholder.current_or_all")
+        )
+        self.metrics_button.setText(self._t("action.metrics"))
+        self.length_measure_action.setText(self._t("action.length"))
+        self.angle_measure_action.setText(self._t("action.angle"))
+        self.metric_style_action.setText(self._t("action.metric_style"))
+        self.update_button.setText(self._t("action.update"))
+        self.update_button.setToolTip(self._t("action.update_tooltip"))
+        self._rebuild_update_menu()
+        self.previous_frame_button.setToolTip(self._t("action.previous_frame"))
+        self.next_frame_button.setToolTip(self._t("action.next_frame"))
+        self.frame_label.setText(self._t("label.current_frame"))
+        self.fps_caption.setText(self._t("label.fps"))
+        self.range_caption.setText(self._t("label.range"))
+        self.stride_caption.setText(self._t("label.stride"))
+        self.playback_repeat_button.setText(
+            self._t(
+                "action.repeat_loop" if self.playback_loop else "action.repeat_once"
+            )
+        )
+        self.zoom_minus_button.setToolTip(self._t("action.zoom_out"))
+        self.zoom_input.setToolTip(self._t("action.zoom_percentage"))
+        self.zoom_plus_button.setToolTip(self._t("action.zoom_in"))
+        self._set_play_button_state(self.timer.isActive())
+        self.command.setPlaceholderText(self._t("placeholder.command"))
+        self.frame_dock.setWindowTitle(self._t("dock.frames"))
+        self.file_dock.setWindowTitle(self._t("dock.files"))
+        self.file_placeholder.setText(self._t("placeholder.file_manager"))
+        self.file_proxy.set_header_labels(
+            {
+                0: self._t("header.name"),
+                1: self._t("header.size"),
+                2: self._t("header.type"),
+                3: self._t("header.modified"),
+            }
+        )
 
     def set_data(self, elements, coordinates, lattices):
         """Set the three raw frame-ordered array lists.
@@ -5491,16 +5677,21 @@ class MainWindow(QMainWindow):
             return
         self.update_menu.clear()
         for updater in self.updaters:
-            action = self.update_menu.addAction(updater["name"])
+            label = (
+                self._t("updater.clean")
+                if updater["name"] == "clean"
+                else updater["name"]
+            )
+            action = self.update_menu.addAction(label)
             action.setToolTip(str(updater["path"]))
             action.triggered.connect(
                 lambda checked=False, record=updater: self._run_updater_dialog(record)
             )
         if self.updaters:
             self.update_menu.addSeparator()
-        more_action = self.update_menu.addAction("More...")
+        more_action = self.update_menu.addAction(self._t("action.more"))
         more_action.triggered.connect(self._show_updater_dialog)
-        help_action = self.update_menu.addAction("Help")
+        help_action = self.update_menu.addAction(self._t("action.help"))
         help_action.triggered.connect(self._show_updater_help)
 
     def set_updater(self, updater):

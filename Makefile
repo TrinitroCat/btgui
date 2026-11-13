@@ -74,6 +74,7 @@ COMMON_FLAGS = \
 	$(STATIC_LIBPYTHON) \
 	--include-data-files=src/btgui/settings.json=btgui/settings.json \
 	--include-data-dir=src/btgui/data=btgui/data \
+	--include-data-dir=src/btgui/frontend/locales=btgui/frontend/locales \
 	--output-dir=$(OUTPUT_DIR) \
 	--output-filename=btgui$(EXE) \
 	--jobs=$(JOBS) \

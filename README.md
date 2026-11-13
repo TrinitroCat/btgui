@@ -101,6 +101,14 @@ Settings > File Manager chooses optional Size/Type/Modified columns, folder
 ordering, and the sort column/order. Renaming or deleting a file that is
 currently open is blocked.
 
+The main window is available in English and 简体中文. Settings > Language
+switches immediately without restarting; the choice is stored in
+`settings.json`. Menu bar items, toolbars, dock titles, frame/playback/zoom
+controls, file headers and visible button labels are localized. Nested dialogs
+remain in English in this first pass. Strings live in
+`src/btgui/frontend/locales/*.json`; adding another language only requires a new
+JSON file with a `_meta` block.
+
 Closed files stay cached until the total estimated memory exceeds the configured
 limit. Only files with no display windows are released; if all referenced files
 exceed the limit they are kept, and a file is released as soon as its last

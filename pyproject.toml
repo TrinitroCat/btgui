@@ -16,4 +16,4 @@ btgui = "btgui.app:main"
 where = ["src"]
 
 [tool.setuptools.package-data]
-btgui = ["settings.json", "data/*.json"]
+btgui = ["settings.json", "data/*.json", "frontend/locales/*.json"]
