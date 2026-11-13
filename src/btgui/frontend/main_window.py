@@ -1527,10 +1527,16 @@ class MainWindow(QMainWindow):
         self.timer = QTimer(self)
         self.timer.timeout.connect(self._advance_frame)
 
-        self.toolbar = QToolBar("Tools", self)
-        self.toolbar.setObjectName("mainToolbar")
-        self.toolbar.setMovable(False)
-        self.addToolBar(Qt.ToolBarArea.TopToolBarArea, self.toolbar)
+        self.toolbar_groups = {}
+        for key, title in (
+            ("edit", "Edit"),
+            ("structure", "Structure"),
+            ("measure", "Measure"),
+            ("update", "Update"),
+            ("frames", "Frames"),
+        ):
+            self._add_toolbar_group(key, title)
+        self.toolbar = self.toolbar_groups["edit"]
         self.viewer = StructureViewer(self)
         self._configure_viewer(self.viewer)
         self.viewer.hide()
@@ -1543,7 +1549,7 @@ class MainWindow(QMainWindow):
         self.undo_action.setShortcut("Ctrl+Z")
         self.undo_action.setToolTip("Undo edit")
         self.undo_action.triggered.connect(self._undo)
-        self.toolbar.addAction(self.undo_action)
+        self.toolbar_groups["edit"].addAction(self.undo_action)
         self.redo_action = QAction(
             self.style().standardIcon(QStyle.StandardPixmap.SP_ArrowForward),
             "Redo",
@@ -1552,8 +1558,7 @@ class MainWindow(QMainWindow):
         self.redo_action.setShortcut("Ctrl+Y")
         self.redo_action.setToolTip("Redo edit")
         self.redo_action.triggered.connect(self._redo)
-        self.toolbar.addAction(self.redo_action)
-        self.toolbar.addSeparator()
+        self.toolbar_groups["edit"].addAction(self.redo_action)
 
         self.supercell_action = QAction("Build / Transform...", self)
         self.supercell_action.triggered.connect(self._show_supercell)
@@ -1563,26 +1568,24 @@ class MainWindow(QMainWindow):
         self.supercell_button.setText("Supercell")
         self.supercell_button.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
         self.supercell_button.setMenu(self.supercell_menu)
-        self.toolbar.addWidget(self.supercell_button)
+        self.toolbar_groups["structure"].addWidget(self.supercell_button)
         self.add_atom_action = QAction("Add Atom", self)
         self.add_atom_action.triggered.connect(self._show_add_atom)
-        self.toolbar.addAction(self.add_atom_action)
+        self.toolbar_groups["structure"].addAction(self.add_atom_action)
         self.replace_atom_action = QAction("Replace Atom", self)
         self.replace_atom_action.setEnabled(False)
         self.replace_atom_action.triggered.connect(self._show_replace_atom)
-        self.toolbar.addAction(self.replace_atom_action)
+        self.toolbar_groups["structure"].addAction(self.replace_atom_action)
         self.clean_action = QAction("Clean", self)
         self.clean_action.setToolTip(
             "Relax the focused frame with the preset force field"
         )
         self.clean_action.triggered.connect(self._clean_current_frame)
-        self.toolbar.addAction(self.clean_action)
         self.hydrogen_action = QAction("Add H", self)
         self.hydrogen_action.setToolTip(
             "Add hydrogens to the focused frame from the explicit bond orders"
         )
         self.hydrogen_action.triggered.connect(self._add_hydrogens)
-        self.toolbar.addAction(self.hydrogen_action)
 
         self.bond_menu = QMenu(self)
         self.add_bond_action = self.bond_menu.addAction("Add bond")
@@ -1629,16 +1632,16 @@ class MainWindow(QMainWindow):
         self.bond_button.setText("Bonds")
         self.bond_button.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
         self.bond_button.setMenu(self.bond_menu)
-        self.toolbar.addWidget(self.bond_button)
+        self.toolbar_groups["structure"].addWidget(self.bond_button)
 
         self.pbc_wrap_button = QToolButton(self)
         self.pbc_wrap_button.setText("PBC wrap")
         self.pbc_wrap_button.clicked.connect(self._wrap_pbc)
-        self.toolbar.addWidget(self.pbc_wrap_button)
+        self.toolbar_groups["structure"].addWidget(self.pbc_wrap_button)
         self.pbc_frames_edit = QLineEdit(self)
         self.pbc_frames_edit.setPlaceholderText("current or all")
         self.pbc_frames_edit.setMaximumWidth(130)
-        self.toolbar.addWidget(self.pbc_frames_edit)
+        self.toolbar_groups["structure"].addWidget(self.pbc_frames_edit)
 
         self.metrics_button = QToolButton(self)
         self.metrics_button.setText("Metrics")
@@ -1650,7 +1653,7 @@ class MainWindow(QMainWindow):
         self.metric_style_action = self.metrics_menu.addAction("Style...")
         self.metric_style_action.triggered.connect(self._show_metric_style)
         self.metrics_button.setMenu(self.metrics_menu)
-        self.toolbar.addWidget(self.metrics_button)
+        self.toolbar_groups["measure"].addWidget(self.metrics_button)
 
         self.update_button = QToolButton(self)
         self.update_button.setText("Update")
@@ -1659,35 +1662,35 @@ class MainWindow(QMainWindow):
         self.update_menu = QMenu(self.update_button)
         self.update_button.setMenu(self.update_menu)
         self._rebuild_update_menu()
-        self.toolbar.addWidget(self.update_button)
-
-        self.toolbar.addSeparator()
+        self.toolbar_groups["update"].addWidget(self.update_button)
+        self.toolbar_groups["update"].addAction(self.clean_action)
+        self.toolbar_groups["update"].addAction(self.hydrogen_action)
         self.previous_frame_button = QToolButton(self)
         self.previous_frame_button.setText("↑")
         self.previous_frame_button.setToolTip("Previous frame")
         self.previous_frame_button.clicked.connect(lambda: self._step_frame(-1))
-        self.toolbar.addWidget(self.previous_frame_button)
+        self.toolbar_groups["frames"].addWidget(self.previous_frame_button)
         self.frame_label = QLabel("Current Frame", self)
-        self.toolbar.addWidget(self.frame_label)
+        self.toolbar_groups["frames"].addWidget(self.frame_label)
         self.frame_input = QLineEdit("0", self)
         self.frame_input.setMaximumWidth(58)
         self.frame_input.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.frame_input.editingFinished.connect(self._on_frame_input)
-        self.toolbar.addWidget(self.frame_input)
+        self.toolbar_groups["frames"].addWidget(self.frame_input)
         self.frame_total_label = QLabel("/ 0", self)
-        self.toolbar.addWidget(self.frame_total_label)
+        self.toolbar_groups["frames"].addWidget(self.frame_total_label)
         self.next_frame_button = QToolButton(self)
         self.next_frame_button.setText("↓")
         self.next_frame_button.setToolTip("Next frame")
         self.next_frame_button.clicked.connect(lambda: self._step_frame(1))
-        self.toolbar.addWidget(self.next_frame_button)
+        self.toolbar_groups["frames"].addWidget(self.next_frame_button)
         self.play_button = QToolButton(self)
         self.play_button.setIcon(
             self.style().standardIcon(QStyle.StandardPixmap.SP_MediaPlay)
         )
         self.play_button.setToolTip("Play")
         self.play_button.clicked.connect(self._toggle_playback)
-        self.toolbar.addWidget(self.play_button)
+        self.toolbar_groups["frames"].addWidget(self.play_button)
         self._set_play_button_state(False)
 
         self.playback_menu = QMenu(self)
@@ -1750,14 +1753,7 @@ class MainWindow(QMainWindow):
             QToolButton.ToolButtonPopupMode.InstantPopup
         )
         self.playback_options_button.setMenu(self.playback_menu)
-        self.toolbar.addWidget(self.playback_options_button)
-        self.toolbar.addSeparator()
-        spacer = QWidget(self)
-        spacer.setSizePolicy(
-            QSizePolicy.Policy.Expanding,
-            QSizePolicy.Policy.Preferred,
-        )
-        self.toolbar.addWidget(spacer)
+        self.toolbar_groups["frames"].addWidget(self.playback_options_button)
         self.zoom_minus_button = QToolButton(self)
         self.zoom_minus_button.setText("-")
         self.zoom_minus_button.setToolTip("Decrease zoom")
@@ -4870,6 +4866,20 @@ class MainWindow(QMainWindow):
     def _change_zoom(self, delta):
         """Change the zoom spin box by one toolbar step."""
         self.zoom_input.setValue(self.zoom_input.value() + delta)
+
+    def _add_toolbar_group(self, key, title):
+        """Create one visually bounded toolbar group in the top area."""
+        bar = QToolBar(title, self)
+        bar.setObjectName(f"toolbar_{key}")
+        bar.setMovable(False)
+        bar.setFloatable(False)
+        bar.setStyleSheet(
+            "QToolBar { border: 1px solid rgba(128, 128, 128, 0.55); "
+            "border-radius: 3px; padding: 1px; margin: 1px; spacing: 2px; }"
+        )
+        self.addToolBar(Qt.ToolBarArea.TopToolBarArea, bar)
+        self.toolbar_groups[key] = bar
+        return bar
 
     def _create_menus(self):
         """Create File, Settings, Appearance, and View menus.
