@@ -14,12 +14,22 @@ from btgui.backend.updater_presets.build_structure_graph import ChemGraph
 from btgui.backend.updater_presets.simple_forcefield import (
     AngleCosineHarmonics,
     Harmonics,
+    Hydrogen14LennardJones,
     LennardJones,
+    build_nonbonded_masks,
 )
 from btgui.data.appearance import covalent_radius, vdw_radius
 
 
 BOND_LENGTH_OFFSETS = {1: 0.0, 2: 0.18, 3: 0.30}
+CLEAN_LOCAL_METHODS = ("BFGS", "L-BFGS-B", "Nelder-Mead")
+CLEAN_GLOBAL_METHODS = (
+    "basinhopping",
+    "differential_evolution",
+    "dual_annealing",
+    "shgo",
+    "direct",
+)
 
 
 def _frame_value(value, index, frames):
@@ -63,6 +73,151 @@ def _fixed_mask(value, coordinates):
     return mask != 0.0
 
 
+def _evaluate_terms(graph, terms):
+    """Return total energy and per-atom forces for one graph state."""
+    energy = 0.0
+    forces = np.zeros((graph.n_atoms, 3), dtype=float)
+    for term in terms:
+        term_energy, term_forces = term.apply(graph)
+        energy += term_energy
+        forces += term_forces
+    return float(energy), forces
+
+
+class FreeCoordinateObjective:
+    """Expose only free Cartesian coordinates to an optimizer."""
+
+    def __init__(self, graph, terms, initial, free_mask):
+        self.graph = graph
+        self.terms = terms
+        self.initial = np.asarray(initial, dtype=float).reshape(-1).copy()
+        self.free = np.flatnonzero(np.asarray(free_mask, dtype=bool).reshape(-1))
+        self.x0 = self.initial[self.free].copy()
+
+    def expand(self, vector):
+        """Expand a free-coordinate vector into the complete coordinate array."""
+        full = self.initial.copy()
+        full[self.free] = np.asarray(vector, dtype=float)
+        return full.reshape(self.graph.n_atoms, 3)
+
+    def evaluate(self, vector):
+        """Return energy and the gradient with respect to free coordinates."""
+        graph = self.graph
+        graph.coo = self.expand(vector)
+        graph.r_ij = graph.coo[graph.src] - graph.coo[graph.dst]
+        graph.dist_ij = np.linalg.norm(graph.r_ij, axis=1)
+        energy, forces = _evaluate_terms(graph, self.terms)
+        gradient = (-forces.reshape(-1))[self.free]
+        return energy, gradient
+
+    def energy(self, vector):
+        """Return only the energy for derivative-free optimizers."""
+        return self.evaluate(vector)[0]
+
+    def bounds(self, span):
+        """Return per-free-coordinate search bounds around the input geometry."""
+        span = float(span)
+        if span <= 0:
+            raise ValueError("bounds_span must be positive")
+        lower = self.initial[self.free] - span
+        upper = self.initial[self.free] + span
+        return list(zip(lower, upper))
+
+
+def _run_optimizer(
+    objective,
+    *,
+    mode,
+    local_method,
+    global_method,
+    maxiter,
+    gtol,
+    workers,
+    bounds_span,
+):
+    """Run the selected SciPy local or global optimizer on free coordinates."""
+    try:
+        from scipy.optimize import (
+            basinhopping,
+            differential_evolution,
+            direct,
+            dual_annealing,
+            minimize,
+            shgo,
+        )
+    except ImportError as error:
+        raise RuntimeError(
+            "clean requires scipy; install btgui with its core dependencies"
+        ) from error
+
+    maxiter = max(1, int(maxiter))
+    workers = max(1, int(workers))
+    if mode == "local":
+        if local_method not in CLEAN_LOCAL_METHODS:
+            raise ValueError(f"unsupported local optimizer: {local_method}")
+        if local_method == "Nelder-Mead":
+            result = minimize(
+                objective.energy,
+                objective.x0,
+                method="Nelder-Mead",
+                options={"maxiter": maxiter},
+            )
+        else:
+            result = minimize(
+                objective.evaluate,
+                objective.x0,
+                jac=True,
+                method=local_method,
+                options={"maxiter": maxiter, "gtol": float(gtol)},
+            )
+        return np.asarray(result.x, dtype=float), result
+
+    if mode != "global":
+        raise ValueError(f"unsupported clean mode: {mode}")
+    if global_method not in CLEAN_GLOBAL_METHODS:
+        raise ValueError(f"unsupported global optimizer: {global_method}")
+    bounds = objective.bounds(bounds_span)
+    if global_method == "basinhopping":
+        result = basinhopping(
+            objective.energy,
+            objective.x0,
+            niter=maxiter,
+            minimizer_kwargs={
+                "method": "BFGS",
+                "jac": lambda vector: objective.evaluate(vector)[1],
+                "options": {"maxiter": maxiter, "gtol": float(gtol)},
+            },
+        )
+    elif global_method == "differential_evolution":
+        result = differential_evolution(
+            objective.energy,
+            bounds,
+            maxiter=maxiter,
+            workers=workers,
+            polish=True,
+        )
+    elif global_method == "dual_annealing":
+        result = dual_annealing(
+            objective.energy,
+            bounds,
+            maxiter=maxiter,
+        )
+    elif global_method == "shgo":
+        result = shgo(
+            objective.energy,
+            bounds,
+            iters=maxiter,
+            workers=workers,
+        )
+    else:
+        result = direct(
+            objective.energy,
+            bounds,
+            maxiter=maxiter,
+        )
+    return np.asarray(result.x, dtype=float), result
+
+
 def _relax_frame(
     lattice,
     elements,
@@ -76,7 +231,13 @@ def _relax_frame(
     angle_k,
     lj_epsilon,
     lj_equilibrium_scale,
+    lj_hh14_epsilon,
     lj_cutoff,
+    mode,
+    local_method,
+    global_method,
+    workers,
+    bounds_span,
     optimizer,
 ):
     """Relax one frame and return new Cartesian coordinates."""
@@ -84,7 +245,6 @@ def _relax_frame(
     if n_atoms == 0:
         return coordinates.copy()
     fixed_mask = _fixed_mask(fixed, coordinates)
-    free = fixed_mask.reshape(-1).astype(float)
     if not np.any(fixed_mask):
         return coordinates.copy()
 
@@ -131,61 +291,54 @@ def _relax_frame(
             covalent_radii[bond_edges[0]] + covalent_radii[bond_edges[1]] - offsets
         )
 
+    masks = build_nonbonded_masks(graph, atomic_numbers)
     terms = (
         Harmonics(k_values, l_values),
         AngleCosineHarmonics(angle_k, labels),
         LennardJones(
-            lj_epsilon, lj_equilibrium_scale, lj_cutoff, vdw_radii
+            lj_epsilon,
+            lj_equilibrium_scale,
+            lj_cutoff,
+            vdw_radii,
+            pair_mask=masks.standard,
+        ),
+        Hydrogen14LennardJones(
+            lj_hh14_epsilon,
+            lj_cutoff,
+            vdw_radii,
+            masks.hh14,
         ),
     )
-
-    def objective(vector):
-        graph.coo = vector.reshape(n_atoms, 3)
-        graph.r_ij = graph.coo[graph.src] - graph.coo[graph.dst]
-        graph.dist_ij = np.linalg.norm(graph.r_ij, axis=1)
-        energy = 0.0
-        forces = np.zeros((n_atoms, 3), dtype=float)
-        for term in terms:
-            term_energy, term_forces = term.apply(graph)
-            energy += term_energy
-            forces += term_forces
-        # Terms return forces; scipy asks for the energy gradient.
-        return float(energy), -forces.reshape(-1) * free
-
-    initial = coordinates.reshape(-1).astype(float, copy=True)
-    energy_before, gradient = objective(initial)
+    objective = FreeCoordinateObjective(
+        graph, terms, coordinates, fixed_mask
+    )
+    if objective.free.size == 0:
+        return coordinates.copy()
+    energy_before, gradient = objective.evaluate(objective.x0)
     if not np.isfinite(energy_before) or not np.isfinite(gradient).all():
         raise ValueError("clean produced non-finite force-field values")
-    if np.max(np.abs(gradient)) <= gtol:
+    if mode == "local" and np.max(np.abs(gradient)) <= gtol:
         return coordinates.copy()
 
     if optimizer is None:
-        try:
-            from scipy.optimize import minimize
-        except ImportError as error:
-            raise RuntimeError(
-                "clean requires scipy; install btgui with its core dependencies"
-            ) from error
-        result = minimize(
+        relaxed_free, _result = _run_optimizer(
             objective,
-            initial,
-            jac=True,
-            method="L-BFGS-B",
-            options={
-                "maxiter": int(maxiter),
-                "gtol": float(gtol),
-                "ftol": 1e-12,
-            },
+            mode=mode,
+            local_method=local_method,
+            global_method=global_method,
+            maxiter=maxiter,
+            gtol=gtol,
+            workers=workers,
+            bounds_span=bounds_span,
         )
-        relaxed = np.asarray(result.x, dtype=float)
     else:
-        relaxed = np.asarray(optimizer(objective, initial), dtype=float)
-
-    if relaxed.shape != initial.shape or not np.isfinite(relaxed).all():
+        relaxed_free = np.asarray(
+            optimizer(objective.evaluate, objective.x0), dtype=float
+        )
+    if relaxed_free.shape != objective.x0.shape or not np.isfinite(relaxed_free).all():
         return coordinates.copy()
-    relaxed = relaxed.reshape(n_atoms, 3)
-    relaxed = np.where(fixed_mask, relaxed, coordinates)
-    energy_after, _ = objective(relaxed.reshape(-1))
+    relaxed = objective.expand(relaxed_free)
+    energy_after, _ = objective.evaluate(relaxed_free)
     if not np.isfinite(energy_after) or energy_after > energy_before + 1e-9:
         return coordinates.copy()
 
@@ -218,7 +371,13 @@ def clean(
     angle_k=1.0,
     lj_epsilon=5e-3,
     lj_equilibrium_scale=0.75,
+    lj_hh14_epsilon=1e-2,
     lj_cutoff=6.0,
+    mode="local",
+    local_method="BFGS",
+    global_method="differential_evolution",
+    workers=1,
+    bounds_span=2.0,
     optimizer=None,
 ):
     """Relax one or more structures with the preset valence force field.
@@ -233,8 +392,8 @@ def clean(
         bonds: Optional per-frame ``(2, E)`` COO bond arrays. ``None`` builds
             bonds with the Check bonds covalent-radius rule; an explicitly
             empty array means no bonds. A sequence selects one array per frame.
-        maxiter: Maximum L-BFGS-B iterations.
-        gtol: Gradient tolerance used as the early-exit condition.
+        maxiter: Maximum iterations for the selected optimizer.
+        gtol: Gradient tolerance for local gradient methods.
         bond_tolerance: Covalent-radius multiplier used when ``bonds`` is
             ``None``.
         bond_k: Harmonic bond force constant per unit bond order.
@@ -243,10 +402,18 @@ def clean(
         lj_equilibrium_scale: Multiplier on the van der Waals radius sum that
             places the Lennard-Jones minimum at
             ``scale * (vdW_i + vdW_j)``.
+        lj_hh14_epsilon: Well depth for the independent 1-4 H-H correction.
         lj_cutoff: Lennard-Jones cutoff; candidates are stored to 1.3 times
             this value.
-        optimizer: Optional ``callable(objective, x0) -> ndarray`` replacing
-            the default scipy L-BFGS-B call.
+        mode: ``local`` or ``global`` optimizer mode.
+        local_method: One of :data:`CLEAN_LOCAL_METHODS`; default ``BFGS``.
+        global_method: One of :data:`CLEAN_GLOBAL_METHODS`.
+        workers: Worker count forwarded to global optimizers that support it
+            (differential evolution and SHGO); other methods ignore it.
+        bounds_span: Per-free-coordinate search half-width for global methods.
+        optimizer: Optional ``callable(free_objective, x0) -> ndarray``
+            replacing the built-in dispatch. ``x0`` and the result are free
+            coordinates only.
 
     Return:
         ``(cells, elements, coordinates)`` lists. Elements, frame count, atom
@@ -282,7 +449,13 @@ def clean(
             angle_k=angle_k,
             lj_epsilon=lj_epsilon,
             lj_equilibrium_scale=lj_equilibrium_scale,
+            lj_hh14_epsilon=lj_hh14_epsilon,
             lj_cutoff=lj_cutoff,
+            mode=mode,
+            local_method=local_method,
+            global_method=global_method,
+            workers=workers,
+            bounds_span=bounds_span,
             optimizer=optimizer,
         )
         result_cell.append(np.array(frame_cell, copy=True))

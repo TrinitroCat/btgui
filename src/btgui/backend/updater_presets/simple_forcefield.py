@@ -1,12 +1,105 @@
 """Small valence force field terms used by the preset updaters."""
 
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
 from typing import Tuple
 
 import numpy as np
 
 from .bond_order import ideal_angles
 from .build_structure_graph import ChemGraph
+
+
+@dataclass(frozen=True)
+class NonbondedMasks:
+    """Pair partitions for independent non-bonded contributions."""
+
+    standard: np.ndarray
+    hh14: np.ndarray
+
+
+def _bond_edge_set(G: ChemGraph) -> set[tuple[int, int]]:
+    """Return canonical bonded endpoint pairs."""
+    if G.bond_mask is None:
+        return set()
+    return {
+        tuple(sorted((int(source), int(target))))
+        for source, target in G.indices[:, G.bond_mask].T
+    }
+
+
+def _neighbours(G: ChemGraph) -> list[set[int]]:
+    """Return bonded neighbour sets for every atom."""
+    neighbours = [set() for _ in range(G.n_atoms)]
+    for source, target in _bond_edge_set(G):
+        neighbours[source].add(target)
+        neighbours[target].add(source)
+    return neighbours
+
+
+def build_nonbonded_masks(G: ChemGraph, atomic_numbers: np.ndarray) -> NonbondedMasks:
+    """Partition graph pairs into standard and 1-4 H-H non-bonded pairs.
+
+    The 1-4 mask is built bond-centrically: for each bond ``a-b``, every
+    hydrogen attached to ``a`` (other than ``b``) is paired with every hydrogen
+    attached to ``b`` (other than ``a``). This is the H-a-b-H path and avoids
+    any all-pairs graph traversal.
+    """
+    count = G.indices.shape[1]
+    atomic_numbers = np.asarray(atomic_numbers, dtype=np.int64).reshape(-1)
+    standard = np.ones(count, dtype=bool)
+    hh14 = np.zeros(count, dtype=bool)
+    if count == 0:
+        return NonbondedMasks(standard, hh14)
+    if len(atomic_numbers) != G.n_atoms:
+        raise ValueError("atomic_numbers must match graph atom count")
+
+    bonds = _bond_edge_set(G)
+    neighbours = _neighbours(G)
+    lookup = {
+        (int(source), int(target)): index
+        for index, (source, target) in enumerate(G.indices.T)
+    }
+
+    def set_pair(mask, first, second, value):
+        for pair in ((first, second), (second, first)):
+            index = lookup.get(pair)
+            if index is not None:
+                mask[index] = value
+
+    # Exclude bonded and 1-3 pairs from the ordinary non-bonded term.
+    for centre, adjacent in enumerate(neighbours):
+        ordered = sorted(adjacent)
+        for first in range(len(ordered)):
+            for second in range(first + 1, len(ordered)):
+                set_pair(standard, ordered[first], ordered[second], False)
+    for source, target in bonds:
+        set_pair(standard, source, target, False)
+
+    hydrogens = atomic_numbers == 1
+    for source, target in bonds:
+        left = [
+            index
+            for index in neighbours[source]
+            if index != target and hydrogens[index]
+        ]
+        right = [
+            index
+            for index in neighbours[target]
+            if index != source and hydrogens[index]
+        ]
+        for left_index in left:
+            for right_index in right:
+                if left_index == right_index:
+                    continue
+                pair = tuple(sorted((left_index, right_index)))
+                if pair in bonds:
+                    continue
+                if pair not in lookup and pair[::-1] not in lookup:
+                    continue
+                set_pair(hh14, pair[0], pair[1], True)
+                set_pair(standard, pair[0], pair[1], False)
+    return NonbondedMasks(standard, hh14)
 
 
 def coo_row_sum(indices, val, n):
@@ -221,11 +314,15 @@ class LennardJones(StdTerm):
             equilibrium_scale: float,
             cutoff: float,
             vdw_radii: np.ndarray,
+            pair_mask: np.ndarray | None = None,
     ):
         self.epsilon = float(epsilon)
         self.equilibrium_scale = float(equilibrium_scale)
         self.cutoff = float(cutoff)
         self.vdw_radii = np.asarray(vdw_radii, dtype=float)
+        self.pair_mask = (
+            None if pair_mask is None else np.asarray(pair_mask, dtype=bool)
+        )
         self._excluded = None
 
     def _exclusion_mask(self, G: ChemGraph):
@@ -235,11 +332,7 @@ class LennardJones(StdTerm):
         if G.bond_mask is None:
             return excluded
         excluded |= G.bond_mask
-        neighbours = [set() for _ in range(G.n_atoms)]
-        for source, target in G.indices[:, G.bond_mask].T:
-            source, target = int(source), int(target)
-            neighbours[source].add(target)
-            neighbours[target].add(source)
+        neighbours = _neighbours(G)
         lookup = {
             (int(source), int(target)): index
             for index, (source, target) in enumerate(G.indices.T)
@@ -248,19 +341,27 @@ class LennardJones(StdTerm):
             ordered = sorted(adjacent)
             for first in range(len(ordered)):
                 for second in range(first + 1, len(ordered)):
-                    pair = (ordered[first], ordered[second])
-                    index = lookup.get(pair)
-                    if index is not None:
-                        excluded[index] = True
+                    for pair in (
+                        (ordered[first], ordered[second]),
+                        (ordered[second], ordered[first]),
+                    ):
+                        index = lookup.get(pair)
+                        if index is not None:
+                            excluded[index] = True
         return excluded
 
     def apply(self, G: ChemGraph):
-        if self._excluded is None:
-            self._excluded = self._exclusion_mask(G)
-        mask = ~G.bond_mask if G.bond_mask is not None else np.ones(
-            G.indices.shape[1], dtype=bool
-        )
-        mask &= ~self._excluded
+        if self.pair_mask is not None:
+            if len(self.pair_mask) != G.indices.shape[1]:
+                raise ValueError("pair_mask length does not match graph pairs")
+            mask = self.pair_mask.copy()
+        else:
+            if self._excluded is None:
+                self._excluded = self._exclusion_mask(G)
+            mask = ~G.bond_mask if G.bond_mask is not None else np.ones(
+                G.indices.shape[1], dtype=bool
+            )
+            mask &= ~self._excluded
         mask &= G.dist_ij <= self.cutoff
         if not np.any(mask):
             return 0.0, np.zeros((G.n_atoms, 3), dtype=float)
@@ -280,3 +381,28 @@ class LennardJones(StdTerm):
         forces = coo_row_sum(indices, edge_force, G.n_atoms)
         forces += coo_row_sum(indices[::-1], -edge_force, G.n_atoms)
         return energy, forces
+
+
+class Hydrogen14LennardJones(LennardJones):
+    """Independent Lennard-Jones correction for 1-4 hydrogen pairs.
+
+    The ordinary :class:`LennardJones` term receives a mask that excludes these
+    pairs; this term owns them with a full van der Waals contact minimum. It is
+    intentionally a separate term so future non-bonded corrections can be
+    appended without changing the ordinary pair partitioning.
+    """
+
+    def __init__(
+            self,
+            epsilon: float,
+            cutoff: float,
+            vdw_radii: np.ndarray,
+            pair_mask: np.ndarray,
+    ):
+        super().__init__(
+            epsilon,
+            equilibrium_scale=1.0,
+            cutoff=cutoff,
+            vdw_radii=vdw_radii,
+            pair_mask=pair_mask,
+        )
