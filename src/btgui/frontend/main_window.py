@@ -2091,12 +2091,15 @@ class MainWindow(QMainWindow):
 
     def _activate_viewer(self, viewer):
         """Make one displayed viewer the target of toolbar and edit actions."""
+        old_key = self.active_key
         self.viewer = viewer
         record = next(
             (item for item in self.window_manager.records if item["viewer"] is viewer),
             None,
         )
         if record is not None:
+            if record["file_key"] != old_key and self.timer.isActive():
+                self._pause_playback()
             state = self.files.get(record["file_key"])
             if state is not None and not state.closed:
                 self.active_key = record["file_key"]
@@ -2131,6 +2134,8 @@ class MainWindow(QMainWindow):
 
     def _activate_empty_state(self):
         """Replace the active state with an empty untitled state."""
+        if self.timer.isActive():
+            self._pause_playback()
         old = self.files.get(None)
         empty = FileState(None, self.settings["history_limit"])
         self.files[None] = empty
@@ -5756,6 +5761,8 @@ class MainWindow(QMainWindow):
     def _open_file(self, path):
         """Open one file in a new window, or focus its existing window."""
         key = Path(path).expanduser().resolve()
+        if key != self.active_key and self.timer.isActive():
+            self._pause_playback()
         records = self.window_manager.records_for_file(key)
         if records:
             active = self.window_manager.active_record()
