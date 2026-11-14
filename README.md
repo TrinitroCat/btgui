@@ -94,15 +94,22 @@ Double-clicking an unopened file in the Files tree creates a new window on its
 first frame and leaves older windows open.
 
 The left dock stacks the file manager above the Frames list. The tree follows
-the focused file's directory, supports normal selection and expansion, and its
-context menu provides Open, New Folder, Rename, Delete, Copy Path, and Refresh.
-By default it shows only the file-name tree with folders sorted before files.
-Settings > File Manager chooses optional Size/Type/Modified columns, folder
-ordering, and the sort column/order. Renaming or deleting a file that is
-currently open is blocked.
+the focused file's directory; switching files resets manual browsing, while
+frame changes keep it. A top toolbar provides parent, back, forward and recycle
+bin actions. The tree starts with a POSIX-style `..` row; `..` has no context
+menu and returns to the parent directory. Right-click `Open` on a directory
+makes it the root without selecting a file, while ordinary directory
+double-click still expands. `New Folder` creates a sibling of the selected
+directory/file; on empty space it creates inside the current root. `Delete`
+moves files into the session recycle bin under the system temporary directory
+(`btgui/recycle_bin`), and overwriting saves/exports first copy the previous
+file there. By default the tree shows only the file-name column with folders
+sorted before files. Settings > File Manager chooses optional
+Size/Type/Modified columns, folder ordering, and the sort column/order.
+Renaming or deleting a file that is currently open is blocked.
 
-The main window is available in English and 简体中文. Settings > Language
-switches immediately without restarting; the choice is stored in
+The main window defaults to 简体中文 and can switch to English. Settings >
+Language switches immediately without restarting; the choice is stored in
 `settings.json`. Menu bar items, toolbars, dock titles, frame/playback/zoom
 controls, file headers and visible button labels are localized. Nested dialogs
 remain in English in this first pass. Strings live in
@@ -217,6 +224,12 @@ and incident edges. Files may also be dropped onto the viewer. Supercell changes
 are reversible, retain their current multipliers, and `Resize` rebases the
 current frame when a new base is explicitly desired.
 
+Files may be opened in a modeless plain-text editor from the file-manager
+`Edit` action. If ordinary structure parsing fails, the same editor is used as a
+fallback; `OSError` and permission failures still report a normal open error.
+Files larger than 50 MiB require confirmation before loading. The editor
+provides Save and Save As with standard shortcuts.
+
 Internally each bond graph is an unweighted `int64` COO array of shape `(2, E)`:
 zero-based endpoints, `src < dst`, unique edges, lexicographically sorted by
 `(src, dst)`. `None` means uncomputed; an empty `(2, 0)` array means explicitly
@@ -243,6 +256,16 @@ refresh the renderer so in-place edits become visible immediately. When BUCToolk
 available at runtime, `to_bt()` returns a copied `BatchStructures` object;
 `to_bt("1, 3-4")` uses the one-based inclusive frame syntax and
 `to_bt([0, 2])` uses zero-based Python indices.
+
+`env list` shows the build-in interpreter first and external Python
+executables discovered from the active environment. `env change N` or
+`env change PATH` selects an external interpreter for the current session;
+this does not affect the built-in GUI commands. Settings > Preferences stores
+an optional `external_python_path` used at startup. `python PATH [args...]`
+runs a Python file with the selected interpreter. The build-in branch uses the
+persistent console namespace; external interpreters run in a background
+`subprocess`. Runs longer than 0.2 seconds open an application-modal status
+window with an explicit Stop action; quick runs do not flash a dialog.
 
 ### Supercell transformations
 

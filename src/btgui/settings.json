@@ -23,6 +23,7 @@
   "clean_workers": 1,
   "clean_bounds_span": 2.0,
   "language": "zh_CN",
+  "external_python_path": null,
   "updater_path": [],
   "updater_function": []
 }

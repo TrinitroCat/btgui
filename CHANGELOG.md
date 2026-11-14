@@ -2,10 +2,21 @@
 
 ## Unreleased
 
-- Added an English/简体中文 main-window localization with JSON locale files,
-  Settings > Language switching, and translated menus, toolbars, dock titles,
-  frame/playback controls, file headers, and visible button labels. Nested
-  dialogs remain in English for this first pass.
+- File manager navigation now uses a POSIX `..` row plus parent/back/forward
+  controls, directory Open, sibling-level New Folder behavior, and a session
+  recycle bin under the system temporary directory. Deletes move files there;
+  Save, Save As and Export copy overwritten files there first. Exit asks before
+  clearing a non-empty recycle bin.
+- Added a modeless QPlainTextEdit editor for file-manager Edit and as the
+  fallback for failed structure parsing. Files over 50 MiB require confirmation,
+  and the editor provides Save/Save As with standard shortcuts.
+- Added CLI `env list`, session-only `env change`, the persistent Settings
+  external Python path, and `python PATH [args...]`. External scripts run in a
+  background subprocess; runs longer than 0.2 seconds show a modal window with
+  an explicit Stop action, while build-in execution keeps the persistent CLI
+  namespace.
+- The main window defaults to 简体中文; Settings > Language switches between
+  English and Simplified Chinese.
 - Added an independent 1-4 H-H non-bonded term to clean, using the full van der
   Waals H-H contact distance so alkane conformers favor staggered over
   eclipsed/gauche contacts, while ordinary non-bonded pairs keep the existing

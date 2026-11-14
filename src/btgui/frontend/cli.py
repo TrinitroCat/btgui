@@ -6,7 +6,12 @@ import code
 from contextlib import redirect_stderr, redirect_stdout
 import importlib
 import io
+import os
 import shlex
+import shutil
+import subprocess
+import sys
+from pathlib import Path
 from typing import Callable
 
 import numpy as np
@@ -106,6 +111,8 @@ class CLI:
         on_executed: Callable | None = None,
         buctoolkit_paths=None,
         on_update: Callable | None = None,
+        on_python_file: Callable | None = None,
+        external_python: str | None = None,
     ) -> None:
         self._log = log
         self._on_open = on_open
@@ -119,6 +126,9 @@ class CLI:
         self._on_view_reset = on_view_reset
         self._on_data_changed = on_data_changed
         self._on_update = on_update
+        self._on_python_file = on_python_file
+        self._external_python = self._normalize_interpreter(external_python)
+        self._interpreters = []
         self._on_executed = on_executed
         self._targets = {"coo": [], "cell": [], "elements": []}
         self._backup = {name: [] for name in self._IN_VAR_SET}
@@ -393,6 +403,132 @@ class CLI:
         self._refresh_backup_buffers()
         return False
 
+    @staticmethod
+    def _normalize_interpreter(value):
+        """Resolve an interpreter path or return ``None`` for build-in."""
+        if value is None:
+            return None
+        text = str(value).strip()
+        if not text:
+            return None
+        path = Path(text).expanduser()
+        if not path.is_absolute():
+            path = Path.cwd() / path
+        path = path.resolve()
+        return str(path) if path.is_file() else None
+
+    def set_external_python(self, value):
+        """Set the session external interpreter from persisted settings."""
+        self._external_python = self._normalize_interpreter(value)
+
+    def _discover_interpreters(self):
+        """Discover external Python executables visible in the environment."""
+        candidates = set()
+        for variable in ("VIRTUAL_ENV", "CONDA_PREFIX"):
+            prefix = os.environ.get(variable, "").strip()
+            if not prefix:
+                continue
+            base = Path(prefix)
+            for relative in ("bin/python", "bin/python3", "python.exe", "Scripts/python.exe"):
+                candidate = base / relative
+                if candidate.is_file():
+                    candidates.add(str(candidate.resolve()))
+        for name in ("python3", "python"):
+            candidate = shutil.which(name)
+            if candidate:
+                candidates.add(str(Path(candidate).resolve()))
+        launcher = shutil.which("py")
+        if launcher:
+            try:
+                result = subprocess.run(
+                    [launcher, "-0p"],
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+                for line in result.stdout.splitlines():
+                    stripped = line.strip().lstrip("*").strip()
+                    if stripped and Path(stripped).is_file():
+                        candidates.add(str(Path(stripped).resolve()))
+            except OSError:
+                pass
+        if self._external_python:
+            candidates.add(self._external_python)
+        builtin = str(Path(sys.executable).resolve())
+        candidates.discard(builtin)
+        return sorted(candidates, key=lambda item: item.casefold())
+
+    def _show_environments(self):
+        """Append the numbered interpreter list to the console."""
+        self._interpreters = self._discover_interpreters()
+        lines = ["Python interpreters:", "  1. build-in (current process)"]
+        for index, path in enumerate(self._interpreters, start=2):
+            marker = " *" if self._external_python == path else ""
+            lines.append(f"  {index}. {path}{marker}")
+        if self._external_python is None:
+            lines[1] += " *"
+        self._log("\n".join(lines))
+
+    def _change_environment(self, value):
+        """Change the session-only Python interpreter selection."""
+        value = value.strip()
+        if value.lower() in {"build-in", "built-in", "0", "1"}:
+            self._external_python = None
+            self._log("Python interpreter changed to build-in.")
+            return
+        if value.isdigit():
+            if not self._interpreters:
+                self._interpreters = self._discover_interpreters()
+            index = int(value) - 2
+            if not 0 <= index < len(self._interpreters):
+                raise ValueError("env change: interpreter number is out of range")
+            path = self._interpreters[index]
+        else:
+            path = self._normalize_interpreter(value)
+            if path is None:
+                raise ValueError(f"env change: interpreter not found: {value}")
+        self._external_python = path
+        self._log(f"Python interpreter changed to {path}.")
+
+    def _run_python_file(self, path, args):
+        """Run a Python file with either the build-in or external interpreter."""
+        path = Path(path).expanduser()
+        if not path.is_absolute():
+            path = Path.cwd() / path
+        path = path.resolve()
+        if not path.is_file():
+            raise ValueError(f"python: file not found: {path}")
+        interpreter = self._external_python
+        if interpreter is not None:
+            if self._on_python_file is None:
+                raise ValueError("external Python execution is not configured")
+            self._on_python_file(interpreter, path, list(args))
+            return
+        source = path.read_text(encoding="utf-8", errors="replace")
+        old_argv = sys.argv
+        old_name = self._namespace.get("__name__")
+        old_file = self._namespace.get("__file__")
+        sys.argv = [str(path), *args]
+        self._namespace["__name__"] = "__main__"
+        self._namespace["__file__"] = str(path)
+        stream = io.StringIO()
+        try:
+            with redirect_stdout(stream), redirect_stderr(stream):
+                exec(compile(source, str(path), "exec"), self._namespace)
+        finally:
+            sys.argv = old_argv
+            if old_name is None:
+                self._namespace.pop("__name__", None)
+            else:
+                self._namespace["__name__"] = old_name
+            if old_file is None:
+                self._namespace.pop("__file__", None)
+            else:
+                self._namespace["__file__"] = old_file
+        text = stream.getvalue()
+        if text:
+            self._log(text.rstrip())
+
     def _show_help(self) -> None:
         """Display detailed built-in and Python-console documentation.
 
@@ -414,6 +550,9 @@ class CLI:
             "  view reset                 reset camera and zoom\n"
             "  update [SCOPE]             run updater on current/all/selected frames\n"
             "  to_bt [1,3-5]             store selected frames in Python variable bt\n"
+            "  env list                  list available Python interpreters\n"
+            "  env change [N|PATH]       choose the external interpreter for python PATH\n"
+            "  python PATH [ARGS...]     run a Python file with build-in/external Python\n"
             "\nPython console:\n"
             "  coo       List[np.ndarray], Cartesian coordinates shaped (N, 3)\n"
             "  cell      List[np.ndarray], row-vector cells shaped (3, 3)\n"
@@ -540,6 +679,19 @@ class CLI:
             if batch is not None:
                 self._namespace["bt"] = batch
                 self._log("Created BUCToolkit BatchStructures as Python variable bt.")
+            return False
+        if name == "env":
+            if len(args) == 1 and args[0].lower() == "list":
+                self._show_environments()
+                return False
+            if len(args) == 2 and args[0].lower() == "change":
+                self._change_environment(args[1])
+                return False
+            raise ValueError("usage: env list | env change [NUMBER|PATH]")
+        if name == "python":
+            if len(args) < 1:
+                raise ValueError("usage: python PATH [ARGS...]")
+            self._run_python_file(args[0], args[1:])
             return False
         return self._push_python(source)
 

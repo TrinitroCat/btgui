@@ -17,7 +17,7 @@ import numpy as np
 from ..backend.lattice_transform import transform_structure
 from PySide6.QtCore import (
     QSignalBlocker, QTimer, Qt, Signal, QDir, QFile, QModelIndex,
-    QSortFilterProxyModel,
+    QAbstractProxyModel, QPersistentModelIndex, QSortFilterProxyModel,
 )
 from PySide6.QtGui import QAction, QActionGroup, QColor, QDoubleValidator, QIntValidator
 from PySide6.QtWidgets import (
@@ -92,7 +92,10 @@ from btgui.frontend.changes import (
 )
 from btgui.integrations.structure_io import normalize_structure_files
 from btgui.integrations.updater import load_updater_module
+from btgui.frontend.file_recycler import FileRecycler
 from btgui.frontend.i18n import Catalog, available_languages, language_codes
+from btgui.frontend.python_runner import ExternalPythonRunner, ExternalRunDialog
+from btgui.frontend.text_editor import TextEditorDialog
 from btgui.frontend.viewer import StructureViewer
 
 
@@ -120,7 +123,8 @@ DEFAULT_SETTINGS = {
     "clean_global_maxiter": 200,
     "clean_workers": 1,
     "clean_bounds_span": 2.0,
-    "language": "en",
+    "language": "zh_CN",
+    "external_python_path": None,
     "updater_path": [],
     "updater_function": [],
 }
@@ -1215,6 +1219,17 @@ class SettingsDialog(QDialog):
         self.keyboard_translation_step_spin.setValue(
             settings["keyboard_translation_step"]
         )
+        self.external_python_edit = QLineEdit(
+            settings.get("external_python_path") or "", self
+        )
+        self.external_python_edit.setPlaceholderText("None (build-in)")
+        self.external_python_button = QPushButton("Browse...", self)
+        self.external_python_button.clicked.connect(self._choose_external_python)
+        external_python_row = QWidget(self)
+        external_python_layout = QHBoxLayout(external_python_row)
+        external_python_layout.setContentsMargins(0, 0, 0, 0)
+        external_python_layout.addWidget(self.external_python_edit, 1)
+        external_python_layout.addWidget(self.external_python_button)
 
         form = QFormLayout()
         form.addRow("Undo history steps", self.history_limit_spin)
@@ -1225,6 +1240,7 @@ class SettingsDialog(QDialog):
         form.addRow("Boundary width", self.edge_width_spin)
         form.addRow("Boundary color", self.edge_color_button)
         form.addRow("Keyboard translation step", self.keyboard_translation_step_spin)
+        form.addRow("External Python interpreter", external_python_row)
         buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel,
             self,
@@ -1250,6 +1266,17 @@ class SettingsDialog(QDialog):
             self.edge_color_button.setProperty("color", color.name())
             self.edge_color_button.setStyleSheet(f"background-color: {color.name()};")
 
+    def _choose_external_python(self):
+        """Choose a persistent external Python interpreter path."""
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "External Python interpreter",
+            self.external_python_edit.text(),
+            "Python (*python*.exe python*);;All files (*)",
+        )
+        if path:
+            self.external_python_edit.setText(path)
+
     def values(self):
         """Return validated settings represented by the controls.
 
@@ -1269,6 +1296,7 @@ class SettingsDialog(QDialog):
             "buctoolkit_paths": self.buctoolkit_paths,
             "keyboard_translation_step": self.keyboard_translation_step_spin.value(),
             "file_cache_limit_mb": self.cache_limit_spin.value(),
+            "external_python_path": self.external_python_edit.text().strip() or None,
         }
 
 
@@ -1329,6 +1357,171 @@ class FileManagerDialog(QDialog):
             "file_manager_sort_column": int(self.sort_combo.currentData()),
             "file_manager_sort_order": self.order_combo.currentData(),
         }
+
+
+class ParentRowProxyModel(QAbstractProxyModel):
+    """Expose a synthetic POSIX-style ``..`` row above the current root."""
+
+    _PARENT_ID = 1
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._root = QPersistentModelIndex()
+        self._has_parent = False
+        self._header_labels = {}
+        self._next_id = 2
+        self._id_to_source = {}
+        self._source_to_id = {}
+
+    def _reset_mapping(self):
+        self._next_id = 2
+        self._id_to_source = {}
+        self._source_to_id = {}
+
+    def set_root_source_index(self, source_index):
+        """Set the sorted source index represented by the view root."""
+        self.beginResetModel()
+        self._root = QPersistentModelIndex(source_index)
+        root = QModelIndex(self._root)
+        self._has_parent = root.isValid() and root.parent().isValid()
+        self._reset_mapping()
+        self.endResetModel()
+
+    def is_parent_row(self, index):
+        """Return whether a view index is the synthetic parent row."""
+        return index.isValid() and index.internalId() == self._PARENT_ID
+
+    def rowCount(self, parent=QModelIndex()):
+        if self.sourceModel() is None:
+            return 0
+        root = QModelIndex(self._root)
+        if not root.isValid():
+            return 0
+        if not parent.isValid():
+            return self.sourceModel().rowCount(root) + int(self._has_parent)
+        source_parent = self.mapToSource(parent)
+        if not source_parent.isValid():
+            return 0
+        return self.sourceModel().rowCount(source_parent)
+
+    def columnCount(self, parent=QModelIndex()):
+        if self.sourceModel() is None:
+            return 0
+        return self.sourceModel().columnCount()
+
+    def index(self, row, column, parent=QModelIndex()):
+        if not parent.isValid():
+            if self._has_parent and row == 0:
+                return self.createIndex(row, column, self._PARENT_ID)
+            source_row = row - int(self._has_parent)
+            source_index = self.sourceModel().index(
+                source_row, column, QModelIndex(self._root)
+            )
+            return self.mapFromSource(source_index)
+        source_parent = self.mapToSource(parent)
+        if not source_parent.isValid():
+            return QModelIndex()
+        source_index = self.sourceModel().index(row, column, source_parent)
+        return self.mapFromSource(source_index)
+
+    def parent(self, index):
+        if not index.isValid() or self.is_parent_row(index):
+            return QModelIndex()
+        source_index = self.mapToSource(index)
+        if not source_index.isValid():
+            return QModelIndex()
+        source_parent = source_index.parent()
+        root = QModelIndex(self._root)
+        if not source_parent.isValid() or source_parent == root:
+            return QModelIndex()
+        return self.mapFromSource(source_parent)
+
+    def mapToSource(self, proxy_index):
+        if not proxy_index.isValid() or self.is_parent_row(proxy_index):
+            return QModelIndex()
+        persistent = self._id_to_source.get(int(proxy_index.internalId()))
+        if persistent is None or not persistent.isValid():
+            return QModelIndex()
+        return QModelIndex(persistent)
+
+    def mapFromSource(self, source_index):
+        root = QModelIndex(self._root)
+        if not source_index.isValid() or not root.isValid():
+            return QModelIndex()
+        if source_index == root:
+            return QModelIndex()
+        parent = source_index.parent()
+        key = (
+            source_index.row(),
+            source_index.column(),
+            parent.row(),
+            parent.column(),
+            int(parent.internalId()) if parent.isValid() else -1,
+        )
+        existing = self._source_to_id.get(key)
+        if existing is not None:
+            row = source_index.row()
+            if parent == root and self._has_parent:
+                row += 1
+            return self.createIndex(row, source_index.column(), existing)
+        proxy_id = self._next_id
+        self._next_id += 1
+        self._source_to_id[key] = proxy_id
+        self._id_to_source[proxy_id] = QPersistentModelIndex(source_index)
+        row = source_index.row()
+        if parent == root and self._has_parent:
+            row += 1
+        return self.createIndex(row, source_index.column(), proxy_id)
+
+    def data(self, index, role=Qt.ItemDataRole.DisplayRole):
+        if self.is_parent_row(index):
+            if role == Qt.ItemDataRole.DisplayRole and index.column() == 0:
+                return ".."
+            if role == Qt.ItemDataRole.ToolTipRole and index.column() == 0:
+                return ".."
+            return None
+        source_index = self.mapToSource(index)
+        if not source_index.isValid():
+            return None
+        return self.sourceModel().data(source_index, role)
+
+    def setData(self, index, value, role=Qt.ItemDataRole.EditRole):
+        """Forward inline edits to the source file model."""
+        if self.is_parent_row(index):
+            return False
+        source_index = self.mapToSource(index)
+        if not source_index.isValid():
+            return False
+        return self.sourceModel().setData(source_index, value, role)
+
+    def flags(self, index):
+        if self.is_parent_row(index):
+            return Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable
+        source_index = self.mapToSource(index)
+        if not source_index.isValid():
+            return Qt.ItemFlag.NoItemFlags
+        return self.sourceModel().flags(source_index)
+
+    def headerData(self, section, orientation, role=Qt.ItemDataRole.DisplayRole):
+        if (
+            orientation == Qt.Orientation.Horizontal
+            and role == Qt.ItemDataRole.DisplayRole
+            and section in self._header_labels
+        ):
+            return self._header_labels[section]
+        return self.sourceModel().headerData(section, orientation, role)
+
+    def set_header_labels(self, labels):
+        """Set translated labels for the horizontal headers."""
+        self._header_labels = dict(labels)
+        self.headerDataChanged.emit(Qt.Orientation.Horizontal, 0, 3)
+
+    def sort(self, column, order=Qt.SortOrder.AscendingOrder):
+        """Sort the underlying file model and refresh mapped rows."""
+        self.layoutAboutToBeChanged.emit()
+        self.sourceModel().sort(column, order)
+        self._reset_mapping()
+        self.layoutChanged.emit()
 
 
 class CleanBackendDialog(QDialog):
@@ -1775,6 +1968,11 @@ class MainWindow(QMainWindow):
         self.settings_warning = None
         self.settings = self._load_settings()
         self.catalog = Catalog(self.settings["language"])
+        self.recycler = FileRecycler()
+        self._text_editors = {}
+        self._python_runner = ExternalPythonRunner(self)
+        self._python_runner.output.connect(self._log)
+        self._python_runner.finished.connect(self._on_external_python_finished)
         self.language_actions = {}
         self.updater_warning = None
         self._load_configured_updaters()
@@ -2050,6 +2248,8 @@ class MainWindow(QMainWindow):
             on_data_changed=self._on_cli_data_changed,
             on_update=self._run_default_updater,
             on_executed=self._refresh_after_cli_execution,
+            on_python_file=self._run_external_python,
+            external_python=self.settings.get("external_python_path"),
             buctoolkit_paths=self.settings["buctoolkit_paths"],
         )
         self._cli_file_key = object()
@@ -2097,12 +2297,15 @@ class MainWindow(QMainWindow):
             QDir.Filter.AllDirs | QDir.Filter.Files | QDir.Filter.NoDotAndDotDot
         )
         self.file_model.setReadOnly(False)
-        self.file_proxy = FileSortProxyModel(self)
-        self.file_proxy.setSourceModel(self.file_model)
+        self.file_sort_proxy = FileSortProxyModel(self)
+        self.file_sort_proxy.setSourceModel(self.file_model)
+        self.file_proxy = ParentRowProxyModel(self)
+        self.file_proxy.setSourceModel(self.file_sort_proxy)
         self.file_tree = QTreeView(self.file_dock)
         self.file_tree.setModel(self.file_proxy)
         self.file_tree.setHeaderHidden(True)
         self.file_tree.setSortingEnabled(True)
+        self.file_tree.setRootIndex(QModelIndex())
         self.file_tree.setEditTriggers(
             QAbstractItemView.EditTrigger.EditKeyPressed
         )
@@ -2110,6 +2313,43 @@ class MainWindow(QMainWindow):
         self.file_tree.doubleClicked.connect(self._file_tree_double_clicked)
         self.file_tree.customContextMenuRequested.connect(self._show_file_context_menu)
         self.file_model.fileRenamed.connect(self._on_file_renamed)
+        file_nav = QToolBar(self.file_dock)
+        file_nav.setMovable(False)
+        file_nav.setFloatable(False)
+        self.file_nav = file_nav
+        self.file_up_button = QToolButton(self.file_dock)
+        self.file_up_button.setIcon(
+            self.style().standardIcon(QStyle.StandardPixmap.SP_ArrowUp)
+        )
+        self.file_up_button.setToolTip("Parent directory")
+        self.file_up_button.clicked.connect(self._open_file_manager_parent)
+        self.file_back_button = QToolButton(self.file_dock)
+        self.file_back_button.setIcon(
+            self.style().standardIcon(QStyle.StandardPixmap.SP_ArrowBack)
+        )
+        self.file_back_button.setToolTip("Back")
+        self.file_back_button.clicked.connect(self._file_manager_go_back)
+        self.file_forward_button = QToolButton(self.file_dock)
+        self.file_forward_button.setIcon(
+            self.style().standardIcon(QStyle.StandardPixmap.SP_ArrowForward)
+        )
+        self.file_forward_button.setToolTip("Forward")
+        self.file_forward_button.clicked.connect(self._file_manager_go_forward)
+        self.file_recycle_button = QToolButton(self.file_dock)
+        trash_icon = getattr(QStyle.StandardPixmap, "SP_TrashIcon", None)
+        if trash_icon is not None:
+            self.file_recycle_button.setIcon(self.style().standardIcon(trash_icon))
+        else:
+            self.file_recycle_button.setText("Recycle Bin")
+        self.file_recycle_button.setToolTip("Recycle Bin")
+        self.file_recycle_button.clicked.connect(self._open_file_manager_recycle_bin)
+        for button in (
+            self.file_up_button,
+            self.file_back_button,
+            self.file_forward_button,
+            self.file_recycle_button,
+        ):
+            file_nav.addWidget(button)
         self.file_placeholder = QLabel(
             "Open a structure file to browse its directory.", self.file_dock
         )
@@ -2117,11 +2357,17 @@ class MainWindow(QMainWindow):
         file_container = QWidget(self.file_dock)
         file_layout = QVBoxLayout(file_container)
         file_layout.setContentsMargins(0, 0, 0, 0)
+        file_layout.addWidget(file_nav)
         file_layout.addWidget(self.file_placeholder)
         file_layout.addWidget(self.file_tree, 1)
         self.file_dock.setWidget(file_container)
         self._file_manager_dir = None
         self._file_manager_path = None
+        self._file_manager_file_key = None
+        self._file_manager_manual = False
+        self._file_manager_back = deque(maxlen=self.settings["history_limit"])
+        self._file_manager_forward = deque(maxlen=self.settings["history_limit"])
+        self._recycle_root = None
         self.addDockWidget(Qt.DockWidgetArea.LeftDockWidgetArea, self.file_dock)
         self.addDockWidget(Qt.DockWidgetArea.LeftDockWidgetArea, self.frame_dock)
         self.splitDockWidget(self.file_dock, self.frame_dock, Qt.Orientation.Vertical)
@@ -2249,6 +2495,13 @@ class MainWindow(QMainWindow):
             language = str(loaded.get("language", settings["language"]))
             if language not in language_codes():
                 language = "en"
+            external_python_path = loaded.get(
+                "external_python_path", settings["external_python_path"]
+            )
+            if external_python_path is not None and not isinstance(
+                external_python_path, str
+            ):
+                raise TypeError("external_python_path must be a string or null")
             buctoolkit_paths = loaded.get("buctoolkit_paths", settings["buctoolkit_paths"])
             if isinstance(buctoolkit_paths, str):
                 buctoolkit_paths = buctoolkit_paths.split(os.pathsep)
@@ -2287,6 +2540,7 @@ class MainWindow(QMainWindow):
                 clean_workers=clean_workers,
                 clean_bounds_span=clean_bounds_span,
                 language=language,
+                external_python_path=external_python_path,
                 **file_manager_flags,
             )
         except (TypeError, ValueError) as error:
@@ -2591,7 +2845,17 @@ class MainWindow(QMainWindow):
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
         self.settings.update(dialog.values())
+        self.cli.set_external_python(self.settings.get("external_python_path"))
         self.undo_stack = deque(self.undo_stack, maxlen=self.settings["history_limit"])
+        self._file_manager_back = deque(
+            list(self._file_manager_back)[-self.settings["history_limit"] :],
+            maxlen=self.settings["history_limit"],
+        )
+        self._file_manager_forward = deque(
+            list(self._file_manager_forward)[-self.settings["history_limit"] :],
+            maxlen=self.settings["history_limit"],
+        )
+        self._update_file_manager_buttons()
         if self.viewer is not None:
             self.viewer.set_appearance(
                 self.viewer.atom_styles,
@@ -4507,7 +4771,7 @@ class MainWindow(QMainWindow):
         for column, visible in columns.items():
             self.file_tree.setColumnHidden(column, not visible)
         self.file_tree.setHeaderHidden(not any(columns.values()))
-        self.file_proxy.set_folders_first(
+        self.file_sort_proxy.set_folders_first(
             self.settings["file_manager_folders_first"]
         )
         order = (
@@ -4536,42 +4800,203 @@ class MainWindow(QMainWindow):
         self.settings.update(dialog.values())
         self._persist_settings()
 
+    def _file_source_to_view(self, source_index):
+        """Map a QFileSystemModel index through sorting and the parent row."""
+        sorted_index = self.file_sort_proxy.mapFromSource(source_index)
+        return self.file_proxy.mapFromSource(sorted_index)
+
+    def _file_view_to_source(self, view_index):
+        """Map a view index back to the QFileSystemModel source."""
+        sorted_index = self.file_proxy.mapToSource(view_index)
+        return self.file_sort_proxy.mapToSource(sorted_index)
+
+    def _update_file_manager_buttons(self):
+        """Synchronize navigation and recycle-button availability."""
+        directory = self._file_manager_dir
+        parent = directory.parent if directory is not None else None
+        self.file_up_button.setEnabled(
+            directory is not None and parent != directory and parent.is_dir()
+        )
+        self.file_back_button.setEnabled(bool(self._file_manager_back))
+        self.file_forward_button.setEnabled(bool(self._file_manager_forward))
+        self.file_recycle_button.setEnabled(self.recycler.has_items())
+
+    def _set_file_manager_root(self, directory, path=None, force=False):
+        """Set the visible root without touching navigation history."""
+        directory = Path(directory).resolve()
+        if not directory.is_dir():
+            return False
+        if force or directory != self._file_manager_dir:
+            self.file_model.setRootPath(str(directory))
+            root_source = self.file_model.index(str(directory))
+            sorted_root = self.file_sort_proxy.mapFromSource(root_source)
+            self.file_proxy.set_root_source_index(sorted_root)
+            self.file_tree.setRootIndex(QModelIndex())
+            self._file_manager_dir = directory
+        if path is not None:
+            self._select_file_manager_path(path)
+        self.file_placeholder.hide()
+        self.file_tree.show()
+        self.file_nav.show()
+        self._update_file_manager_buttons()
+        return True
+
+    def _select_file_manager_path(self, path):
+        """Select a file or directory inside the current file-tree root."""
+        source_index = self.file_model.index(str(path))
+        index = self._file_source_to_view(source_index)
+        if index.isValid():
+            self.file_tree.setCurrentIndex(index)
+            self.file_tree.scrollTo(index)
+            self._file_manager_path = Path(path)
+            return True
+        return False
+
+    def _navigate_file_manager(self, directory, *, record=True, manual=True):
+        """Change the visible root and optionally record it in history."""
+        directory = Path(directory).expanduser().resolve()
+        if not directory.is_dir():
+            self._log(f"File manager: not a directory: {directory}")
+            return False
+        previous = self._file_manager_dir
+        if record and previous is not None and previous != directory:
+            self._file_manager_back.append(previous)
+            self._file_manager_forward.clear()
+        self._file_manager_manual = manual
+        self._file_manager_path = None
+        self.file_tree.clearSelection()
+        return self._set_file_manager_root(directory, force=True)
+
+    def _open_file_manager_directory(self, directory):
+        """Open a directory as the file-tree root, independent of the file."""
+        return self._navigate_file_manager(directory, record=True, manual=True)
+
+    def _open_file_manager_parent(self):
+        """Move the file tree one directory up."""
+        directory = self._file_manager_dir
+        if directory is None:
+            return
+        parent = directory.parent
+        if parent != directory and parent.is_dir():
+            self._navigate_file_manager(parent, record=True, manual=True)
+
+    def _file_manager_go_back(self):
+        """Navigate to the previous directory in the file-manager history."""
+        if not self._file_manager_back:
+            return
+        current = self._file_manager_dir
+        target = self._file_manager_back.pop()
+        if current is not None:
+            self._file_manager_forward.append(current)
+        self._navigate_file_manager(target, record=False, manual=True)
+        self._update_file_manager_buttons()
+
+    def _file_manager_go_forward(self):
+        """Navigate to the next directory in the file-manager history."""
+        if not self._file_manager_forward:
+            return
+        current = self._file_manager_dir
+        target = self._file_manager_forward.pop()
+        if current is not None:
+            self._file_manager_back.append(current)
+        self._navigate_file_manager(target, record=False, manual=True)
+        self._update_file_manager_buttons()
+
+    def _open_file_manager_recycle_bin(self):
+        """Show the session recycle-bin directory in the file tree."""
+        if not self.recycler.has_items():
+            return
+        self._navigate_file_manager(
+            self.recycler.ensure(), record=True, manual=True
+        )
+
     def _sync_file_manager(self, force=False):
-        """Point the file tree at the active file's directory."""
+        """Follow the active file unless the user opened a directory manually."""
+        if self.active_key != self._file_manager_file_key:
+            self._file_manager_file_key = self.active_key
+            self._file_manager_manual = False
+            self._file_manager_back.clear()
+            self._file_manager_forward.clear()
+        if self._file_manager_manual:
+            directory = self._file_manager_dir
+            if directory is not None and directory.is_dir():
+                self._set_file_manager_root(directory, force=force)
+                return
+            self._file_manager_manual = False
+
         path = self.active_key
         directory = path.parent if path is not None else None
         if directory is not None and directory.is_dir():
-            self.file_placeholder.hide()
-            self.file_tree.show()
-            if force or directory != self._file_manager_dir:
-                self.file_model.setRootPath(str(directory))
-                root_index = self.file_model.index(str(directory))
-                self.file_tree.setRootIndex(self.file_proxy.mapFromSource(root_index))
-                self._file_manager_dir = directory
-            if path is not None:
-                source_index = self.file_model.index(str(path))
-                index = self.file_proxy.mapFromSource(source_index)
-                if index.isValid():
-                    self.file_tree.setCurrentIndex(index)
-                    self.file_tree.scrollTo(index)
+            self._set_file_manager_root(directory, path=path, force=force)
             self._file_manager_path = path
             return
         self.file_tree.hide()
+        self.file_nav.hide()
         self.file_placeholder.show()
         self._file_manager_dir = None
         self._file_manager_path = None
+        self._file_manager_back.clear()
+        self._file_manager_forward.clear()
+        self._update_file_manager_buttons()
+
+    def _open_text_editor(self, path):
+        """Open a file in the modeless plain-text editor."""
+        path = Path(path).expanduser().resolve()
+        existing = self._text_editors.get(path)
+        if existing is not None and existing.isVisible():
+            existing.raise_()
+            existing.activateWindow()
+            return existing
+        try:
+            size = path.stat().st_size
+        except OSError as error:
+            self._log(f"Text editor: {error}")
+            return None
+        if size > 50 * 1024 * 1024:
+            answer = QMessageBox.warning(
+                self,
+                "Large file",
+                f"{path.name} is larger than 50 MiB. "
+                "Loading it into the text editor may be slow. Continue?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                return None
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except OSError as error:
+            QMessageBox.warning(self, "Text Editor", str(error))
+            return None
+        dialog = TextEditorDialog(
+            path, text, self, before_write=self._backup_overwrite_target
+        )
+        self._text_editors[path] = dialog
+        dialog.destroyed.connect(
+            lambda _obj=None, path=path: self._text_editors.pop(path, None)
+        )
+        dialog.show()
+        dialog.raise_()
+        dialog.activateWindow()
+        return dialog
 
     def _file_tree_double_clicked(self, index):
-        """Open a double-clicked structure file, leaving directories to Qt."""
+        """Let directories expand, open files, and navigate through ``..``."""
         if not index.isValid():
             return
-        source_index = self.file_proxy.mapToSource(index)
+        if self.file_proxy.is_parent_row(index):
+            self._open_file_manager_parent()
+            return
+        source_index = self._file_view_to_source(index)
+        path = Path(self.file_model.filePath(source_index))
         if self.file_model.isDir(source_index):
             return
-        path = Path(self.file_model.filePath(source_index))
         try:
             self._open_file(path)
-        except (ImportError, OSError, RuntimeError, TypeError, ValueError) as error:
+        except (ValueError, TypeError, RuntimeError) as error:
+            self._log(f"Parse error: {error}")
+            self._open_text_editor(path)
+        except (ImportError, OSError) as error:
             self._log(f"Open error: {error}")
             QMessageBox.warning(self, "Open structure", self._open_error_message(error))
 
@@ -4614,29 +5039,47 @@ class MainWindow(QMainWindow):
             state.close()
 
     def _show_file_context_menu(self, position):
-        """Offer the standard file operations for the selected tree item."""
+        """Offer file operations for the selected tree item."""
         index = self.file_tree.indexAt(position)
-        if not index.isValid():
-            index = self.file_tree.rootIndex()
-        source_index = self.file_proxy.mapToSource(index)
-        path = Path(self.file_model.filePath(source_index))
+        if index.isValid() and self.file_proxy.is_parent_row(index):
+            return
+        selected = index.isValid()
+        if not selected:
+            path = self._file_manager_dir
+        else:
+            source_index = self._file_view_to_source(index)
+            path = Path(self.file_model.filePath(source_index))
+        if path is None:
+            return
         menu = QMenu(self.file_tree)
-        if path.is_file():
+        if selected and path.is_dir():
+            menu.addAction(
+                self._t("action.context.open"),
+                lambda: self._open_file_manager_directory(path),
+            )
+            menu.addSeparator()
+        elif selected and path.is_file():
             menu.addAction(
                 self._t("action.context.open"),
                 lambda: self._file_tree_double_clicked(index),
             )
+            menu.addAction(
+                self._t("action.context.edit"),
+                lambda: self._open_text_editor(path),
+            )
             menu.addSeparator()
+        target = path.parent if selected else path
         menu.addAction(
             self._t("action.context.new_folder"),
-            lambda: self._new_folder(path if path.is_dir() else path.parent),
+            lambda: self._new_folder(target),
         )
-        menu.addAction(
-            self._t("action.context.rename"), lambda: self._rename_file(index)
-        )
-        menu.addAction(
-            self._t("action.context.delete"), lambda: self._delete_file(path)
-        )
+        if selected:
+            menu.addAction(
+                self._t("action.context.rename"), lambda: self._rename_file(index)
+            )
+            menu.addAction(
+                self._t("action.context.delete"), lambda: self._delete_file(path)
+            )
         menu.addAction(
             self._t("action.context.copy_path"), lambda: self._copy_path(path)
         )
@@ -4661,7 +5104,7 @@ class MainWindow(QMainWindow):
 
     def _rename_file(self, index):
         """Start the model's inline rename when the path is not in use."""
-        source_index = self.file_proxy.mapToSource(index)
+        source_index = self._file_view_to_source(index)
         path = Path(self.file_model.filePath(source_index))
         if self._path_has_open_state(path):
             QMessageBox.warning(
@@ -4671,7 +5114,7 @@ class MainWindow(QMainWindow):
         self.file_tree.edit(index)
 
     def _delete_file(self, path):
-        """Move an unused file or directory to the system trash."""
+        """Move an unused file or directory into the session recycle bin."""
         path = Path(path)
         if self._path_has_open_state(path):
             QMessageBox.warning(
@@ -4681,33 +5124,21 @@ class MainWindow(QMainWindow):
         answer = QMessageBox.question(
             self,
             "Delete",
-            f"Move {path.name} to the trash?",
+            f"Move {path.name} to the recycle bin?",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
         )
         if answer != QMessageBox.StandardButton.Yes:
             return
-        if QFile.moveToTrash(str(path)):
-            self._drop_cached_paths(path)
-            self._sync_file_manager(force=True)
+        try:
+            self.recycler.move(path)
+        except OSError as error:
+            QMessageBox.warning(
+                self, "Delete", f"Could not move {path.name}: {error}"
+            )
             return
-        fallback = QMessageBox.question(
-            self,
-            "Delete",
-            "The trash is unavailable. Delete permanently?",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-        )
-        if fallback != QMessageBox.StandardButton.Yes:
-            return
-        removed = (
-            QDir(str(path)).removeRecursively()
-            if path.is_dir()
-            else QFile.remove(str(path))
-        )
-        if not removed:
-            QMessageBox.warning(self, "Delete", f"Could not delete {path.name}.")
-        else:
-            self._drop_cached_paths(path)
+        self._drop_cached_paths(path)
         self._sync_file_manager(force=True)
+        self._update_file_manager_buttons()
 
     def _copy_path(self, path):
         """Copy one absolute path to the clipboard."""
@@ -5067,6 +5498,29 @@ class MainWindow(QMainWindow):
         self.redo_stack.clear()
         self._refresh_after_change(frame_index=self.current_index)
         self._sync_history_actions()
+
+    def closeEvent(self, event):
+        """Confirm clearing the recycle bin before closing the main window."""
+        self._python_runner.shutdown()
+        if self.recycler.has_items():
+            path = self.recycler.root
+            answer = QMessageBox.question(
+                self,
+                "Recycle Bin",
+                "There are files in the recycle bin "
+                f"[path: {path}]. If you exit the program, they will be cleared. "
+                "Continue to exit?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                event.ignore()
+                return
+            try:
+                self.recycler.clear()
+            except OSError as error:
+                self._log(f"Recycle bin cleanup warning: {error}")
+        event.accept()
 
     def _close_all_views(self):
         """Close every displayed structure window."""
@@ -5612,6 +6066,20 @@ class MainWindow(QMainWindow):
         self.frame_dock.setWindowTitle(self._t("dock.frames"))
         self.file_dock.setWindowTitle(self._t("dock.files"))
         self.file_placeholder.setText(self._t("placeholder.file_manager"))
+        self.file_up_button.setToolTip(self._t("action.file_manager_parent"))
+        self.file_back_button.setToolTip(self._t("action.file_manager_back"))
+        self.file_forward_button.setToolTip(
+            self._t("action.file_manager_forward")
+        )
+        self.file_recycle_button.setToolTip(
+            self._t("action.file_manager_recycle")
+        )
+        if not self.file_recycle_button.icon().isNull():
+            self.file_recycle_button.setText("")
+        else:
+            self.file_recycle_button.setText(
+                self._t("action.file_manager_recycle")
+            )
         self.file_proxy.set_header_labels(
             {
                 0: self._t("header.name"),
@@ -6400,6 +6868,11 @@ class MainWindow(QMainWindow):
             return
         try:
             indices = parse_frame_selection(selection.text(), len(self.coordinates))
+            output = Path(output_path["value"])
+            if output.is_dir():
+                for existing in output.iterdir():
+                    if existing.is_file():
+                        self._backup_overwrite_target(existing)
             self.save_handler.export_batch(
                 output_path["value"],
                 indices,
@@ -6457,6 +6930,16 @@ class MainWindow(QMainWindow):
             self._focus_record(last_record)
         self.cli.bind_data(self.elements, self.coordinates, self.lattices)
 
+    def _backup_overwrite_target(self, path):
+        """Copy an existing regular file into the recycle bin before writing."""
+        path = Path(path)
+        if not path.is_file():
+            return None
+        try:
+            return self.recycler.backup_copy(path)
+        finally:
+            self._update_file_manager_buttons()
+
     def _save(self, path):
         """Save only the currently displayed frame to a file.
 
@@ -6473,6 +6956,7 @@ class MainWindow(QMainWindow):
         frame_index = self.current_index
         if not 0 <= frame_index < len(self.coordinates):
             raise ValueError("the current frame index is invalid")
+        self._backup_overwrite_target(path)
         self.save_handler(
             path,
             [self.elements[frame_index]],
@@ -6568,6 +7052,36 @@ class MainWindow(QMainWindow):
                 self._pause_playback()
         else:
             self.play_position += 1
+
+    def _on_external_python_finished(self, returncode):
+        """Report an external script result after its worker thread exits."""
+        self._log(f"External Python exited with code {returncode}.")
+
+    def _run_external_python(self, interpreter, path, args):
+        """Run an external Python file and show a stop dialog after 0.2 s."""
+        if self._python_runner.is_running():
+            self._log("An external Python script is already running.")
+            return
+        try:
+            started = self._python_runner.start(
+                interpreter, path, args, cwd=Path.cwd()
+            )
+        except OSError as error:
+            self._log(f"External Python error: {error}")
+            return
+        if not started:
+            return
+        self.setEnabled(False)
+        try:
+            finished = self._python_runner.wait(0.2)
+        finally:
+            self.setEnabled(True)
+        if finished:
+            return
+        if not self._python_runner.is_running():
+            return
+        dialog = ExternalRunDialog(self._python_runner, self)
+        dialog.exec()
 
     def _run_command(self):
         """Parse and execute one console command, reporting errors in the console.
