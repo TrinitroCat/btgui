@@ -94,16 +94,17 @@ Double-clicking an unopened file in the Files tree creates a new window on its
 first frame and leaves older windows open.
 
 The left dock stacks the file manager above the Frames list. The tree follows
-the focused file's directory; switching files resets manual browsing, while
-frame changes keep it. A top toolbar provides parent, back, forward and recycle
-bin actions. The tree starts with a POSIX-style `..` row; `..` has no context
-menu and returns to the parent directory. Right-click `Open` on a directory
-makes it the root without selecting a file, while ordinary directory
-double-click still expands. `New Folder` creates a sibling of the selected
-directory/file; on empty space it creates inside the current root. `Delete`
-moves files into the session recycle bin under the system temporary directory
-(`btgui/recycle_bin`), and overwriting saves/exports first copy the previous
-file there. By default the tree shows only the file-name column with folders
+the focused file's directory; opening another file inside the current root
+keeps that root, while a file outside it switches the root to the new file's
+directory. Frame changes keep the current view. A top toolbar provides parent,
+back, forward and recycle bin actions. The tree starts with a POSIX-style `..`
+row; `..` has no context menu and returns to the parent directory. Right-click
+`Open` on a directory makes it the root without selecting a file, while ordinary
+directory double-click still expands. `New Folder` creates a sibling of the
+selected directory/file; on empty space it creates inside the current root.
+`Delete` moves files into the session recycle bin under the system temporary
+directory (`btgui/recycle_bin`), and overwriting saves/exports first copy the
+previous file there. By default the tree shows only the file-name column with folders
 sorted before files. Settings > File Manager chooses optional
 Size/Type/Modified columns, folder ordering, and the sort column/order.
 Renaming or deleting a file that is currently open is blocked.

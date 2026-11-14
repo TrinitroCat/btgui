@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- File-manager root switching now preserves the current root when a newly
+  opened/focused file is inside it, and only retargets the tree when the file is
+  outside the current tree.
 - File manager navigation now uses a POSIX `..` row plus parent/back/forward
   controls, directory Open, sibling-level New Folder behavior, and a session
   recycle bin under the system temporary directory. Deletes move files there;

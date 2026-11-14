@@ -4944,17 +4944,53 @@ class MainWindow(QMainWindow):
             self.recycler.ensure(), record=True, manual=True
         )
 
+    @staticmethod
+    def _path_is_under(path, directory):
+        """Return whether a file path is inside a directory tree."""
+        if path is None or directory is None:
+            return False
+        try:
+            Path(path).resolve().relative_to(Path(directory).resolve())
+            return True
+        except (OSError, ValueError):
+            return False
+
     def _sync_file_manager(self, force=False):
-        """Follow the active file unless the user opened a directory manually."""
+        """Keep a containing root; switch roots only for unrelated files."""
+        replace_root = False
+        previous_root = self._file_manager_dir
         if self.active_key != self._file_manager_file_key:
             self._file_manager_file_key = self.active_key
-            self._file_manager_manual = False
-            self._file_manager_back.clear()
-            self._file_manager_forward.clear()
-        if self._file_manager_manual:
+            keep_root = self._path_is_under(
+                self.active_key, previous_root
+            )
+            if not keep_root:
+                replace_root = True
+                self._file_manager_manual = False
+                self._file_manager_back.clear()
+                self._file_manager_forward.clear()
+
+        if not replace_root and self._path_is_under(
+            self.active_key, self._file_manager_dir
+        ):
+            self._set_file_manager_root(
+                self._file_manager_dir,
+                path=self.active_key,
+                force=force,
+            )
+            return
+
+        if not replace_root and self._file_manager_manual:
             directory = self._file_manager_dir
             if directory is not None and directory.is_dir():
-                self._set_file_manager_root(directory, force=force)
+                selected = (
+                    self.active_key
+                    if self._path_is_under(self.active_key, directory)
+                    else None
+                )
+                self._set_file_manager_root(
+                    directory, path=selected, force=force
+                )
                 return
             self._file_manager_manual = False
 
