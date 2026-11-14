@@ -1387,6 +1387,40 @@ class ParentRowProxyModel(QAbstractProxyModel):
         self._reset_mapping()
         self.endResetModel()
 
+    def setSourceModel(self, model):
+        """Forward source changes so asynchronous directory loads repaint."""
+        old = self.sourceModel()
+        if old is not None:
+            for signal in (
+                old.rowsInserted,
+                old.rowsRemoved,
+                old.rowsMoved,
+                old.dataChanged,
+                old.layoutChanged,
+                old.modelReset,
+            ):
+                try:
+                    signal.disconnect()
+                except (RuntimeError, TypeError):
+                    pass
+        super().setSourceModel(model)
+        if model is not None:
+            for signal in (
+                model.rowsInserted,
+                model.rowsRemoved,
+                model.rowsMoved,
+                model.dataChanged,
+                model.layoutChanged,
+                model.modelReset,
+            ):
+                signal.connect(self._source_changed)
+
+    def _source_changed(self, *_args):
+        """Refresh mapped rows after the file model changes."""
+        self.layoutAboutToBeChanged.emit()
+        self._reset_mapping()
+        self.layoutChanged.emit()
+
     def is_parent_row(self, index):
         """Return whether a view index is the synthetic parent row."""
         return index.isValid() and index.internalId() == self._PARENT_ID
