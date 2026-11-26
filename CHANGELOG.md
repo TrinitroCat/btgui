@@ -2,6 +2,39 @@
 
 ## Unreleased
 
+- Fixed a new frame window ignoring the chosen background colour. Opening a
+  frame in its own window copied the stored colour value but never applied it to
+  the renderer, so only the original window kept the setting.
+- Fixed Ctrl+left-drag box selection replacing the current atom selection. The
+  gesture cleared the selection as soon as dragging began, so the release-time
+  union had nothing to add to; a plain box still starts a fresh selection.
+- Fixed frame deletion closing the whole file. ``_delete_frames`` edited the
+  active workspace through the attribute forwarding, but closing the displayed
+  window had already switched that active workspace to the empty untitled state,
+  so the real file kept all frames while every window and the frame list went
+  blank. The deletion now edits the captured file state, restores it as active,
+  and reopens a window on the surviving frame; a workspace that loses every
+  frame is dropped so the next open reads the file again.
+- Fixed the command console on Python 3.13 and newer: ``showsyntaxerror`` now
+  accepts the ``source`` keyword, so one syntax error no longer raises
+  ``unexpected keyword argument 'source'`` for every later command. An
+  unexpected interpreter error also resets the console's pending line buffer
+  instead of leaving the offending text to be recompiled forever.
+- Fixed startup failure on PySide6 6.11, where assigning ordinary main-window
+  attributes raised ``TypeError: can't apply this __setattr__ to MainWindow
+  object``. Attributes outside the frame-owned set now delegate to
+  ``super().__setattr__`` so PySide6's own QObject implementation is used.
+- Added a one-slot application-wide atom clipboard. Copy stores the selected
+  species and absolute coordinates; Paste appends that fragment to the focused
+  frame across files and windows, carries no bond information, is one Undo step,
+  and selects the pasted atoms. Sources are the Edit toolbar actions, `Ctrl+C`
+  and `Ctrl+V` in a focused viewer, and a right-click menu that opens only for a
+  click without dragging.
+- Cached file states now store the source file's modification time and size
+  captured before the read. Reopening a cached file compares that metadata and,
+  when it no longer matches, releases the entry and loads the file again instead
+  of serving a stale structure. Saving onto the active file refreshes its
+  recorded metadata so in-memory frames are not discarded.
 - File-manager root switching now preserves the current root when a newly
   opened/focused file is inside it, and only retargets the tree when the file is
   outside the current tree.

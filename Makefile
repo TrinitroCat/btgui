@@ -40,7 +40,7 @@ ifeq ($(OS),Windows_NT)
 EXE := .exe
 PLATFORM_FLAGS := --windows-console-mode=$(CONSOLE_MODE) --windows-icon-from-ico=$(ICON)
 else
-EXE :=
+EXE := .x
 PLATFORM_FLAGS :=
 # Conda's libpython*.a is often an LTO/LLVM archive that the system linker
 # cannot read ("File format not recognized"). Link the shared libpython instead.

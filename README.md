@@ -66,6 +66,11 @@ The standalone entry point uses built-in serial readers and writers. File Open s
 - Left-drag: clear the old selection and select only atoms inside the rectangle.
 - Ctrl+left-drag: add atoms inside the rectangle to the current atom selection.
 - Scroll: zoom.
+- Ctrl+C: copy the selected atoms to the one-slot atom clipboard.
+- Ctrl+V: append the clipboard atoms to the focused frame.
+- Right-click without dragging: open the Copy / Paste menu. Right-drag keeps
+  orbiting the view, and the Shift and Shift+Alt right-drag gestures keep their
+  atom transforms.
 
 Metrics > Length and Metrics > Angle temporarily replace normal atom selection. Pick
 two atoms for a distance or three atoms in endpoint-vertex-endpoint order for an
@@ -74,6 +79,16 @@ coordinates. Temporary metric picks use amber outlines; completing the required
 picks immediately returns to normal selection, while `Esc` or clicking empty space
 cancels an incomplete pick. Metrics > Style changes the current frame's line and
 label appearance.
+
+The atom clipboard is one application-wide slot shared by every file and
+window. **Copy** stores detached element symbols and absolute Cartesian
+coordinates of the selected atoms; a later copy replaces the previous fragment.
+**Paste** appends that fragment to the focused frame unchanged — atoms keep
+their copied coordinates and carry no bond information, so internal bonds must
+be added afterwards with Add bond or Check bonds. One paste is a single Undo
+step, and Copy/Paste are not part of the history; pasting selects the appended
+atoms. The `Ctrl+C` and `Ctrl+V` keys work while a viewer has focus, so the
+command console and dialogs keep their native text clipboard behavior.
 
 Selected-atom transforms are previewed through VTK actors while dragging. The
 coordinate array and covalent bonds are updated once on release. Use `Ctrl+Z`
@@ -120,8 +135,13 @@ JSON file with a `_meta` block.
 Closed files stay cached until the total estimated memory exceeds the configured
 limit. Only files with no display windows are released; if all referenced files
 exceed the limit they are kept, and a file is released as soon as its last
-window closes. `File > Open` opens each selected file in its own window and
-focuses the last one; directories are expanded to their supported files first.
+window closes. Each cache entry records its source file's modification time and
+size at load time: reopening a file whose metadata no longer matches releases
+that entry and reads the file again, so an externally edited file is never
+served stale. Saving onto the active file refreshes the recorded metadata
+without splitting the workspace. `File > Open` opens each selected file in its
+own window and focuses the last one; directories are expanded to their supported
+files first.
 Save As starts from the active file path and writes only the current frame; it
 does not rename or split the in-memory workspace.
 

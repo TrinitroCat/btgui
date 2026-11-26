@@ -85,6 +85,7 @@ from btgui.backend.updater_presets.clean_structure import (
 )
 from btgui.data.appearance import ELEMENT_COLORS, default_color
 from btgui.frontend.cli import CLI
+from btgui.frontend.clipboard import AtomClipboard
 from btgui.frontend.file_state import FileState
 from btgui.frontend.changes import (
     AppearanceChange, BondChange, ClearBondsChange, FramePermutationChange,
@@ -1056,15 +1057,6 @@ class WindowManager:
         for record in list(self.records):
             record["subwindow"].close()
 
-    def close_for_frames(self, indices, file_key=None):
-        """Close windows displaying any frame in ``indices``."""
-        targets = set(int(index) for index in indices)
-        for record in list(self.records):
-            if file_key is not None and record["file_key"] != file_key:
-                continue
-            if record["frame_index"] in targets:
-                record["subwindow"].close()
-
     def remove_frames(self, indices, file_key=None):
         """Drop deleted indices and shift surviving window references."""
         deleted = set(int(index) for index in indices)
@@ -1966,13 +1958,20 @@ class MainWindow(QMainWindow):
         )
 
     def __setattr__(self, name, value):
-        """Write one frame-owned attribute into the active file state."""
+        """Write one frame-owned attribute into the active file state.
+
+        Note:
+            Ordinary attributes delegate to ``super().__setattr__``. PySide6
+            6.11 implements ``QObject.__setattr__`` and rejects
+            ``object.__setattr__`` on QObject subclasses with
+            ``TypeError: can't apply this __setattr__ to MainWindow object``.
+        """
         if name in type(self)._STATE_ATTRS:
             state = self.__dict__.get("_active_state")
             if state is not None:
                 setattr(state, name, value)
                 return
-        object.__setattr__(self, name, value)
+        super().__setattr__(name, value)
 
     def __init__(self, open_handler=None, save_handler=None, parent=None, updater=None):
         super().__init__(parent)
@@ -2003,6 +2002,7 @@ class MainWindow(QMainWindow):
         self.settings = self._load_settings()
         self.catalog = Catalog(self.settings["language"])
         self.recycler = FileRecycler()
+        self.atom_clipboard = AtomClipboard()
         self._text_editors = {}
         self._python_runner = ExternalPythonRunner(self)
         self._python_runner.output.connect(self._log)
@@ -2047,6 +2047,21 @@ class MainWindow(QMainWindow):
         self.redo_action.setToolTip("Redo edit")
         self.redo_action.triggered.connect(self._redo)
         self.toolbar_groups["edit"].addAction(self.redo_action)
+        # Section: Copy/Paste deliberately carry no QAction shortcut. A window
+        # shortcut would hijack native Ctrl+C/Ctrl+V text editing in the command
+        # console and dialogs; the focused viewer handles those keys instead.
+        self.copy_action = QAction("Copy", self)
+        self.copy_action.setToolTip("Copy the selected atoms (Ctrl+C)")
+        self.copy_action.setEnabled(False)
+        self.copy_action.triggered.connect(self._copy_selected_atoms)
+        self.toolbar_groups["edit"].addAction(self.copy_action)
+        self.paste_action = QAction("Paste", self)
+        self.paste_action.setToolTip(
+            "Append the copied atoms at their original coordinates (Ctrl+V)"
+        )
+        self.paste_action.setEnabled(False)
+        self.paste_action.triggered.connect(self._paste_atoms)
+        self.toolbar_groups["edit"].addAction(self.paste_action)
 
         self.supercell_action = QAction("Build / Transform...", self)
         self.supercell_action.triggered.connect(self._show_supercell)
@@ -2710,6 +2725,27 @@ class MainWindow(QMainWindow):
         viewer.selectionChanged.connect(self._on_selection_changed)
         viewer.frameStepRequested.connect(self._step_frame)
         viewer.set_error_handler(self._log)
+        self._connect_clipboard_signals(viewer)
+
+    def _connect_clipboard_signals(self, viewer):
+        """Route one viewer's Copy, Paste, and context-menu requests.
+
+        Args:
+            viewer: Viewer that emits the atom clipboard signals.
+
+        Returns:
+            None. Every handler activates the emitting viewer first so the
+            operation always targets the selection the user is looking at.
+        """
+        viewer.copyRequested.connect(
+            lambda view=viewer: (self._activate_viewer(view), self._copy_selected_atoms())
+        )
+        viewer.pasteRequested.connect(
+            lambda view=viewer: (self._activate_viewer(view), self._paste_atoms())
+        )
+        viewer.contextMenuRequested.connect(
+            lambda position, view=viewer: self._show_viewer_context_menu(view, position)
+        )
 
     def _activate_viewer(self, viewer):
         """Make one displayed viewer the target of toolbar and edit actions."""
@@ -2848,6 +2884,7 @@ class MainWindow(QMainWindow):
                 self._step_frame(step),
             )
         )
+        self._connect_clipboard_signals(viewer)
 
     def _persist_settings(self):
         """Write current settings to ``settings.json`` beside the package.
@@ -4146,17 +4183,19 @@ class MainWindow(QMainWindow):
             reference_index: Original reference atom for an automatic bond chain.
 
         Returns:
-            None. The full scene is rebuilt after one atomic commit.
+            True when the change was committed, otherwise False for an invalid
+            request or a cancelled metrics confirmation. The full scene is
+            rebuilt after one atomic commit.
         """
         if not 0 <= int(frame_index) < len(self.coordinates):
-            return
+            return False
         frame_index = int(frame_index)
         symbols = np.asarray(symbols, dtype="<U3").reshape(-1)
         coordinates = np.asarray(coordinates, dtype=float).reshape((-1, 3))
         if len(symbols) != len(coordinates) or len(symbols) == 0:
-            return
+            return False
         if not self._confirm_metrics_topology_change():
-            return
+            return False
         before_elements = self.elements[frame_index]
         before_coordinates = self.coordinates[frame_index]
         before_lattice = self.lattices[frame_index]
@@ -4187,7 +4226,7 @@ class MainWindow(QMainWindow):
         if reference_index is not None:
             if not 0 <= int(reference_index) < len(before_elements):
                 self._log("Add ignored: reference atom is out of range.")
-                return
+                return False
             original = self.bond_adjacencies[frame_index]
             graph = normalize_bond_adjacency(original)
             orders = self.bond_orders[frame_index]
@@ -4215,6 +4254,7 @@ class MainWindow(QMainWindow):
             )
             change = (change, bonds)
         self._record_change(change, frame_index=frame_index)
+        return True
 
     def _commit_reference_atoms(self, frame_index, symbols, coordinates, reference_index):
         """Commit a complete reference-placement chain as one change.
@@ -4310,6 +4350,119 @@ class MainWindow(QMainWindow):
             after_missing={frame_index: original is None},
         )
         self._record_change((bonds, change), frame_index=frame_index)
+
+    def _copy_selected_atoms(self, checked=False):
+        """Copy the selected atoms of the focused frame into the clipboard.
+
+        Args:
+            checked: Ignored Qt action state.
+
+        Return:
+            None. The one-slot buffer retains detached copies of species and
+            absolute coordinates; no history entry is created.
+        """
+        if self.viewer is None or not self.coordinates:
+            self._log("Copy: no structure is displayed.")
+            return
+        frame_index = int(self.current_index)
+        if not 0 <= frame_index < len(self.coordinates):
+            return
+        elements = np.asarray(self.elements[frame_index])
+        indices = np.asarray(self.viewer.selected_indices, dtype=int)
+        indices = indices[(indices >= 0) & (indices < len(elements))]
+        if len(indices) == 0:
+            self._log("Copy: select at least one atom first.")
+            return
+        count = self.atom_clipboard.store(
+            elements[indices],
+            self.coordinates[frame_index][indices],
+            self._file_title(self._active_state, frame_index),
+        )
+        self._sync_clipboard_actions()
+        self._log(f"Copy: {count} atom(s) from {self.atom_clipboard.source}.")
+
+    def _paste_atoms(self, checked=False):
+        """Append the clipboard fragment to the focused frame as one change.
+
+        Args:
+            checked: Ignored Qt action state.
+
+        Return:
+            None. Atoms keep their absolute coordinates and carry no bond
+            information; the appended indices become the new selection.
+        """
+        if self.viewer is None or not self.coordinates:
+            self._log("Paste: no structure is displayed.")
+            return
+        if self.atom_clipboard.is_empty():
+            self._log("Paste: the atom clipboard is empty.")
+            return
+        # Section: pausing first makes the displayed frame authoritative, so a
+        # paste never targets a playback frame that is already gone.
+        self._pause_playback()
+        frame_index = int(self.current_index)
+        if not 0 <= frame_index < len(self.coordinates):
+            return
+        fragment = self.atom_clipboard.content()
+        if fragment is None:
+            return
+        elements, coordinates = fragment
+        added = len(elements)
+        first_new = len(self.elements[frame_index])
+        if not self._commit_added_atoms(
+            frame_index, elements, coordinates, "Paste atoms"
+        ):
+            return
+        self.viewer.set_selection(np.arange(first_new, first_new + added, dtype=int))
+        self._sync_clipboard_actions()
+        self._log(f"Paste: appended {added} atom(s) from {self.atom_clipboard.source}.")
+
+    def _show_viewer_context_menu(self, viewer, position):
+        """Offer atom Copy and Paste for one right-clicked viewer.
+
+        Args:
+            viewer: Viewer that received the right click.
+            position: Global screen position of the click.
+
+        Returns:
+            None. The menu reuses the toolbar actions so enabled states agree.
+        """
+        if viewer is not self.viewer:
+            self._activate_viewer(viewer)
+        self._sync_clipboard_actions()
+        menu = QMenu(self)
+        menu.addAction(self.copy_action)
+        menu.addAction(self.paste_action)
+        menu.exec(position)
+
+    def _sync_clipboard_actions(self):
+        """Enable Copy for a valid selection and Paste for a filled clipboard.
+
+        Args:
+            None.
+
+        Return:
+            None. Both toolbar actions and their context-menu copies follow the
+            focused viewer, current frame, and clipboard state.
+        """
+        if not hasattr(self, "copy_action"):
+            return
+        selected = (
+            np.asarray(self.viewer.selected_indices, dtype=int)
+            if self.viewer is not None
+            else np.empty(0, dtype=int)
+        )
+        frame_valid = 0 <= self.current_index < len(self.elements)
+        atom_count = len(self.elements[self.current_index]) if frame_valid else 0
+        has_selection = (
+            len(selected) > 0
+            and bool(np.all(selected >= 0))
+            and bool(np.all(selected < atom_count))
+        )
+        self.copy_action.setEnabled(bool(has_selection))
+        self.paste_action.setEnabled(
+            bool(frame_valid and not self.atom_clipboard.is_empty())
+        )
 
     def _show_appearance(self):
         """Open the atom and bond appearance editor for the current frame."""
@@ -4675,7 +4828,7 @@ class MainWindow(QMainWindow):
         self._log(f"Add H: appended {added} hydrogen atom(s).")
 
     def _sync_atom_actions(self, indices=None):
-        """Enable replacement only when the current frame has a valid selection."""
+        """Enable selection-dependent actions for the current frame."""
         if not hasattr(self, "replace_atom_action"):
             return
         selected = self.viewer.selected_indices if indices is None else np.asarray(indices, dtype=int)
@@ -4686,6 +4839,7 @@ class MainWindow(QMainWindow):
             and np.all(selected < len(self.elements[self.current_index]))
         )
         self.replace_atom_action.setEnabled(bool(has_selection))
+        self._sync_clipboard_actions()
 
     def _on_selection_changed(self, indices):
         """Synchronize actions and print one ordinarily selected atom.
@@ -5235,6 +5389,26 @@ class MainWindow(QMainWindow):
         self._pending_frame_row = None
         self._open_frame_window(self.frame_list.row(item))
 
+    @staticmethod
+    def _file_signature(path):
+        """Return the cache-validation signature of one structure file.
+
+        Args:
+            path: Source path, or ``None`` for untitled CLI data.
+
+        Returns:
+            A ``(st_mtime_ns, st_size)`` tuple, or ``None`` when the path
+            cannot be stat-ed. The pair is captured before the file is read so
+            a later modification always produces a mismatch.
+        """
+        if path is None:
+            return None
+        try:
+            status = Path(path).stat()
+        except OSError:
+            return None
+        return (int(status.st_mtime_ns), int(status.st_size))
+
     def _cache_limit_bytes(self):
         """Return the configured file-cache limit in bytes."""
         return max(64, int(self.settings["file_cache_limit_mb"])) * 1024 * 1024
@@ -5313,9 +5487,24 @@ class MainWindow(QMainWindow):
         self._file_color_index += 1
         return QColor.fromHslF(hue, 0.45, 0.72)
 
-    def _prepare_file_state(self, key, elements, coordinates, lattices):
-        """Build one detached FileState from freshly read raw frame lists."""
+    def _prepare_file_state(self, key, elements, coordinates, lattices, signature=None):
+        """Build one detached FileState from freshly read raw frame lists.
+
+        Args:
+            key: Canonical source path, or None for untitled CLI data.
+            elements: Frame-ordered element symbol arrays.
+            coordinates: Frame-ordered Cartesian coordinate arrays.
+            lattices: Frame-ordered lattice arrays.
+            signature: File metadata captured before the read, used to
+                invalidate this cache entry when the file changes on disk.
+
+        Return:
+            A detached state owning copies of the supplied frame lists.
+        """
         state = FileState(key, self.settings["history_limit"])
+        state.source_signature = (
+            self._file_signature(key) if signature is None else signature
+        )
         state.border_color = self._next_file_color() if key is not None else None
         state.elements = list(elements)
         state.coordinates = list(coordinates)
@@ -5398,6 +5587,10 @@ class MainWindow(QMainWindow):
         else:
             self._connect_extra_viewer(viewer)
             viewer.camera.SetParallelProjection(not viewer.perspective_enabled)
+        # Section: the attribute copy above does not repaint the renderer, and a
+        # fresh viewer always starts from the default background, so a new frame
+        # window would otherwise ignore the chosen background colour.
+        viewer.set_background(viewer._background_color_value)
         record = self.window_manager.add(
             viewer,
             frame_index,
@@ -5515,57 +5708,98 @@ class MainWindow(QMainWindow):
         )
 
     def _delete_frames(self, frame_indices):
-        """Delete several frames with one aligned-list update and one redraw."""
-        indices = sorted(
-            set(int(index) for index in frame_indices)
-        )
-        indices = [index for index in indices if 0 <= index < len(self.elements)]
+        """Delete several frames with one aligned-list update and one redraw.
+
+        Args:
+            frame_indices: Zero-based frame indices to remove.
+
+        Return:
+            None. Windows of deleted frames close, the surviving workspace keeps
+            displaying a valid frame, and a workspace that loses every frame is
+            dropped so the next open reads the file again.
+        """
+        state = self._active_state
+        key = self.active_key
+        if state is None or state.closed:
+            return
+        indices = sorted(set(int(index) for index in frame_indices))
+        indices = [index for index in indices if 0 <= index < len(state.elements)]
         if not indices:
             return
-        self.window_manager.close_for_frames(indices, self.active_key)
         deleted = set(indices)
-        retained = [index for index in range(len(self.elements)) if index not in deleted]
+        # Section: collect the doomed windows before touching any list. Closing
+        # the displayed window switches the active workspace to the untitled
+        # empty state when it was the last one, so shutdown happens only after
+        # this state owns the edited data.
+        closing = [
+            record["subwindow"]
+            for record in self.window_manager.records
+            if record["file_key"] == key and record["frame_index"] in deleted
+        ]
+        retained = [index for index in range(len(state.elements)) if index not in deleted]
         for target in (
-            self.elements,
-            self.coordinates,
-            self.lattices,
-            self.atom_frame_styles,
-            self.frame_metrics,
-            self.bond_adjacencies,
-            self.bond_orders,
-            self.frame_names,
+            state.elements,
+            state.coordinates,
+            state.lattices,
+            state.atom_frame_styles,
+            state.frame_metrics,
+            state.bond_adjacencies,
+            state.bond_orders,
+            state.frame_names,
         ):
             target[:] = [target[index] for index in retained]
-        old_bases = self.supercell_bases
-        old_transforms = self.supercell_transforms
-        self.supercell_bases = {
-            new: old_bases[old] for new, old in enumerate(retained)
-        }
-        self.supercell_transforms = {
+        old_bases = state.supercell_bases
+        old_transforms = state.supercell_transforms
+        state.supercell_bases = {new: old_bases[old] for new, old in enumerate(retained)}
+        state.supercell_transforms = {
             new: old_transforms[old] for new, old in enumerate(retained)
         }
-        self.bond_frame_indices = [
+        state.bond_frame_indices = [
             index - sum(deleted_index < index for deleted_index in deleted)
-            for index in self.bond_frame_indices
+            for index in state.bond_frame_indices
             if index not in deleted
         ]
-        if self.viewer is not None:
-            self.viewer.bond_frame_indices = set(self.bond_frame_indices)
-        self.window_manager.remove_frames(indices, self.active_key)
-        old_current = self.current_index
-        if not self.elements:
-            self.current_index = 0
+        self.window_manager.remove_frames(indices, key)
+        old_current = int(state.current_index)
+        if not state.elements:
+            state.current_index = 0
         elif old_current in deleted:
-            self.current_index = min(old_current, len(self.elements) - 1)
+            state.current_index = min(old_current, len(state.elements) - 1)
         else:
-            self.current_index = old_current - sum(
+            state.current_index = old_current - sum(
                 deleted_index < old_current for deleted_index in deleted
             )
-        for record in self.window_manager.records:
+        for record in self.window_manager.records_for_file(key):
             record["viewer"].selected_indices = np.empty(0, dtype=int)
             record["viewer"].selected_bonds.clear()
-        self.undo_stack.clear()
-        self.redo_stack.clear()
+        state.undo_stack.clear()
+        state.redo_stack.clear()
+        for subwindow in closing:
+            subwindow.close()
+        if not state.elements:
+            # Section: the workspace lost every frame. Drop it instead of leaving
+            # an empty one, so reopening the path reads the file again.
+            if key is not None and self.files.get(key) is state:
+                self.files.pop(key, None)
+            state.close()
+            if self._active_state is state:
+                self._activate_empty_state()
+            self._refresh_after_change(frame_index=0)
+            self._sync_history_actions()
+            return
+        # Section: window shutdown may have activated another workspace. Restore
+        # this file before refreshing so the new current frame gets a window and
+        # every later update edits the state that actually lost frames.
+        self._active_state = state
+        self.active_key = key
+        if key is None:
+            self.files[None] = state
+        self.current_index = int(state.current_index)
+        record = self.window_manager.find(key, self.current_index)
+        if record is None:
+            self._create_viewer_for_state(state, key, self.current_index, show=True)
+        elif record["viewer"] is not self.viewer:
+            self._focus_record(record)
         self._refresh_after_change(frame_index=self.current_index)
         self._sync_history_actions()
 
@@ -6088,6 +6322,10 @@ class MainWindow(QMainWindow):
         self.undo_action.setToolTip(self._t("action.undo_tooltip"))
         self.redo_action.setText(self._t("action.redo"))
         self.redo_action.setToolTip(self._t("action.redo_tooltip"))
+        self.copy_action.setText(self._t("action.copy"))
+        self.copy_action.setToolTip(self._t("action.copy_tooltip"))
+        self.paste_action.setText(self._t("action.paste"))
+        self.paste_action.setToolTip(self._t("action.paste_tooltip"))
         self.supercell_action.setText(self._t("action.supercell_build"))
         self.supercell_button.setText(self._t("action.supercell"))
         self.add_atom_action.setText(self._t("action.add_atom"))
@@ -6967,16 +7205,36 @@ class MainWindow(QMainWindow):
             self._focus_record(target)
             return target
         state = self.files.get(key)
-        if state is None or state.closed:
+        previous = state
+        # Section: reuse a cached state only while its file metadata matches.
+        # The signature is captured before the read, so a file modified after
+        # caching (or by another program) is reloaded instead of served stale.
+        stale = (
+            state is not None
+            and not state.closed
+            and state.window_refs == 0
+            and state.source_signature != self._file_signature(key)
+        )
+        if state is None or state.closed or stale:
+            signature = self._file_signature(key)
             elements, coordinates, lattices = self.open_handler([key])
             validate_data(elements, coordinates, lattices)
-            state = self._prepare_file_state(key, elements, coordinates, lattices)
+            state = self._prepare_file_state(
+                key, elements, coordinates, lattices, signature
+            )
             self.files[key] = state
+            if stale:
+                self._log(f"File cache: {key.name} changed on disk; reloaded.")
         record = self._create_viewer_for_state(state, key, 0, show=True)
         self.active_key = key
         self._active_state = state
         self.current_index = 0
         state.current_index = 0
+        # Section: release the stale state only after the replacement owns the
+        # file key and the active references, so no callback can observe a
+        # closed state through the window manager.
+        if previous is not None and previous is not state and not previous.closed:
+            previous.close()
         self._trim_file_cache()
         self._activate_viewer(record["viewer"])
         self._log(
@@ -7033,6 +7291,12 @@ class MainWindow(QMainWindow):
             [self.coordinates[frame_index]],
             [self.lattices[frame_index]],
         )
+        # Section: saving onto the active file rewrites its bytes, so refresh
+        # the cache signature; otherwise the next reopen would drop the frames
+        # that are held only in memory. The workspace itself is not split.
+        target = Path(path).expanduser().resolve()
+        if self.active_key is not None and target == self.active_key:
+            self._active_state.source_signature = self._file_signature(self.active_key)
         self._log(f"Saved {path}")
 
     def _play(self, specification, fps):
@@ -7168,13 +7432,15 @@ class MainWindow(QMainWindow):
             return
         prompt = "..." if self.cli._continuation else ">>>"
         self._log(f"{prompt} {source}")
+        continuation = False
         try:
             continuation = self.cli.execute(source)
-            self.command.setPlaceholderText(
-                "... continue Python block" if continuation else ">>> Python or GUI command"
-            )
         except (ImportError, OSError, RuntimeError, TypeError, ValueError, IndexError) as error:
             self._log(f"Command error: {error}")
+            continuation = self.cli._continuation
+        self.command.setPlaceholderText(
+            "... continue Python block" if continuation else ">>> Python or GUI command"
+        )
 
     def _select_indices(self, indices):
         """Apply a CLI atom selection and redraw the current frame.

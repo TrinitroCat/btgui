@@ -17,10 +17,16 @@ class FileState:
 
     Return:
         A mutable container. ``close`` clears all owned references explicitly.
+
+    Note:
+        ``source_signature`` records the ``(st_mtime_ns, st_size)`` pair of the
+        file contents behind this state, captured before the read. The cache
+        compares it against the current file and drops stale entries.
     """
 
     def __init__(self, path: Path | None, history_limit: int):
         self.path = path
+        self.source_signature = None
         self.elements = []
         self.coordinates = []
         self.lattices = []
@@ -103,6 +109,7 @@ class FileState:
         self._frame_name_serial = 0
         self.window_refs = 0
         self.border_color = None
+        self.source_signature = None
         self.path = None
         self.closed = True
 

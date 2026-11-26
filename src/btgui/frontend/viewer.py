@@ -4,7 +4,7 @@ import numpy as np
 import pyvista as pv
 from pyvistaqt import QtInteractor
 from PySide6.QtCore import Qt, Signal, QRect
-from PySide6.QtGui import QMouseEvent
+from PySide6.QtGui import QKeySequence, QMouseEvent
 from PySide6.QtWidgets import QRubberBand, QLabel
 from vtkmodules.vtkCommonTransforms import vtkTransform
 from vtkmodules.vtkRenderingCore import vtkCellPicker, vtkLight
@@ -32,6 +32,9 @@ class StructureViewer(QtInteractor):
     measurementModeChanged = Signal(object)
     selectionChanged = Signal(object)
     frameStepRequested = Signal(int)
+    copyRequested = Signal()
+    pasteRequested = Signal()
+    contextMenuRequested = Signal(object)
 
     def __init__(self, parent=None):
         super().__init__(parent=parent)
@@ -1974,6 +1977,17 @@ class StructureViewer(QtInteractor):
         Returns:
             None. The event is consumed for supported structure operations.
         """
+        # Section: atom Copy/Paste are handled here instead of by QAction
+        # shortcuts so the command console and dialogs keep native text
+        # clipboard behavior. They are active only while this viewer has focus.
+        if not self.add_mode and event.matches(QKeySequence.StandardKey.Copy):
+            self.copyRequested.emit()
+            event.accept()
+            return
+        if not self.add_mode and event.matches(QKeySequence.StandardKey.Paste):
+            self.pasteRequested.emit()
+            event.accept()
+            return
         arrow_keys = {
             Qt.Key.Key_Left: -1,
             Qt.Key.Key_Right: 1,
@@ -2177,9 +2191,13 @@ class StructureViewer(QtInteractor):
             return
         if np.linalg.norm(current - self.press_position) > 4:
             if not self.dragged and self.drag_mode == "select" and self.measurement_mode is None:
-                # A box gesture starts a fresh atom selection, even with Ctrl.
-                self.selected_bonds.clear()
-                self._update_selection(np.empty(0, dtype=int), additive=False)
+                # Section: a plain box gesture starts a fresh atom selection,
+                # while Ctrl keeps the existing selection; the release handler
+                # unions the boxed atoms into it. Clearing here would discard
+                # everything the Ctrl box is supposed to add to.
+                if not (self.press_modifiers & Qt.KeyboardModifier.ControlModifier):
+                    self.selected_bonds.clear()
+                    self._update_selection(np.empty(0, dtype=int), additive=False)
             self.dragged = True
         has_atom_drag_state = (
             self.drag_start_mouse is not None
@@ -2378,6 +2396,10 @@ class StructureViewer(QtInteractor):
                     Qt.MouseButton.NoButton,
                 )
                 super().mouseReleaseEvent(camera_event)
+                # Section: a right click without movement opens the atom menu;
+                # a right drag keeps its camera gesture and stays silent.
+                if not self.dragged:
+                    self.contextMenuRequested.emit(event.globalPosition().toPoint())
             should_commit = (
                 finished_drag_mode in ("translate_atoms", "rotate_atoms")
                 and self.dragged
@@ -2480,6 +2502,28 @@ class StructureViewer(QtInteractor):
             self.selected_indices = np.asarray(sorted(selected), dtype=int)
         else:
             self.selected_indices = picked.astype(int, copy=True)
+        self.refresh_selection_overlay()
+        self.selectionChanged.emit(self.selected_indices.copy())
+
+    def set_selection(self, indices):
+        """Replace the atom selection with validated indices.
+
+        Args:
+            indices: Candidate atom indices for the current frame.
+
+        Returns:
+            None. Out-of-range indices are dropped, the overlay is refreshed,
+            and one selectionChanged signal reports the final selection.
+        """
+        candidate = np.asarray(indices, dtype=int).reshape(-1)
+        if 0 <= self.current_index < len(self.elements):
+            atom_count = len(np.asarray(self.elements[self.current_index]).reshape(-1))
+            candidate = candidate[(candidate >= 0) & (candidate < atom_count)]
+        else:
+            candidate = np.empty(0, dtype=int)
+        self.selected_bonds.clear()
+        self.refresh_bond_selection(render=False)
+        self.selected_indices = candidate
         self.refresh_selection_overlay()
         self.selectionChanged.emit(self.selected_indices.copy())
 

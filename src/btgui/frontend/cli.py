@@ -46,17 +46,19 @@ class _CapturedConsole(code.InteractiveConsole):
         """
         self.stream.write(data)
 
-    def showsyntaxerror(self, filename: str | None = None) -> None:
+    def showsyntaxerror(self, filename: str | None = None, **kwargs) -> None:
         """Record and render a normal interactive syntax error.
 
         Args:
             filename: Optional filename displayed by Python.
+            **kwargs: Python 3.13 and newer pass ``source`` so the traceback
+                can display the offending line.
 
         Returns:
             None. The error flag is set before normal formatting.
         """
         self.had_error = True
-        super().showsyntaxerror(filename)
+        super().showsyntaxerror(filename, **kwargs)
 
     def showtraceback(self) -> None:
         """Record and render a normal interactive runtime traceback.
@@ -376,7 +378,18 @@ class CLI:
         if not self._continuation:
             self._console.had_error = False
         with redirect_stdout(stream), redirect_stderr(stream):
-            requires_more = self._console.push(source)
+            try:
+                requires_more = self._console.push(source)
+            except Exception:
+                # Section: InteractiveConsole.push() resets its line buffer only
+                # after runsource() returns. An unexpected interpreter error
+                # would keep the offending text, so every later command would
+                # recompile it and fail again; drop that buffer before the
+                # caller reports the error, and discard partial page edits.
+                self._console.resetbuffer()
+                self._continuation = False
+                self._install_work(self._backup)
+                raise
         self._emit_stream(stream)
         self._continuation = requires_more
         if requires_more:
